@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
@@ -60,10 +62,16 @@
     manages user logins. It is responsible for:</para>
 
     <itemizedlist>
-      <listitem><para>Keeping track of users and sessions, their
-      processes and their idle state</para></listitem>
+      <listitem><para>Keeping track of users and sessions, their processes and their idle state. This is implemented by
+      allocating a systemd slice unit for each user below <filename>user.slice</filename>, and a scope unit below it
+      for each concurrent session of a user. Also, a per-user service manager is started as system service instance of
+      <filename>user@.service</filename> for each logged in user.</para></listitem>
 
-      <listitem><para>Providing PolicyKit-based access for users to
+      <listitem><para>Generating and managing session IDs. If auditing is available and an audit session ID is already set for
+      a session, then this ID is reused as the session ID. Otherwise, an independent session counter is
+      used.</para></listitem>
+
+      <listitem><para>Providing PolicyKit-based access for users for
       operations such as system shutdown or sleep</para></listitem>
 
       <listitem><para>Implementing a shutdown/sleep inhibition logic
@@ -84,7 +92,7 @@
       management</para></listitem>
     </itemizedlist>
 
-    <para>User sessions are registered in logind via the
+    <para>User sessions are registered with logind via the
     <citerefentry><refentrytitle>pam_systemd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
     PAM module.</para>
 
@@ -92,18 +100,18 @@
     <citerefentry><refentrytitle>logind.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for information about the configuration of this service.</para>
 
-    <para>See <ulink
-    url="http://www.freedesktop.org/wiki/Software/systemd/multiseat">Multi-Seat
-    on Linux</ulink> for an introduction into basic concepts of logind
+    <para>See
+    <citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+    for information about the basic concepts of logind
     such as users, sessions and seats.</para>
 
     <para>See the <ulink
-    url="http://www.freedesktop.org/wiki/Software/systemd/logind">
+    url="https://www.freedesktop.org/wiki/Software/systemd/logind">
     logind D-Bus API Documentation</ulink> for information about the
     APIs <filename>systemd-logind</filename> provides.</para>
 
     <para>For more information on the inhibition logic see the <ulink
-    url="http://www.freedesktop.org/wiki/Software/systemd/inhibit">Inhibitor
+    url="https://www.freedesktop.org/wiki/Software/systemd/inhibit">Inhibitor
     Lock Developer Documentation</ulink>.</para>
   </refsect1>
 
@@ -115,6 +123,7 @@
       <citerefentry><refentrytitle>loginctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>logind.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>pam_systemd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+      <citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     </para>
   </refsect1>
 

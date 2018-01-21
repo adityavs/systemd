@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,8 +20,9 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <inttypes.h>
 #include <stdio.h>
 
-#include "systemd/sd-id128.h"
+#include "sd-id128.h"
 
 int print_qr_code(FILE *f, const void *seed, size_t seed_size, uint64_t start, uint64_t interval, const char *hn, sd_id128_t machine);

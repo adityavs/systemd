@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -18,12 +19,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stddef.h>
-#include <unistd.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <sys/inotify.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "io-util.h"
 #include "libudev-private.h"
 
 /**
@@ -57,12 +61,16 @@ _public_ struct udev_queue *udev_queue_new(struct udev *udev)
 {
         struct udev_queue *udev_queue;
 
-        if (udev == NULL)
+        if (udev == NULL) {
+                errno = EINVAL;
                 return NULL;
+        }
 
         udev_queue = new0(struct udev_queue, 1);
-        if (udev_queue == NULL)
+        if (udev_queue == NULL) {
+                errno = ENOMEM;
                 return NULL;
+        }
 
         udev_queue->refcount = 1;
         udev_queue->udev = udev;
@@ -107,8 +115,7 @@ _public_ struct udev_queue *udev_queue_unref(struct udev_queue *udev_queue)
 
         safe_close(udev_queue->fd);
 
-        free(udev_queue);
-        return NULL;
+        return mfree(udev_queue);
 }
 
 /**
@@ -121,8 +128,10 @@ _public_ struct udev_queue *udev_queue_unref(struct udev_queue *udev_queue)
  **/
 _public_ struct udev *udev_queue_get_udev(struct udev_queue *udev_queue)
 {
-        if (udev_queue == NULL)
+        if (udev_queue == NULL) {
+                errno = EINVAL;
                 return NULL;
+        }
         return udev_queue->udev;
 }
 
@@ -220,6 +229,7 @@ _public_ int udev_queue_get_seqnum_is_finished(struct udev_queue *udev_queue, un
  **/
 _public_ struct udev_list_entry *udev_queue_get_queued_list_entry(struct udev_queue *udev_queue)
 {
+        errno = ENODATA;
         return NULL;
 }
 
@@ -258,8 +268,16 @@ _public_ int udev_queue_get_fd(struct udev_queue *udev_queue) {
  * Returns: the result of clearing the watch for queue changes.
  */
 _public_ int udev_queue_flush(struct udev_queue *udev_queue) {
+        int r;
+
+        assert(udev_queue);
+
         if (udev_queue->fd < 0)
                 return -EINVAL;
 
-        return flush_fd(udev_queue->fd);
+        r = flush_fd(udev_queue->fd);
+        if (r < 0)
+                return r;
+
+        return 0;
 }

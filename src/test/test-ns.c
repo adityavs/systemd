@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,22 +18,28 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "namespace.h"
 #include "log.h"
+#include "namespace.h"
 
 int main(int argc, char *argv[]) {
         const char * const writable[] = {
                 "/home",
+                "-/home/lennart/projects/foobar", /* this should be masked automatically */
                 NULL
         };
 
         const char * const readonly[] = {
-                "/",
-                "/usr",
+                /* "/", */
+                /* "/usr", */
                 "/boot",
+                "/lib",
+                "/usr/lib",
+                "-/lib64",
+                "-/usr/lib64",
                 NULL
         };
 
@@ -42,12 +47,21 @@ int main(int argc, char *argv[]) {
                 "/home/lennart/projects",
                 NULL
         };
+
+        static const NamespaceInfo ns_info = {
+                .private_dev = true,
+                .protect_control_groups = true,
+                .protect_kernel_tunables = true,
+                .protect_kernel_modules = true,
+        };
+
         char *root_directory;
         char *projects_directory;
-
         int r;
         char tmp_dir[] = "/tmp/systemd-private-XXXXXX",
              var_tmp_dir[] = "/var/tmp/systemd-private-XXXXXX";
+
+        log_set_max_level(LOG_DEBUG);
 
         assert_se(mkdtemp(tmp_dir));
         assert_se(mkdtemp(var_tmp_dir));
@@ -65,15 +79,18 @@ int main(int argc, char *argv[]) {
                 log_info("Not chrooted");
 
         r = setup_namespace(root_directory,
+                            NULL,
+                            &ns_info,
                             (char **) writable,
                             (char **) readonly,
                             (char **) inaccessible,
+                            NULL,
+                            &(BindMount) { .source = (char*) "/usr/bin", .destination = (char*) "/etc/systemd", .read_only = true }, 1,
                             tmp_dir,
                             var_tmp_dir,
-                            NULL,
-                            true,
                             PROTECT_HOME_NO,
                             PROTECT_SYSTEM_NO,
+                            0,
                             0);
         if (r < 0) {
                 log_error_errno(r, "Failed to setup namespace: %m");

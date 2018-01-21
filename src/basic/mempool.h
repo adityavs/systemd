@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -38,7 +37,7 @@ void* mempool_alloc0_tile(struct mempool *mp);
 void mempool_free_tile(struct mempool *mp, void *p);
 
 #define DEFINE_MEMPOOL(pool_name, tile_type, alloc_at_least) \
-struct mempool pool_name = { \
+static struct mempool pool_name = { \
         .tile_size = sizeof(tile_type), \
         .at_least = alloc_at_least, \
 }

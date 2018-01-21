@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,20 +18,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdbool.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 #include "util.h"
 #include "virt.h"
-#include "build.h"
 
 static bool arg_quiet = false;
 static enum {
         ANY_VIRTUALIZATION,
         ONLY_VM,
-        ONLY_CONTAINER
+        ONLY_CONTAINER,
+        ONLY_CHROOT,
+        ONLY_PRIVATE_USERS,
 } arg_mode = ANY_VIRTUALIZATION;
 
 static void help(void) {
@@ -42,6 +42,8 @@ static void help(void) {
                "     --version          Show package version\n"
                "  -c --container        Only detect whether we are run in a container\n"
                "  -v --vm               Only detect whether we are run in a VM\n"
+               "  -r --chroot           Detect whether we are run in a chroot() environment\n"
+               "     --private-users    Only detect whether we are running in a user namespace\n"
                "  -q --quiet            Don't output anything, just set return value\n"
                , program_invocation_short_name);
 }
@@ -49,15 +51,18 @@ static void help(void) {
 static int parse_argv(int argc, char *argv[]) {
 
         enum {
-                ARG_VERSION = 0x100
+                ARG_VERSION = 0x100,
+                ARG_PRIVATE_USERS,
         };
 
         static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                { "container", no_argument,       NULL, 'c'           },
-                { "vm",        optional_argument, NULL, 'v'           },
-                { "quiet",     no_argument,       NULL, 'q'           },
+                { "help",          no_argument, NULL, 'h'               },
+                { "version",       no_argument, NULL, ARG_VERSION       },
+                { "container",     no_argument, NULL, 'c'               },
+                { "vm",            no_argument, NULL, 'v'               },
+                { "chroot",        no_argument, NULL, 'r'               },
+                { "private-users", no_argument, NULL, ARG_PRIVATE_USERS },
+                { "quiet",         no_argument, NULL, 'q'               },
                 {}
         };
 
@@ -66,7 +71,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hqcv", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hqcvr", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -75,9 +80,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case 'q':
                         arg_quiet = true;
@@ -87,8 +90,16 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_mode = ONLY_CONTAINER;
                         break;
 
+                case ARG_PRIVATE_USERS:
+                        arg_mode = ONLY_PRIVATE_USERS;
+                        break;
+
                 case 'v':
                         arg_mode = ONLY_VM;
+                        break;
+
+                case 'r':
+                        arg_mode = ONLY_CHROOT;
                         break;
 
                 case '?':
@@ -99,8 +110,7 @@ static int parse_argv(int argc, char *argv[]) {
                 }
 
         if (optind < argc) {
-                log_error("%s takes no arguments.",
-                          program_invocation_short_name);
+                log_error("%s takes no arguments.", program_invocation_short_name);
                 return -EINVAL;
         }
 
@@ -108,8 +118,6 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-        const char *id = NULL;
-        int retval = EXIT_SUCCESS;
         int r;
 
         /* This is mostly intended to be used for scripts which want
@@ -125,42 +133,55 @@ int main(int argc, char *argv[]) {
 
         switch (arg_mode) {
 
-        case ANY_VIRTUALIZATION: {
-                int v;
-
-                v = detect_virtualization(&id);
-                if (v < 0) {
-                        log_error_errno(v, "Failed to check for virtualization: %m");
+        case ONLY_VM:
+                r = detect_vm();
+                if (r < 0) {
+                        log_error_errno(r, "Failed to check for VM: %m");
                         return EXIT_FAILURE;
                 }
 
-                retval = v != VIRTUALIZATION_NONE ? EXIT_SUCCESS : EXIT_FAILURE;
                 break;
-        }
 
         case ONLY_CONTAINER:
-                r = detect_container(&id);
+                r = detect_container();
                 if (r < 0) {
                         log_error_errno(r, "Failed to check for container: %m");
                         return EXIT_FAILURE;
                 }
 
-                retval = r > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
                 break;
 
-        case ONLY_VM:
-                r = detect_vm(&id);
+        case ONLY_CHROOT:
+                r = running_in_chroot();
                 if (r < 0) {
-                        log_error_errno(r, "Failed to check for vm: %m");
+                        log_error_errno(r, "Failed to check for chroot() environment: %m");
                         return EXIT_FAILURE;
                 }
 
-                retval = r > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+                return r ? EXIT_SUCCESS : EXIT_FAILURE;
+
+        case ONLY_PRIVATE_USERS:
+                r = running_in_userns();
+                if (r < 0) {
+                        log_error_errno(r, "Failed to check for user namespace: %m");
+                        return EXIT_FAILURE;
+                }
+
+                return r ? EXIT_SUCCESS : EXIT_FAILURE;
+
+        case ANY_VIRTUALIZATION:
+        default:
+                r = detect_virtualization();
+                if (r < 0) {
+                        log_error_errno(r, "Failed to check for virtualization: %m");
+                        return EXIT_FAILURE;
+                }
+
                 break;
         }
 
         if (!arg_quiet)
-                puts(id ? id : "none");
+                puts(virtualization_to_string(r));
 
-        return retval;
+        return r != VIRTUALIZATION_NONE ? EXIT_SUCCESS : EXIT_FAILURE;
 }

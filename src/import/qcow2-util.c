@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,10 +20,11 @@
 
 #include <zlib.h>
 
-#include "util.h"
-#include "sparse-endian.h"
-#include "qcow2-util.h"
+#include "alloc-util.h"
 #include "btrfs-util.h"
+#include "qcow2-util.h"
+#include "sparse-endian.h"
+#include "util.h"
 
 #define QCOW2_MAGIC 0x514649fb
 
@@ -214,8 +214,7 @@ static int verify_header(const Header *header) {
         if (HEADER_MAGIC(header) != QCOW2_MAGIC)
                 return -EBADMSG;
 
-        if (HEADER_VERSION(header) != 2 &&
-            HEADER_VERSION(header) != 3)
+        if (!IN_SET(HEADER_VERSION(header), 2, 3))
                 return -EOPNOTSUPP;
 
         if (HEADER_CRYPT_METHOD(header) != 0)

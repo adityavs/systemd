@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
 
-#include <util.h>
-#include <fileio.h>
-#include <time-util.h>
-#include <acpi-fpdt.h>
+#include "acpi-fpdt.h"
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "time-util.h"
 
 struct acpi_table_header {
         char signature[4];
@@ -119,7 +120,7 @@ int acpi_get_boot_usec(usec_t *loader_start, usec_t *loader_exit) {
         }
 
         if (ptr == 0)
-                return -EINVAL;
+                return -ENODATA;
 
         /* read Firmware Basic Boot Performance Data Record */
         fd = open("/dev/mem", O_CLOEXEC|O_RDONLY);
@@ -145,6 +146,10 @@ int acpi_get_boot_usec(usec_t *loader_start, usec_t *loader_exit) {
 
         if (brec.type != ACPI_FPDT_BOOT_REC)
                 return -EINVAL;
+
+        if (brec.exit_services_exit == 0)
+                /* Non-UEFI compatible boot. */
+                return -ENODATA;
 
         if (brec.startup_start == 0 || brec.exit_services_exit < brec.startup_start)
                 return -EINVAL;

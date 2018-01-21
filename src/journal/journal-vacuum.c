@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,20 +22,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sd-id128.h"
+
+#include "alloc-util.h"
+#include "dirent-util.h"
+#include "fd-util.h"
 #include "journal-def.h"
 #include "journal-file.h"
 #include "journal-vacuum.h"
-#include "sd-id128.h"
+#include "parse-util.h"
+#include "string-util.h"
 #include "util.h"
+#include "xattr-util.h"
 
 struct vacuum_info {
         uint64_t usage;
         char *filename;
 
         uint64_t realtime;
+
         sd_id128_t seqnum_id;
         uint64_t seqnum;
-
         bool have_seqnum;
 };
 
@@ -67,19 +73,18 @@ static int vacuum_compare(const void *_a, const void *_b) {
 }
 
 static void patch_realtime(
-                const char *dir,
+                int fd,
                 const char *fn,
                 const struct stat *st,
                 unsigned long long *realtime) {
 
-        _cleanup_free_ const char *path = NULL;
         usec_t x, crtime = 0;
 
         /* The timestamp was determined by the file name, but let's
          * see if the file might actually be older than the file name
          * suggested... */
 
-        assert(dir);
+        assert(fd >= 0);
         assert(fn);
         assert(st);
         assert(realtime);
@@ -101,14 +106,7 @@ static void patch_realtime(
          * unfortunately there's currently no sane API to query
          * it. Hence let's implement this manually... */
 
-        /* Unfortunately there is is not fgetxattrat(), so we need to
-         * go via path here. :-( */
-
-        path = strjoin(dir, "/", fn, NULL);
-        if (!path)
-                return;
-
-        if (path_getcrtime(path, &crtime) >= 0) {
+        if (fd_getcrtime_at(fd, fn, &crtime, 0) >= 0) {
                 if (crtime < *realtime)
                         *realtime = crtime;
         }
@@ -120,9 +118,13 @@ static int journal_file_empty(int dir_fd, const char *name) {
         le64_t n_entries;
         ssize_t n;
 
-        fd = openat(dir_fd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        if (fd < 0)
-                return -errno;
+        fd = openat(dir_fd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK|O_NOATIME);
+        if (fd < 0) {
+                /* Maybe failed due to O_NOATIME and lack of privileges? */
+                fd = openat(dir_fd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+                if (fd < 0)
+                        return -errno;
+        }
 
         if (fstat(fd, &st) < 0)
                 return -errno;
@@ -144,22 +146,24 @@ static int journal_file_empty(int dir_fd, const char *name) {
 int journal_directory_vacuum(
                 const char *directory,
                 uint64_t max_use,
+                uint64_t n_max_files,
                 usec_t max_retention_usec,
                 usec_t *oldest_usec,
                 bool verbose) {
 
         _cleanup_closedir_ DIR *d = NULL;
-        int r = 0;
         struct vacuum_info *list = NULL;
-        unsigned n_list = 0, i;
+        unsigned n_list = 0, i, n_active_files = 0;
         size_t n_allocated = 0;
         uint64_t sum = 0, freed = 0;
         usec_t retention_limit = 0;
         char sbytes[FORMAT_BYTES_MAX];
+        struct dirent *de;
+        int r;
 
         assert(directory);
 
-        if (max_use <= 0 && max_retention_usec <= 0)
+        if (max_use <= 0 && max_retention_usec <= 0 && n_max_files <= 0)
                 return 0;
 
         if (max_retention_usec > 0) {
@@ -174,27 +178,20 @@ int journal_directory_vacuum(
         if (!d)
                 return -errno;
 
-        for (;;) {
-                struct dirent *de;
-                size_t q;
-                struct stat st;
-                char *p;
+        FOREACH_DIRENT_ALL(de, d, r = -errno; goto finish) {
+
                 unsigned long long seqnum = 0, realtime;
+                _cleanup_free_ char *p = NULL;
                 sd_id128_t seqnum_id;
                 bool have_seqnum;
+                uint64_t size;
+                struct stat st;
+                size_t q;
 
-                errno = 0;
-                de = readdir(d);
-                if (!de && errno != 0) {
-                        r = -errno;
-                        goto finish;
-                }
-
-                if (!de)
-                        break;
-
-                if (fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+                if (fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+                        log_debug_errno(errno, "Failed to stat file %s while vacuuming, ignoring: %m", de->d_name);
                         continue;
+                }
 
                 if (!S_ISREG(st.st_mode))
                         continue;
@@ -203,15 +200,20 @@ int journal_directory_vacuum(
 
                 if (endswith(de->d_name, ".journal")) {
 
-                        /* Vacuum archived files */
+                        /* Vacuum archived files. Active files are
+                         * left around */
 
-                        if (q < 1 + 32 + 1 + 16 + 1 + 16 + 8)
+                        if (q < 1 + 32 + 1 + 16 + 1 + 16 + 8) {
+                                n_active_files++;
                                 continue;
+                        }
 
                         if (de->d_name[q-8-16-1] != '-' ||
                             de->d_name[q-8-16-1-16-1] != '-' ||
-                            de->d_name[q-8-16-1-16-1-32-1] != '@')
+                            de->d_name[q-8-16-1-16-1-32-1] != '@') {
+                                n_active_files++;
                                 continue;
+                        }
 
                         p = strdup(de->d_name);
                         if (!p) {
@@ -221,12 +223,12 @@ int journal_directory_vacuum(
 
                         de->d_name[q-8-16-1-16-1] = 0;
                         if (sd_id128_from_string(de->d_name + q-8-16-1-16-1-32, &seqnum_id) < 0) {
-                                free(p);
+                                n_active_files++;
                                 continue;
                         }
 
                         if (sscanf(de->d_name + q-8-16-1-16, "%16llx-%16llx.journal", &seqnum, &realtime) != 2) {
-                                free(p);
+                                n_active_files++;
                                 continue;
                         }
 
@@ -237,12 +239,16 @@ int journal_directory_vacuum(
 
                         /* Vacuum corrupted files */
 
-                        if (q < 1 + 16 + 1 + 16 + 8 + 1)
+                        if (q < 1 + 16 + 1 + 16 + 8 + 1) {
+                                n_active_files++;
                                 continue;
+                        }
 
                         if (de->d_name[q-1-8-16-1] != '-' ||
-                            de->d_name[q-1-8-16-1-16-1] != '@')
+                            de->d_name[q-1-8-16-1-16-1] != '@') {
+                                n_active_files++;
                                 continue;
+                        }
 
                         p = strdup(de->d_name);
                         if (!p) {
@@ -251,55 +257,68 @@ int journal_directory_vacuum(
                         }
 
                         if (sscanf(de->d_name + q-1-8-16-1-16, "%16llx-%16llx.journal~", &realtime, &tmp) != 2) {
-                                free(p);
+                                n_active_files++;
                                 continue;
                         }
 
                         have_seqnum = false;
-                } else
-                        /* We do not vacuum active files or unknown files! */
+                } else {
+                        /* We do not vacuum unknown files! */
+                        log_debug("Not vacuuming unknown file %s.", de->d_name);
                         continue;
+                }
 
-                if (journal_file_empty(dirfd(d), p)) {
+                size = 512UL * (uint64_t) st.st_blocks;
+
+                r = journal_file_empty(dirfd(d), p);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed check if %s is empty, ignoring: %m", p);
+                        continue;
+                }
+                if (r > 0) {
                         /* Always vacuum empty non-online files. */
 
-                        uint64_t size = 512UL * (uint64_t) st.st_blocks;
-
                         if (unlinkat(dirfd(d), p, 0) >= 0) {
-                                log_full(verbose ? LOG_INFO : LOG_DEBUG, "Deleted empty archived journal %s/%s (%s).", directory, p, format_bytes(sbytes, sizeof(sbytes), size));
+
+                                log_full(verbose ? LOG_INFO : LOG_DEBUG,
+                                         "Deleted empty archived journal %s/%s (%s).", directory, p, format_bytes(sbytes, sizeof(sbytes), size));
+
                                 freed += size;
                         } else if (errno != ENOENT)
                                 log_warning_errno(errno, "Failed to delete empty archived journal %s/%s: %m", directory, p);
 
-                        free(p);
                         continue;
                 }
 
-                patch_realtime(directory, p, &st, &realtime);
+                patch_realtime(dirfd(d), p, &st, &realtime);
 
                 if (!GREEDY_REALLOC(list, n_allocated, n_list + 1)) {
-                        free(p);
                         r = -ENOMEM;
                         goto finish;
                 }
 
                 list[n_list].filename = p;
-                list[n_list].usage = 512UL * (uint64_t) st.st_blocks;
+                list[n_list].usage = size;
                 list[n_list].seqnum = seqnum;
                 list[n_list].realtime = realtime;
                 list[n_list].seqnum_id = seqnum_id;
                 list[n_list].have_seqnum = have_seqnum;
+                n_list++;
 
-                sum += list[n_list].usage;
-
-                n_list ++;
+                p = NULL;
+                sum += size;
         }
 
         qsort_safe(list, n_list, sizeof(struct vacuum_info), vacuum_compare);
 
         for (i = 0; i < n_list; i++) {
+                unsigned left;
+
+                left = n_active_files + n_list - i;
+
                 if ((max_retention_usec <= 0 || list[i].realtime >= retention_limit) &&
-                    (max_use <= 0 || sum <= max_use))
+                    (max_use <= 0 || sum <= max_use) &&
+                    (n_max_files <= 0 || left <= n_max_files))
                         break;
 
                 if (unlinkat(dirfd(d), list[i].filename, 0) >= 0) {
@@ -318,12 +337,14 @@ int journal_directory_vacuum(
         if (oldest_usec && i < n_list && (*oldest_usec == 0 || list[i].realtime < *oldest_usec))
                 *oldest_usec = list[i].realtime;
 
+        r = 0;
+
 finish:
         for (i = 0; i < n_list; i++)
                 free(list[i].filename);
         free(list);
 
-        log_full(verbose ? LOG_INFO : LOG_DEBUG, "Vacuuming done, freed %s of archived journals on disk.", format_bytes(sbytes, sizeof(sbytes), freed));
+        log_full(verbose ? LOG_INFO : LOG_DEBUG, "Vacuuming done, freed %s of archived journals from %s.", format_bytes(sbytes, sizeof(sbytes), freed), directory);
 
         return r;
 }

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2008-2009 Kay Sievers <kay@vrfy.org>
  *
@@ -15,16 +16,17 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stddef.h>
-#include <string.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <getopt.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "udev.h"
+#include "string-util.h"
 #include "udev-util.h"
+#include "udev.h"
 #include "udevadm-util.h"
 #include "util.h"
 
@@ -66,10 +68,10 @@ static const char *keyval(const char *str, const char **val, char *buf, size_t s
 }
 
 static void help(void) {
-        printf("%s trigger OPTIONS\n\n"
+        printf("%s trigger [OPTIONS] DEVPATH\n\n"
                "Request events from the kernel.\n\n"
                "  -h --help                         Show this help\n"
-               "     --version                      Show package version\n"
+               "  -V --version                      Show package version\n"
                "  -v --verbose                      Print the list of devices while running\n"
                "  -n --dry-run                      Do not actually trigger the events\n"
                "  -t --type=                        Type of events to trigger\n"
@@ -107,6 +109,7 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
                 { "sysname-match",     required_argument, NULL, 'y'      },
                 { "name-match",        required_argument, NULL, ARG_NAME },
                 { "parent-match",      required_argument, NULL, 'b'      },
+                { "version",           no_argument,       NULL, 'V'      },
                 { "help",              no_argument,       NULL, 'h'      },
                 {}
         };
@@ -116,13 +119,13 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
         } device_type = TYPE_DEVICES;
         const char *action = "change";
         _cleanup_udev_enumerate_unref_ struct udev_enumerate *udev_enumerate = NULL;
-        int c;
+        int c, r;
 
         udev_enumerate = udev_enumerate_new(udev);
         if (udev_enumerate == NULL)
                 return 1;
 
-        while ((c = getopt_long(argc, argv, "vno:t:c:s:S:a:A:p:g:y:b:h", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "vnt:c:s:S:a:A:p:g:y:b:Vh", options, NULL)) >= 0) {
                 const char *key;
                 const char *val;
                 char buf[UTIL_PATH_SIZE];
@@ -145,7 +148,7 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
                         }
                         break;
                 case 'c':
-                        if (!nulstr_contains("add\0" "remove\0" "change\0", optarg)) {
+                        if (!STR_IN_SET(optarg, "add", "remove", "change")) {
                                 log_error("unknown action '%s'", optarg);
                                 return 2;
                         } else
@@ -153,28 +156,56 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
 
                         break;
                 case 's':
-                        udev_enumerate_add_match_subsystem(udev_enumerate, optarg);
+                        r = udev_enumerate_add_match_subsystem(udev_enumerate, optarg);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add subsystem match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 case 'S':
-                        udev_enumerate_add_nomatch_subsystem(udev_enumerate, optarg);
+                        r = udev_enumerate_add_nomatch_subsystem(udev_enumerate, optarg);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add negative subsystem match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 case 'a':
                         key = keyval(optarg, &val, buf, sizeof(buf));
-                        udev_enumerate_add_match_sysattr(udev_enumerate, key, val);
+                        r = udev_enumerate_add_match_sysattr(udev_enumerate, key, val);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add sysattr match '%s=%s': %m", key, val);
+                                return 2;
+                        }
                         break;
                 case 'A':
                         key = keyval(optarg, &val, buf, sizeof(buf));
-                        udev_enumerate_add_nomatch_sysattr(udev_enumerate, key, val);
+                        r = udev_enumerate_add_nomatch_sysattr(udev_enumerate, key, val);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add negative sysattr match '%s=%s': %m", key, val);
+                                return 2;
+                        }
                         break;
                 case 'p':
                         key = keyval(optarg, &val, buf, sizeof(buf));
-                        udev_enumerate_add_match_property(udev_enumerate, key, val);
+                        r = udev_enumerate_add_match_property(udev_enumerate, key, val);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add property match '%s=%s': %m", key, val);
+                                return 2;
+                        }
                         break;
                 case 'g':
-                        udev_enumerate_add_match_tag(udev_enumerate, optarg);
+                        r = udev_enumerate_add_match_tag(udev_enumerate, optarg);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add tag match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 case 'y':
-                        udev_enumerate_add_match_sysname(udev_enumerate, optarg);
+                        r = udev_enumerate_add_match_sysname(udev_enumerate, optarg);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add sysname match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 case 'b': {
                         _cleanup_udev_device_unref_ struct udev_device *dev;
@@ -185,7 +216,11 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
                                 return 2;
                         }
 
-                        udev_enumerate_add_match_parent(udev_enumerate, dev);
+                        r = udev_enumerate_add_match_parent(udev_enumerate, dev);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add parent match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 }
 
@@ -198,10 +233,17 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
                                 return 2;
                         }
 
-                        udev_enumerate_add_match_parent(udev_enumerate, dev);
+                        r = udev_enumerate_add_match_parent(udev_enumerate, dev);
+                        if (r < 0) {
+                                log_error_errno(r, "could not add parent match '%s': %m", optarg);
+                                return 2;
+                        }
                         break;
                 }
 
+                case 'V':
+                        print_version();
+                        return 0;
                 case 'h':
                         help();
                         return 0;
@@ -221,7 +263,11 @@ static int adm_trigger(struct udev *udev, int argc, char *argv[]) {
                         return 2;
                 }
 
-                udev_enumerate_add_match_parent(udev_enumerate, dev);
+                r = udev_enumerate_add_match_parent(udev_enumerate, dev);
+                if (r < 0) {
+                        log_error_errno(r, "could not add tag match '%s': %m", optarg);
+                        return 2;
+                }
         }
 
         switch (device_type) {

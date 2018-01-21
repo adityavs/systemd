@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,8 +20,10 @@
 
 #include <stdarg.h>
 
-#include "xml.h"
+#include "alloc-util.h"
+#include "string-util.h"
 #include "util.h"
+#include "xml.h"
 
 static void test_one(const char *data, ...) {
         void *state = NULL;

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd
 
@@ -20,8 +21,9 @@
 #include <unistd.h>
 
 #include "async.h"
-#include "util.h"
+#include "fileio.h"
 #include "macro.h"
+#include "util.h"
 
 static bool test_async = false;
 
@@ -35,13 +37,13 @@ int main(int argc, char *argv[]) {
         int fd;
         char name[] = "/tmp/test-asynchronous_close.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
         asynchronous_close(fd);
 
         assert_se(asynchronous_job(async_func, NULL) >= 0);
 
-        assert_se(asynchronous_sync() >= 0);
+        assert_se(asynchronous_sync(NULL) >= 0);
 
         sleep(1);
 

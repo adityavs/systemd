@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,9 +20,11 @@
 
 #include <stdio.h>
 
-#include "util.h"
-#include "terminal-util.h"
+#include "alloc-util.h"
 #include "def.h"
+#include "string-util.h"
+#include "terminal-util.h"
+#include "util.h"
 
 static void test_one(const char *p) {
         _cleanup_free_ char *t;

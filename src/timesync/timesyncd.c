@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,15 +18,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "sd-event.h"
 #include "sd-daemon.h"
-#include "capability.h"
-#include "clock-util.h"
-#include "network-util.h"
-#include "signal-util.h"
+#include "sd-event.h"
 
-#include "timesyncd-manager.h"
+#include "capability-util.h"
+#include "clock-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "mkdir.h"
+#include "network-util.h"
+#include "process-util.h"
+#include "signal-util.h"
 #include "timesyncd-conf.h"
+#include "timesyncd-manager.h"
+#include "user-util.h"
 
 static int load_clock_timestamp(uid_t uid, gid_t gid) {
         _cleanup_close_ int fd = -1;
@@ -42,7 +46,7 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
          * systems lacking a battery backed RTC. We also will adjust
          * the time to at least the build time of systemd. */
 
-        fd = open("/var/lib/systemd/clock", O_RDWR|O_CLOEXEC, 0644);
+        fd = open("/var/lib/systemd/timesync/clock", O_RDWR|O_CLOEXEC, 0644);
         if (fd >= 0) {
                 struct stat st;
                 usec_t stamp;
@@ -55,14 +59,25 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
                                 min = stamp;
                 }
 
-                /* Try to fix the access mode, so that we can still
-                   touch the file after dropping priviliges */
-                fchmod(fd, 0644);
-                fchown(fd, uid, gid);
+                if (geteuid() == 0) {
+                        /* Try to fix the access mode, so that we can still
+                           touch the file after dropping priviliges */
+                        r = fchmod(fd, 0644);
+                        if (r < 0)
+                                return log_error_errno(errno, "Failed to change file access mode: %m");
+                        r = fchown(fd, uid, gid);
+                        if (r < 0)
+                                return log_error_errno(errno, "Failed to change file owner: %m");
+                }
 
-        } else
+        } else {
+                r = mkdir_safe_label("/var/lib/systemd/timesync", 0755, uid, gid, true);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create state directory: %m");
+
                 /* create stamp file with the compiled-in date */
-                touch_file("/var/lib/systemd/clock", true, min, uid, gid, 0644);
+                (void) touch_file("/var/lib/systemd/timesync/clock", false, min, uid, gid, 0644);
+        }
 
         ct = now(CLOCK_REALTIME);
         if (ct < min) {
@@ -82,7 +97,7 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
 int main(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         const char *user = "systemd-timesync";
-        uid_t uid;
+        uid_t uid, uid_current;
         gid_t gid;
         int r;
 
@@ -99,23 +114,28 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        r = get_user_creds(&user, &uid, &gid, NULL, NULL);
-        if (r < 0) {
-                log_error_errno(r, "Cannot resolve user name %s: %m", user);
-                goto finish;
+        uid = uid_current = geteuid();
+        gid = getegid();
+
+        if (uid_current == 0) {
+                r = get_user_creds(&user, &uid, &gid, NULL, NULL);
+                if (r < 0) {
+                        log_error_errno(r, "Cannot resolve user name %s: %m", user);
+                        goto finish;
+                }
         }
 
         r = load_clock_timestamp(uid, gid);
         if (r < 0)
                 goto finish;
 
-        r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
-        if (r < 0)
-                goto finish;
-
-        /* We need one process for ourselves, plus one thread for the asynchronous resolver */
-        if (setrlimit(RLIMIT_NPROC, &RLIMIT_MAKE_CONST(2)) < 0)
-                log_warning_errno(errno, "Failed to lower RLIMIT_NPROC to 2: %m");
+        /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
+         * privileges are already dropped. */
+        if (uid_current == 0) {
+                r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
+                if (r < 0)
+                        goto finish;
+        }
 
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
 
@@ -125,7 +145,7 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        if (clock_is_localtime() > 0) {
+        if (clock_is_localtime(NULL) > 0) {
                 log_info("The system is configured to read the RTC time in the local time zone. "
                          "This mode can not be fully supported. All system time to RTC updates are disabled.");
                 m->rtc_local_time = true;
@@ -135,7 +155,13 @@ int main(int argc, char *argv[]) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse configuration file: %m");
 
-        log_debug("systemd-timesyncd running as pid %lu", (unsigned long) getpid());
+        r = manager_parse_fallback_string(m, NTP_SERVERS);
+        if (r < 0) {
+                log_error_errno(r, "Failed to parse fallback server strings: %m");
+                goto finish;
+        }
+
+        log_debug("systemd-timesyncd running as pid " PID_FMT, getpid_cached());
         sd_notify(false,
                   "READY=1\n"
                   "STATUS=Daemon is running");
@@ -154,7 +180,7 @@ int main(int argc, char *argv[]) {
 
         /* if we got an authoritative time, store it in the file system */
         if (m->sync)
-                touch("/var/lib/systemd/clock");
+                (void) touch("/var/lib/systemd/timesync/clock");
 
         sd_event_get_exit_code(m->event, &r);
 

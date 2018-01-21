@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,16 +19,26 @@
 ***/
 
 #include <sys/sendfile.h>
+
+/* When we include libgen.h because we need dirname() we immediately
+ * undefine basename() since libgen.h defines it as a macro to the POSIX
+ * version which is really broken. We prefer GNU basename(). */
 #include <libgen.h>
 #undef basename
 
 #include "sd-daemon.h"
-#include "util.h"
-#include "ratelimit.h"
+
+#include "alloc-util.h"
 #include "btrfs-util.h"
 #include "copy.h"
-#include "import-common.h"
 #include "export-raw.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "import-common.h"
+#include "missing.h"
+#include "ratelimit.h"
+#include "string-util.h"
+#include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
@@ -79,9 +88,7 @@ RawExport *raw_export_unref(RawExport *e) {
 
         free(e->buffer);
         free(e->path);
-        free(e);
-
-        return NULL;
+        return mfree(e);
 }
 
 int raw_export_new(

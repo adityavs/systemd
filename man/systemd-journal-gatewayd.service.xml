@@ -3,6 +3,8 @@
 "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Zbigniew Jędrzejewski-Szmek
@@ -100,6 +102,23 @@
         with <option>--cert=</option>.</para></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><option>--trust=</option></term>
+
+        <listitem><para>Specify the path to a file containing a
+        CA certificate in PEM format.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-D <replaceable>DIR</replaceable></option></term>
+        <term><option>--directory=<replaceable>DIR</replaceable></option></term>
+
+        <listitem><para>Takes a directory path as argument. If
+        specified, <command>systemd-journal-gatewayd</command> will serve the
+        specified journal directory <replaceable>DIR</replaceable> instead of
+        the default runtime and system journal paths.</para></listitem>
+      </varlistentry>
+
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -118,7 +137,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><uri>/entries[?option1&amp;option2=value...]</uri></term>
+        <term><uri>/entries[?option1&amp;option2=value…]</uri></term>
 
         <listitem><para>Retrieval of events in various formats.</para>
 
@@ -147,7 +166,7 @@
   "hostname" : "fedora",
   "os_pretty_name" : "Fedora 19 (Rawhide)",
   "virtualization" : "kvm",
-  ...}</programlisting>
+  …}</programlisting>
         </para>
         </listitem>
       </varlistentry>
@@ -187,13 +206,13 @@
         one per line
         (like <command>journalctl --output json</command>).
         See <ulink
-        url="http://www.freedesktop.org/wiki/Software/systemd/json">Journal
+        url="https://www.freedesktop.org/wiki/Software/systemd/json">Journal
         JSON Format</ulink> for more information.</para>
         </listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><constant>application/event-stream</constant></term>
+        <term><constant>text/event-stream</constant></term>
 
         <listitem><para>Entries are formatted as JSON data structures,
         wrapped in a format suitable for <ulink
@@ -212,7 +231,7 @@
         transfer
         (like <command>journalctl --output export</command>).
         See <ulink
-        url="http://www.freedesktop.org/wiki/Software/systemd/export">Journal
+        url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal
         Export Format</ulink> for more information.</para>
         </listitem>
       </varlistentry>
@@ -262,7 +281,7 @@
         <term><uri>boot</uri></term>
 
         <listitem><para>Limit events to the current boot of the system
-        (like <command>journalctl --this--boot</command>).</para></listitem>
+        (like <command>journalctl -b</command>).</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -279,7 +298,7 @@
     <title>Examples</title>
     <para>Retrieve events from this boot from local journal
     in <ulink
-    url="http://www.freedesktop.org/wiki/Software/systemd/export">Journal
+    url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal
     Export Format</ulink>:
     <programlisting>curl --silent -H'Accept: application/vnd.fdo.journal' \
        'http://localhost:19531/entries?boot'</programlisting>

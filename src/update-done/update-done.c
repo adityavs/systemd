@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,72 +18,36 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
+#include "alloc-util.h"
+#include "fileio-label.h"
 #include "selinux-util.h"
+#include "util.h"
 
 #define MESSAGE                                                         \
-        "This file was created by systemd-update-done. Its only \n"     \
-        "purpose is to hold a timestamp of the time this directory\n"   \
-        "was updated. See systemd-update-done.service(8).\n"
+        "# This file was created by systemd-update-done. Its only \n"   \
+        "# purpose is to hold a timestamp of the time this directory\n" \
+        "# was updated. See man:systemd-update-done.service(8).\n"
 
 static int apply_timestamp(const char *path, struct timespec *ts) {
-        struct timespec twice[2] = {
-                *ts,
-                *ts
-        };
-        struct stat st;
+        _cleanup_free_ char *message = NULL;
+        int r;
 
-        assert(path);
-        assert(ts);
+        /*
+         * We store the timestamp both as mtime of the file and in the file itself,
+         * to support filesystems which cannot store nanosecond-precision timestamps.
+         */
 
-        if (stat(path, &st) >= 0) {
-                /* Is the timestamp file already newer than the OS? If
-                 * so, there's nothing to do. We ignore the nanosecond
-                 * component of the timestamp, since some file systems
-                 * do not support any better accuracy than 1s and we
-                 * have no way to identify the accuracy
-                 * available. Most notably ext4 on small disks (where
-                 * 128 byte inodes are used) does not support better
-                 * accuracy than 1s. */
-                if (st.st_mtim.tv_sec > ts->tv_sec)
-                        return 0;
+        if (asprintf(&message,
+                     MESSAGE
+                     "TIMESTAMP_NSEC=" NSEC_FMT "\n",
+                     timespec_load_nsec(ts)) < 0)
+                return log_oom();
 
-                /* It is older? Then let's update it */
-                if (utimensat(AT_FDCWD, path, twice, AT_SYMLINK_NOFOLLOW) < 0) {
-
-                        if (errno == EROFS)
-                                return log_debug("Can't update timestamp file %s, file system is read-only.", path);
-
-                        return log_error_errno(errno, "Failed to update timestamp on %s: %m", path);
-                }
-
-        } else if (errno == ENOENT) {
-                _cleanup_close_ int fd = -1;
-                int r;
-
-                /* The timestamp file doesn't exist yet? Then let's create it. */
-
-                r = mac_selinux_create_file_prepare(path, S_IFREG);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set SELinux context for %s: %m", path);
-
-                fd = open(path, O_CREAT|O_EXCL|O_WRONLY|O_TRUNC|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0644);
-                mac_selinux_create_file_clear();
-
-                if (fd < 0) {
-                        if (errno == EROFS)
-                                return log_debug("Can't create timestamp file %s, file system is read-only.", path);
-
-                        return log_error_errno(errno, "Failed to create timestamp file %s: %m", path);
-                }
-
-                (void) loop_write(fd, MESSAGE, strlen(MESSAGE), false);
-
-                if (futimens(fd, twice) < 0)
-                        return log_error_errno(errno, "Failed to update timestamp on %s: %m", path);
-        } else
-                log_error_errno(errno, "Failed to stat() timestamp file %s: %m", path);
-
+        r = write_string_file_atomic_label_ts(path, message, ts);
+        if (r == -EROFS)
+                return log_debug("Cannot create \"%s\", file system is read-only.", path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write \"%s\": %m", path);
         return 0;
 }
 
@@ -101,7 +64,7 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = mac_selinux_init(NULL);
+        r = mac_selinux_init();
         if (r < 0) {
                 log_error_errno(r, "SELinux setup failed: %m");
                 goto finish;

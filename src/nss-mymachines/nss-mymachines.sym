@@ -1,4 +1,6 @@
 /***
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   systemd is free software; you can redistribute it and/or modify it
@@ -13,5 +15,9 @@ global:
         _nss_mymachines_gethostbyname2_r;
         _nss_mymachines_gethostbyname3_r;
         _nss_mymachines_gethostbyname4_r;
+        _nss_mymachines_getpwnam_r;
+        _nss_mymachines_getpwuid_r;
+        _nss_mymachines_getgrnam_r;
+        _nss_mymachines_getgrgid_r;
 local: *;
 };

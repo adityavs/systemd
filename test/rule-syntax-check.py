@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1+
+#
 # Simple udev rules syntax checker
 #
 # (C) 2010 Canonical Ltd.
@@ -21,26 +24,19 @@ import sys
 import os
 from glob import glob
 
-if len(sys.argv) > 1:
-    # explicit rule file list
-    rules_files = sys.argv[1:]
-else:
-    # take them from the build dir
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    rules_dir = os.path.join(os.environ.get('top_srcdir', root_dir), 'rules')
-    if not os.path.isdir(rules_dir):
-        sys.stderr.write('No rules files given, and %s does not exist, aborting' % rules_dir)
-        sys.exit(2)
-    rules_files = glob(os.path.join(rules_dir, '*.rules'))
+rules_files = sys.argv[1:]
+if not rules_files:
+    sys.exit('Specify files to test as arguments')
 
-no_args_tests = re.compile('(ACTION|DEVPATH|KERNELS?|NAME|SYMLINK|SUBSYSTEMS?|DRIVERS?|TAG|RESULT|TEST)\s*(?:=|!)=\s*"([^"]*)"$')
-args_tests = re.compile('(ATTRS?|ENV|TEST){([a-zA-Z0-9/_.*%-]+)}\s*(?:=|!)=\s*"([^"]*)"$')
-no_args_assign = re.compile('(NAME|SYMLINK|OWNER|GROUP|MODE|TAG|PROGRAM|RUN|LABEL|GOTO|WAIT_FOR|OPTIONS|IMPORT)\s*(?:\+=|:=|=)\s*"([^"]*)"$')
-args_assign = re.compile('(ATTR|ENV|IMPORT|RUN){([a-zA-Z0-9/_.*%-]+)}\s*(=|\+=)\s*"([^"]*)"$')
+no_args_tests = re.compile(r'(ACTION|DEVPATH|KERNELS?|NAME|SYMLINK|SUBSYSTEMS?|DRIVERS?|TAG|RESULT|TEST)\s*(?:=|!)=\s*"([^"]*)"$')
+args_tests = re.compile(r'(ATTRS?|ENV|TEST){([a-zA-Z0-9/_.*%-]+)}\s*(?:=|!)=\s*"([^"]*)"$')
+no_args_assign = re.compile(r'(NAME|SYMLINK|OWNER|GROUP|MODE|TAG|PROGRAM|RUN|LABEL|GOTO|OPTIONS|IMPORT)\s*(?:\+=|:=|=)\s*"([^"]*)"$')
+args_assign = re.compile(r'(ATTR|ENV|IMPORT|RUN){([a-zA-Z0-9/_.*%-]+)}\s*(=|\+=)\s*"([^"]*)"$')
 
 result = 0
 buffer = ''
 for path in rules_files:
+    print('# looking at {}'.format(path))
     lineno = 0
     for line in open(path):
         lineno += 1
@@ -63,9 +59,9 @@ for path in rules_files:
             if not (no_args_tests.match(clause) or args_tests.match(clause) or
                     no_args_assign.match(clause) or args_assign.match(clause)):
 
-                print('Invalid line %s:%i: %s' % (path, lineno, line))
-                print('  clause: %s' % clause)
-                print('')
+                print('Invalid line {}:{}: {}'.format(path, lineno, line))
+                print('  clause:', clause)
+                print()
                 result = 1
                 break
 

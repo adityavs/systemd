@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,10 +20,10 @@
 
 #include <stdlib.h>
 
-#include "util.h"
-#include "macro.h"
-
+#include "alloc-util.h"
 #include "bus-label.h"
+#include "hexdecoct.h"
+#include "macro.h"
 
 char *bus_label_escape(const char *s) {
         char *r, *t;

@@ -1,4 +1,5 @@
-/*
+/* SPDX-License-Identifier: LGPL-2.1+
+ *
  * libudev - interface to udev device information
  *
  * Copyright (C) 2008 Kay Sievers <kay@vrfy.org>
@@ -10,16 +11,18 @@
  */
 
 #include <errno.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <string.h>
-#include <unistd.h>
 #include <poll.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "format-util.h"
 #include "socket-util.h"
-#include "formats-util.h"
 #include "udev.h"
 
 /* wire protocol magic must match */
@@ -92,13 +95,18 @@ struct udev_ctrl *udev_ctrl_new_from_fd(struct udev *udev, int fd) {
                 uctrl->bound = true;
                 uctrl->sock = fd;
         }
+
+        /*
+         * FIXME: remove it as soon as we can depend on this:
+         *   http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=90c6bd34f884cd9cee21f1d152baf6c18bcac949
+         */
         r = setsockopt(uctrl->sock, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on));
         if (r < 0)
                 log_warning_errno(errno, "could not set SO_PASSCRED: %m");
 
         uctrl->saddr.un.sun_family = AF_LOCAL;
         strscpy(uctrl->saddr.un.sun_path, sizeof(uctrl->saddr.un.sun_path), "/run/udev/control");
-        uctrl->addrlen = offsetof(struct sockaddr_un, sun_path) + strlen(uctrl->saddr.un.sun_path);
+        uctrl->addrlen = SOCKADDR_UN_LEN(uctrl->saddr.un);
         return uctrl;
 }
 
@@ -116,18 +124,12 @@ int udev_ctrl_enable_receiving(struct udev_ctrl *uctrl) {
                         err = bind(uctrl->sock, &uctrl->saddr.sa, uctrl->addrlen);
                 }
 
-                if (err < 0) {
-                        err = -errno;
-                        log_error_errno(errno, "bind failed: %m");
-                        return err;
-                }
+                if (err < 0)
+                        return log_error_errno(errno, "bind failed: %m");
 
                 err = listen(uctrl->sock, 0);
-                if (err < 0) {
-                        err = -errno;
-                        log_error_errno(errno, "listen failed: %m");
-                        return err;
-                }
+                if (err < 0)
+                        return log_error_errno(errno, "listen failed: %m");
 
                 uctrl->bound = true;
                 uctrl->cleanup_socket = true;
@@ -210,8 +212,7 @@ struct udev_ctrl_connection *udev_ctrl_get_connection(struct udev_ctrl *uctrl) {
 err:
         if (conn->sock >= 0)
                 close(conn->sock);
-        free(conn);
-        return NULL;
+        return mfree(conn);
 }
 
 struct udev_ctrl_connection *udev_ctrl_connection_ref(struct udev_ctrl_connection *conn) {
@@ -239,7 +240,7 @@ static int ctrl_send(struct udev_ctrl *uctrl, enum udev_ctrl_msg_type type, int 
         int err = 0;
 
         memzero(&ctrl_msg_wire, sizeof(struct udev_ctrl_msg_wire));
-        strcpy(ctrl_msg_wire.version, "udev-" VERSION);
+        strcpy(ctrl_msg_wire.version, "udev-" PACKAGE_VERSION);
         ctrl_msg_wire.magic = UDEV_CTRL_MAGIC;
         ctrl_msg_wire.type = type;
 
@@ -379,12 +380,13 @@ struct udev_ctrl_msg *udev_ctrl_receive_msg(struct udev_ctrl_connection *conn) {
         cmsg_close_all(&smsg);
 
         cmsg = CMSG_FIRSTHDR(&smsg);
-        cred = (struct ucred *) CMSG_DATA(cmsg);
 
         if (cmsg == NULL || cmsg->cmsg_type != SCM_CREDENTIALS) {
                 log_error("no sender credentials received, message ignored");
                 goto err;
         }
+
+        cred = (struct ucred *) CMSG_DATA(cmsg);
 
         if (cred->uid != 0) {
                 log_error("sender uid="UID_FMT", message ignored", cred->uid);

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
+
 /***
   This file is part of systemd.
 
@@ -18,8 +21,6 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#pragma once
-
 #include "hashmap.h"
 #include "set.h"
 
@@ -34,7 +35,7 @@ struct sd_device {
         uint64_t properties_generation; /* changes whenever the properties are changed */
         uint64_t properties_iterator_generation; /* generation when iteration was started */
 
-        /* the subset of the properties that should be written to the db*/
+        /* the subset of the properties that should be written to the db */
         OrderedHashmap *properties_db;
 
         Hashmap *sysattr_values; /* cached sysattr values */
@@ -76,6 +77,8 @@ struct sd_device {
 
         char *subsystem;
         bool subsystem_set; /* don't reread subsystem */
+        char *driver_subsystem; /* only set for the 'drivers' subsystem */
+        bool driver_subsystem_set; /* don't reread subsystem */
         char *driver;
         bool driver_set; /* don't reread driver */
 
@@ -102,6 +105,8 @@ typedef enum DeviceAction {
         DEVICE_ACTION_MOVE,
         DEVICE_ACTION_ONLINE,
         DEVICE_ACTION_OFFLINE,
+        DEVICE_ACTION_BIND,
+        DEVICE_ACTION_UNBIND,
         _DEVICE_ACTION_MAX,
         _DEVICE_ACTION_INVALID = -1,
 } DeviceAction;

@@ -2,6 +2,8 @@
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -43,61 +45,35 @@
   <refnamediv>
     <refname>systemd-vconsole-setup.service</refname>
     <refname>systemd-vconsole-setup</refname>
-    <refpurpose>Configure the virtual console at boot</refpurpose>
+    <refpurpose>Configure the virtual consoles</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
     <para><filename>systemd-vconsole-setup.service</filename></para>
-    <para><filename>/usr/lib/systemd/systemd-vconsole-setup</filename></para>
+    <cmdsynopsis>
+      <command>/usr/lib/systemd/systemd-vconsole-setup</command>
+      <arg choice="opt">TTY</arg>
+    </cmdsynopsis>
   </refsynopsisdiv>
 
   <refsect1>
     <title>Description</title>
 
-    <para><filename>systemd-vconsole-setup.service</filename> is an
-    early-boot service that configures the virtual console font and
-    console keymap. Internally it calls
-    <citerefentry project='mankier'><refentrytitle>loadkeys</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    and
-    <citerefentry project='die-net'><refentrytitle>setfont</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    <para><filename>systemd-vconsole-setup</filename> sets up and configures either all virtual consoles, or — if the
+    optional <replaceable>TTY</replaceable> parameter is provided — a specific one. When the system is booting up it's
+    called by <citerefentry><refentrytitle>systemd-udevd</refentrytitle><manvolnum>8</manvolnum></citerefentry> during
+    VT console subsystem initialization.  Also,
+    <citerefentry><refentrytitle>systemd-localed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry> invokes
+    it as needed when language or console changes are made. Internally, this program calls <citerefentry
+    project='mankier'><refentrytitle>loadkeys</refentrytitle><manvolnum>1</manvolnum></citerefentry> and <citerefentry
+    project='die-net'><refentrytitle>setfont</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+    </para>
 
-    <para>See
-    <citerefentry><refentrytitle>vconsole.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for information about the configuration files understood by this
-    service.</para>
+    <para>Execute <command>systemctl restart systemd-vconsole-setup.service</command> in order to apply any manual
+    changes made to <filename>/etc/vconsole.conf</filename>.</para>
 
-
-  </refsect1>
-
-  <refsect1>
-    <title>Kernel Command Line</title>
-
-    <para>A few configuration parameters from
-    <filename>vconsole.conf</filename> may be overridden on the kernel
-    command line:</para>
-
-    <variablelist class='kernel-commandline-options'>
-      <varlistentry>
-        <term><varname>vconsole.keymap=</varname></term>
-        <term><varname>vconsole.keymap.toggle=</varname></term>
-
-        <listitem><para>Overrides the key mapping table for the
-        keyboard and the second toggle keymap.</para></listitem>
-      </varlistentry>
-      <varlistentry>
-
-        <term><varname>vconsole.font=</varname></term>
-        <term><varname>vconsole.font.map=</varname></term>
-        <term><varname>vconsole.font.unimap=</varname></term>
-
-        <listitem><para>Configures the console font, the console map,
-        and the unicode font map.</para></listitem>
-      </varlistentry>
-    </variablelist>
-
-    <para>See
-    <citerefentry><refentrytitle>vconsole.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for information about these settings.</para>
+    <para>See <citerefentry><refentrytitle>vconsole.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+    information about the configuration files and kernel command line options understood by this program.</para>
   </refsect1>
 
   <refsect1>

@@ -2,6 +2,28 @@
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
+<!--
+  SPDX-License-Identifier: LGPL-2.1+
+
+  This file is part of systemd.
+
+  Copyright 2012 Kay Sievers
+  Copyright 2014 Jason St. John
+
+  systemd is free software; you can redistribute it and/or modify it
+  under the terms of the GNU Lesser General Public License as published by
+  the Free Software Foundation; either version 2.1 of the License, or
+  (at your option) any later version.
+
+  systemd is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+  Lesser General Public License for more details.
+
+  You should have received a copy of the GNU Lesser General Public License
+  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+-->
+
 <refentry id="udev">
   <refentryinfo>
     <title>udev</title>
@@ -443,6 +465,9 @@
             <para>Starting daemons or other long-running processes is not appropriate
             for udev; the forked processes, detached or not, will be unconditionally
             killed after the event handling has finished.</para>
+            <para>Note that running programs that access the network or mount/unmount
+            filesystems is not allowed inside of udev rules, due to the default sandbox
+            that is enforced on <filename>systemd-udevd.service</filename>.</para>
           </listitem>
         </varlistentry>
 
@@ -470,7 +495,7 @@
                 <term><literal>program</literal></term>
                 <listitem>
                   <para>Execute an external program specified as the assigned
-                  value and if it returns successfully
+                  value and, if it returns successfully,
                   import its output, which must be in environment key
                   format. Path specification, command/argument separation,
                   and quoting work like in <varname>RUN</varname>.</para>
@@ -522,15 +547,6 @@
         </varlistentry>
 
         <varlistentry>
-          <term><varname>WAIT_FOR</varname></term>
-          <listitem>
-            <para>Wait for a file to become available or until a timeout of
-            10 seconds expires. The path is relative to the sysfs device;
-            if no path is specified, this waits for an attribute to appear.</para>
-          </listitem>
-        </varlistentry>
-
-        <varlistentry>
           <term><varname>OPTIONS</varname></term>
           <listitem>
             <para>Rule and device options:</para>
@@ -545,7 +561,7 @@
               <varlistentry>
                 <term><option>string_escape=<replaceable>none|replace</replaceable></option></term>
                 <listitem>
-                  <para>Usually control and other possibly unsafe characters are replaced
+                  <para>Usually, control and other possibly unsafe characters are replaced
                   in strings used for device naming. The mode of replacement can be specified
                   with this option.</para>
                 </listitem>
@@ -586,8 +602,8 @@
 
       <para>The <varname>NAME</varname>, <varname>SYMLINK</varname>,
       <varname>PROGRAM</varname>, <varname>OWNER</varname>,
-      <varname>GROUP</varname>, <varname>MODE</varname>, and
-      <varname>RUN</varname> fields support simple string substitutions.
+      <varname>GROUP</varname>, <varname>MODE</varname>, <varname>SECLABEL</varname>,
+      and <varname>RUN</varname> fields support simple string substitutions.
       The <varname>RUN</varname> substitutions are performed after all rules
       have been processed, right before the program is executed, allowing for
       the use of device properties set by earlier matching rules. For all other

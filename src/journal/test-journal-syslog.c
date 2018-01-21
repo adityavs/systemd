@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "alloc-util.h"
 #include "journald-syslog.h"
 #include "macro.h"
+#include "string-util.h"
 
 static void test_syslog_parse_identifier(const char* str,
                                          const char *ident, const char*pid, int ret) {

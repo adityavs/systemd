@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -44,15 +43,16 @@
  */
 
 #include <errno.h>
-#include <stdlib.h>
-#include <inttypes.h>
-#include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
+#include "alloc-util.h"
+#include "hexdecoct.h"
+#include "macro.h"
 #include "utf8.h"
-#include "util.h"
 
-bool unichar_is_valid(uint32_t ch) {
+bool unichar_is_valid(char32_t ch) {
 
         if (ch >= 0x110000) /* End of unicode space */
                 return false;
@@ -66,7 +66,7 @@ bool unichar_is_valid(uint32_t ch) {
         return true;
 }
 
-static bool unichar_is_control(uint32_t ch) {
+static bool unichar_is_control(char32_t ch) {
 
         /*
           0 to ' '-1 is the C0 range.
@@ -74,7 +74,7 @@ static bool unichar_is_control(uint32_t ch) {
           '\t' is in C0 range, but more or less harmless and commonly used.
         */
 
-        return (ch < ' ' && ch != '\t' && ch != '\n') ||
+        return (ch < ' ' && !IN_SET(ch, '\t', '\n')) ||
                 (0x7F <= ch && ch <= 0x9F);
 }
 
@@ -102,8 +102,9 @@ static int utf8_encoded_expected_len(const char *str) {
 }
 
 /* decode one unicode char */
-int utf8_encoded_to_unichar(const char *str) {
-        int unichar, len, i;
+int utf8_encoded_to_unichar(const char *str, char32_t *ret_unichar) {
+        char32_t unichar;
+        int len, i;
 
         assert(str);
 
@@ -111,34 +112,37 @@ int utf8_encoded_to_unichar(const char *str) {
 
         switch (len) {
         case 1:
-                return (int)str[0];
+                *ret_unichar = (char32_t)str[0];
+                return 0;
         case 2:
                 unichar = str[0] & 0x1f;
                 break;
         case 3:
-                unichar = (int)str[0] & 0x0f;
+                unichar = (char32_t)str[0] & 0x0f;
                 break;
         case 4:
-                unichar = (int)str[0] & 0x07;
+                unichar = (char32_t)str[0] & 0x07;
                 break;
         case 5:
-                unichar = (int)str[0] & 0x03;
+                unichar = (char32_t)str[0] & 0x03;
                 break;
         case 6:
-                unichar = (int)str[0] & 0x01;
+                unichar = (char32_t)str[0] & 0x01;
                 break;
         default:
                 return -EINVAL;
         }
 
         for (i = 1; i < len; i++) {
-                if (((int)str[i] & 0xc0) != 0x80)
+                if (((char32_t)str[i] & 0xc0) != 0x80)
                         return -EINVAL;
                 unichar <<= 6;
-                unichar |= (int)str[i] & 0x3f;
+                unichar |= (char32_t)str[i] & 0x3f;
         }
 
-        return unichar;
+        *ret_unichar = unichar;
+
+        return 0;
 }
 
 bool utf8_is_printable_newline(const char* str, size_t length, bool newline) {
@@ -147,15 +151,16 @@ bool utf8_is_printable_newline(const char* str, size_t length, bool newline) {
         assert(str);
 
         for (p = str; length;) {
-                int encoded_len, val;
+                int encoded_len, r;
+                char32_t val;
 
                 encoded_len = utf8_encoded_valid_unichar(p);
                 if (encoded_len < 0 ||
                     (size_t) encoded_len > length)
                         return false;
 
-                val = utf8_encoded_to_unichar(p);
-                if (val < 0 ||
+                r = utf8_encoded_to_unichar(p, &val);
+                if (r < 0 ||
                     unichar_is_control(val) ||
                     (!newline && val == '\n'))
                         return false;
@@ -237,7 +242,7 @@ char *utf8_escape_non_printable(const char *str) {
                                         *(s++) = hexchar((int) *str);
 
                                         str += 1;
-                                        len --;
+                                        len--;
                                 }
                         }
                 } else {
@@ -275,7 +280,7 @@ char *ascii_is_valid(const char *str) {
  * Returns: The length in bytes that the UTF-8 representation does or would
  *          occupy.
  */
-size_t utf8_encode_unichar(char *out_utf8, uint32_t g) {
+size_t utf8_encode_unichar(char *out_utf8, char32_t g) {
 
         if (g < (1 << 7)) {
                 if (out_utf8)
@@ -319,7 +324,7 @@ char *utf16_to_utf8(const void *s, size_t length) {
         t = r;
 
         while (f < (const uint8_t*) s + length) {
-                uint16_t w1, w2;
+                char16_t w1, w2;
 
                 /* see RFC 2781 section 2.2 */
 
@@ -353,7 +358,7 @@ char *utf16_to_utf8(const void *s, size_t length) {
 }
 
 /* expected size used to encode one unicode char */
-static int utf8_unichar_to_encoded_len(int unichar) {
+static int utf8_unichar_to_encoded_len(char32_t unichar) {
 
         if (unichar < 0x80)
                 return 1;
@@ -371,7 +376,8 @@ static int utf8_unichar_to_encoded_len(int unichar) {
 
 /* validate one encoded unicode char and return its length */
 int utf8_encoded_valid_unichar(const char *str) {
-        int len, unichar, i;
+        int len, i, r;
+        char32_t unichar;
 
         assert(str);
 
@@ -388,7 +394,9 @@ int utf8_encoded_valid_unichar(const char *str) {
                 if ((str[i] & 0x80) != 0x80)
                         return -EINVAL;
 
-        unichar = utf8_encoded_to_unichar(str);
+        r = utf8_encoded_to_unichar(str, &unichar);
+        if (r < 0)
+                return r;
 
         /* check if encoded length matches encoded value */
         if (utf8_unichar_to_encoded_len(unichar) != len)

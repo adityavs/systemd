@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1+
+#
 # systemd-sysv-generator integration test
 #
 # (C) 2015 Canonical Ltd.
@@ -23,15 +26,17 @@ import subprocess
 import tempfile
 import shutil
 from glob import glob
+import collections
+from configparser import RawConfigParser
 
-try:
-    from configparser import RawConfigParser
-except ImportError:
-    # python 2
-    from ConfigParser import RawConfigParser
+sysv_generator = './systemd-sysv-generator'
 
-sysv_generator = os.path.join(os.environ.get('builddir', '.'), 'systemd-sysv-generator')
-
+class MultiDict(collections.OrderedDict):
+    def __setitem__(self, key, value):
+        if isinstance(value, list) and key in self:
+            self[key].extend(value)
+        else:
+            super(MultiDict, self).__setitem__(key, value)
 
 class SysvGeneratorTest(unittest.TestCase):
     def setUp(self):
@@ -77,7 +82,14 @@ class SysvGeneratorTest(unittest.TestCase):
         for service in glob(self.out_dir + '/*.service'):
             if os.path.islink(service):
                 continue
-            cp = RawConfigParser()
+            try:
+                # for python3 we need here strict=False to parse multiple
+                # lines with the same key
+                cp = RawConfigParser(dict_type=MultiDict, strict=False)
+            except TypeError:
+                # RawConfigParser in python2 does not have the strict option
+                # but it allows multiple lines with the same key by default
+                cp = RawConfigParser(dict_type=MultiDict)
             cp.optionxform = lambda o: o  # don't lower-case option names
             with open(service) as f:
                 cp.readfp(f)
@@ -137,7 +149,8 @@ class SysvGeneratorTest(unittest.TestCase):
             link = os.path.join(self.out_dir, '%s.target.wants' % target, unit)
             if target in targets:
                 unit_file = os.readlink(link)
-                self.assertTrue(os.path.exists(unit_file))
+                # os.path.exists() will fail on a dangling symlink
+                self.assertTrue(os.path.exists(link))
                 self.assertEqual(os.path.basename(unit_file), unit)
             else:
                 self.assertFalse(os.path.exists(link),
@@ -190,6 +203,15 @@ class SysvGeneratorTest(unittest.TestCase):
         self.assert_enabled('foo.service', ['multi-user', 'graphical'])
         self.assertNotIn('Overwriting', err)
 
+    def test_simple_escaped(self):
+        '''simple service without dependencies, that requires escaping the name'''
+
+        self.add_sysv('foo+', {})
+        self.add_sysv('foo-admin', {})
+        err, results = self.run_generator()
+        self.assertEqual(set(results), {'foo-admin.service', 'foo\\x2b.service'})
+        self.assertNotIn('Overwriting', err)
+
     def test_simple_enabled_some(self):
         '''simple service without dependencies, enabled in some runlevels'''
 
@@ -215,7 +237,7 @@ class SysvGeneratorTest(unittest.TestCase):
         s = self.run_generator()[1]['foo.service']
         self.assertEqual(set(s.options('Unit')),
                          set(['Documentation', 'SourcePath', 'Description', 'After']))
-        self.assertEqual(s.get('Unit', 'After'), 'nss-lookup.target rpcbind.target')
+        self.assertEqual(s.get('Unit', 'After').split(), ['nss-lookup.target', 'rpcbind.target'])
 
     def test_lsb_deps(self):
         '''LSB header dependencies to other services'''
@@ -274,6 +296,16 @@ class SysvGeneratorTest(unittest.TestCase):
         for f in ['bar.service', 'baz.service']:
             self.assertEqual(os.readlink(os.path.join(self.out_dir, f)),
                              'foo.service')
+        self.assertNotIn('Overwriting', err)
+
+    def test_provides_escaped(self):
+        '''a script that Provides: a name that requires escaping'''
+
+        self.add_sysv('foo', {'Provides': 'foo foo+'})
+        err, results = self.run_generator()
+        self.assertEqual(list(results), ['foo.service'])
+        self.assertEqual(os.readlink(os.path.join(self.out_dir, 'foo\\x2b.service')),
+                         'foo.service')
         self.assertNotIn('Overwriting', err)
 
     def test_same_provides_in_multiple_scripts(self):
@@ -362,11 +394,12 @@ class SysvGeneratorTest(unittest.TestCase):
         # backup files (not enabled in rcN.d/)
         shutil.copy(script, script + '.bak')
         shutil.copy(script, script + '.old')
+        shutil.copy(script, script + '.tmp')
+        shutil.copy(script, script + '.new')
 
         err, results = self.run_generator()
         print(err)
-        self.assertEqual(sorted(results),
-                         ['foo.bak.service', 'foo.old.service', 'foo.service'])
+        self.assertEqual(sorted(results), ['foo.service', 'foo.tmp.service'])
 
         # ensure we don't try to create a symlink to itself
         self.assertNotIn('itself', err)

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,13 +20,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#ifdef HAVE_BLKID
-#include <blkid/blkid.h>
+#if HAVE_BLKID
+#include <blkid.h>
 #endif
 
 #include "util.h"
 
-#ifdef HAVE_BLKID
+#if HAVE_BLKID
 DEFINE_TRIVIAL_CLEANUP_FUNC(blkid_probe, blkid_free_probe);
 #define _cleanup_blkid_free_probe_ _cleanup_(blkid_free_probep)
 #endif

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,15 +18,19 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "io-util.h"
 #include "log.h"
-#include "util.h"
 #include "mkdir.h"
+#include "string-util.h"
+#include "util.h"
 
 #define POOL_SIZE_MIN 512
 
@@ -36,7 +39,7 @@ int main(int argc, char *argv[]) {
         _cleanup_free_ void* buf = NULL;
         size_t buf_size = 0;
         ssize_t k;
-        int r;
+        int r, open_rw_error;
         FILE *f;
         bool refresh_seed_file = true;
 
@@ -54,10 +57,9 @@ int main(int argc, char *argv[]) {
         /* Read pool size, if possible */
         f = fopen("/proc/sys/kernel/random/poolsize", "re");
         if (f) {
-                if (fscanf(f, "%zu", &buf_size) > 0) {
+                if (fscanf(f, "%zu", &buf_size) > 0)
                         /* poolsize is in bits on 2.6, but we want bytes */
                         buf_size /= 8;
-                }
 
                 fclose(f);
         }
@@ -84,14 +86,23 @@ int main(int argc, char *argv[]) {
         if (streq(argv[1], "load")) {
 
                 seed_fd = open(RANDOM_SEED, O_RDWR|O_CLOEXEC|O_NOCTTY|O_CREAT, 0600);
+                open_rw_error = -errno;
                 if (seed_fd < 0) {
+                        refresh_seed_file = false;
+
                         seed_fd = open(RANDOM_SEED, O_RDONLY|O_CLOEXEC|O_NOCTTY);
                         if (seed_fd < 0) {
-                                r = log_error_errno(errno, "Failed to open " RANDOM_SEED ": %m");
+                                bool missing = errno == ENOENT;
+
+                                log_full_errno(missing ? LOG_DEBUG : LOG_ERR,
+                                               open_rw_error, "Failed to open " RANDOM_SEED " for writing: %m");
+                                r = log_full_errno(missing ? LOG_DEBUG : LOG_ERR,
+                                                   errno, "Failed to open " RANDOM_SEED " for reading: %m");
+                                if (missing)
+                                        r = 0;
+
                                 goto finish;
                         }
-
-                        refresh_seed_file = false;
                 }
 
                 random_fd = open("/dev/urandom", O_RDWR|O_CLOEXEC|O_NOCTTY, 0600);
@@ -106,9 +117,10 @@ int main(int argc, char *argv[]) {
                 k = loop_read(seed_fd, buf, buf_size, false);
                 if (k < 0)
                         r = log_error_errno(k, "Failed to read seed from " RANDOM_SEED ": %m");
-                else if (k == 0)
+                else if (k == 0) {
+                        r = 0;
                         log_debug("Seed file " RANDOM_SEED " not yet initialized, proceeding.");
-                else {
+                } else {
                         (void) lseek(seed_fd, 0, SEEK_SET);
 
                         r = loop_write(random_fd, buf, (size_t) k, false);

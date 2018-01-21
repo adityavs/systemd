@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "networkd.h"
-#include "network-internal.h"
+#include <sys/param.h>
+
+#include "alloc-util.h"
 #include "dhcp-lease-internal.h"
+#include "hostname-util.h"
+#include "network-internal.h"
+#include "networkd-manager.h"
+#include "string-util.h"
+#include "udev-util.h"
 
 static void test_deserialize_in_addr(void) {
         _cleanup_free_ struct in_addr *addresses = NULL;
@@ -143,8 +148,8 @@ static void test_network_get(Manager *manager, struct udev_device *loopback) {
 static void test_address_equality(void) {
         _cleanup_address_free_ Address *a1 = NULL, *a2 = NULL;
 
-        assert_se(address_new_dynamic(&a1) >= 0);
-        assert_se(address_new_dynamic(&a2) >= 0);
+        assert_se(address_new(&a1) >= 0);
+        assert_se(address_new(&a2) >= 0);
 
         assert_se(address_equal(NULL, NULL));
         assert_se(!address_equal(a1, NULL));
@@ -158,15 +163,16 @@ static void test_address_equality(void) {
         assert_se(address_equal(a1, a2));
 
         assert_se(inet_pton(AF_INET, "192.168.3.9", &a1->in_addr.in));
-        assert_se(address_equal(a1, a2));
+        assert_se(!address_equal(a1, a2));
         assert_se(inet_pton(AF_INET, "192.168.3.9", &a2->in_addr.in));
+        assert_se(address_equal(a1, a2));
+        assert_se(inet_pton(AF_INET, "192.168.3.10", &a1->in_addr_peer.in));
+        assert_se(address_equal(a1, a2));
+        assert_se(inet_pton(AF_INET, "192.168.3.11", &a2->in_addr_peer.in));
         assert_se(address_equal(a1, a2));
         a1->prefixlen = 10;
         assert_se(!address_equal(a1, a2));
         a2->prefixlen = 10;
-        assert_se(address_equal(a1, a2));
-
-        assert_se(inet_pton(AF_INET, "192.168.3.10", &a2->in_addr.in));
         assert_se(address_equal(a1, a2));
 
         a1->family = AF_INET6;
@@ -184,17 +190,66 @@ static void test_address_equality(void) {
         assert_se(!address_equal(a1, a2));
 }
 
+static void test_dhcp_hostname_shorten_overlong(void) {
+        int r;
+
+        {
+                /* simple hostname, no actions, no errors */
+                _cleanup_free_ char *shortened = NULL;
+                r = shorten_overlong("name1", &shortened);
+                assert_se(r == 0);
+                assert_se(streq("name1", shortened));
+        }
+
+        {
+                /* simple fqdn, no actions, no errors */
+                _cleanup_free_ char *shortened = NULL;
+                r = shorten_overlong("name1.example.com", &shortened);
+                assert_se(r == 0);
+                assert_se(streq("name1.example.com", shortened));
+        }
+
+        {
+                /* overlong fqdn, cut to first dot, no errors */
+                _cleanup_free_ char *shortened = NULL;
+                r = shorten_overlong("name1.test-dhcp-this-one-here-is-a-very-very-long-domain.example.com", &shortened);
+                assert_se(r == 1);
+                assert_se(streq("name1", shortened));
+        }
+
+        {
+                /* overlong hostname, cut to HOST_MAX_LEN, no errors */
+                _cleanup_free_ char *shortened = NULL;
+                r = shorten_overlong("test-dhcp-this-one-here-is-a-very-very-long-hostname-without-domainname", &shortened);
+                assert_se(r == 1);
+                assert_se(streq("test-dhcp-this-one-here-is-a-very-very-long-hostname-without-dom", shortened));
+        }
+
+        {
+                /* overlong fqdn, cut to first dot, empty result error */
+                _cleanup_free_ char *shortened = NULL;
+                r = shorten_overlong(".test-dhcp-this-one-here-is-a-very-very-long-hostname.example.com", &shortened);
+                assert_se(r == -EDOM);
+                assert_se(shortened == NULL);
+        }
+
+}
+
 int main(void) {
         _cleanup_manager_free_ Manager *manager = NULL;
-        struct udev *udev;
-        struct udev_device *loopback;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_udev_unref_ struct udev *udev = NULL;
+        _cleanup_udev_device_unref_ struct udev_device *loopback = NULL;
         int r;
 
         test_deserialize_in_addr();
         test_deserialize_dhcp_routes();
         test_address_equality();
+        test_dhcp_hostname_shorten_overlong();
 
-        assert_se(manager_new(&manager) >= 0);
+        assert_se(sd_event_default(&event) >= 0);
+
+        assert_se(manager_new(&manager, event) >= 0);
 
         r = test_load_config(manager);
         if (r == -EPERM)
@@ -210,7 +265,4 @@ int main(void) {
         test_network_get(manager, loopback);
 
         assert_se(manager_rtnl_enumerate_links(manager) >= 0);
-
-        udev_device_unref(loopback);
-        udev_unref(udev);
 }

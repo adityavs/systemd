@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,18 +19,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "selinux-util.h"
-#include "fileio-label.h"
+#include <sys/stat.h>
 
-int write_string_file_atomic_label(const char *fn, const char *line) {
+#include "fileio-label.h"
+#include "fileio.h"
+#include "selinux-util.h"
+
+int write_string_file_atomic_label_ts(const char *fn, const char *line, struct timespec *ts) {
         int r;
 
         r = mac_selinux_create_file_prepare(fn, S_IFREG);
         if (r < 0)
                 return r;
 
-        r = write_string_file_atomic(fn, line);
+        r = write_string_file_ts(fn, line, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC, ts);
 
         mac_selinux_create_file_clear();
 

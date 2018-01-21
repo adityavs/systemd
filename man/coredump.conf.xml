@@ -3,6 +3,8 @@
         "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2014 Zbigniew Jędrzejewski-Szmek
@@ -45,7 +47,7 @@
   <refnamediv>
     <refname>coredump.conf</refname>
     <refname>coredump.conf.d</refname>
-    <refpurpose>Coredump storage configuration files</refpurpose>
+    <refpurpose>Core dump storage configuration files</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -58,9 +60,16 @@
   <refsect1>
     <title>Description</title>
 
-    <para>These files configure the behaviour of
+    <para>These files configure the behavior of
     <citerefentry><refentrytitle>systemd-coredump</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-    a handler for core dumps invoked by the kernel.</para>
+    a handler for core dumps invoked by the kernel. Whether <command>systemd-coredump</command> is used
+    is determined by the kernel's
+    <varname>kernel.core_pattern</varname> <citerefentry project='man-pages'><refentrytitle>sysctl</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    setting. See
+    <citerefentry><refentrytitle>systemd-coredump</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    and
+    <citerefentry project='man-pages'><refentrytitle>core</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    pages for the details.</para>
   </refsect1>
 
   <xi:include href="standard-conf.xml" xpointer="main-conf" />
@@ -76,16 +85,13 @@
       <varlistentry>
         <term><varname>Storage=</varname></term>
 
-        <listitem><para>Controls where to store cores. One of
-        <literal>none</literal>, <literal>external</literal>,
-        <literal>journal</literal>, and <literal>both</literal>. When
-        <literal>none</literal>, the coredumps will be logged but not
-        stored permanently. When <literal>external</literal> (the
-        default), cores will be stored in <filename>/var/lib/systemd/coredump</filename>.
-        When <literal>journal</literal>, cores will be stored in
-        the journal and rotated following normal journal
-        rotation patterns. When <literal>both</literal>, cores
-        will be stored in both locations.</para>
+        <listitem><para>Controls where to store cores. One of <literal>none</literal>,
+        <literal>external</literal>, and <literal>journal</literal>. When
+        <literal>none</literal>, the core dumps will be logged (including the backtrace if
+        possible), but not stored permanently. When <literal>external</literal> (the
+        default), cores will be stored in <filename>/var/lib/systemd/coredump/</filename>.
+        When <literal>journal</literal>, cores will be stored in the journal and rotated
+        following normal journal rotation patterns.</para>
 
         <para>When cores are stored in the journal, they might be
         compressed following journal compression settings, see
@@ -98,7 +104,7 @@
         <term><varname>Compress=</varname></term>
 
         <listitem><para>Controls compression for external
-        storage. Takes a boolean argument, defaults to
+        storage. Takes a boolean argument, which defaults to
         <literal>yes</literal>.</para>
         </listitem>
       </varlistentry>
@@ -107,7 +113,7 @@
         <term><varname>ProcessSizeMax=</varname></term>
 
         <listitem><para>The maximum size in bytes of a core
-        which will be processed. Coredumps exceeding this size
+        which will be processed. Core dumps exceeding this size
         will be logged, but the backtrace will not be generated
         and the core will not be stored.</para></listitem>
       </varlistentry>
@@ -125,21 +131,24 @@
         <term><varname>KeepFree=</varname></term>
 
         <listitem><para>Enforce limits on the disk space taken up by
-        externally stored coredumps. <option>MaxUse=</option> makes
-        sure that old coredumps are removed as soon as the total disk
-        space taken up by coredumps grows beyond this limit (defaults
+        externally stored core dumps. <option>MaxUse=</option> makes
+        sure that old core dumps are removed as soon as the total disk
+        space taken up by core dumps grows beyond this limit (defaults
         to 10% of the total disk size). <option>KeepFree=</option>
         controls how much disk space to keep free at least (defaults
         to 15% of the total disk size). Note that the disk space used
-        by coredumps might temporarily exceed these limits while
-        coredumps are processed. Note that old coredumps are also
+        by core dumps might temporarily exceed these limits while
+        core dumps are processed. Note that old core dumps are also
         removed based on time via
         <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>. Set
-        either value to 0 to turn off size based
+        either value to 0 to turn off size-based
         clean-up.</para></listitem>
       </varlistentry>
     </variablelist>
 
+    <para>The defaults for all values are listed as comments in the
+    template <filename>/etc/systemd/coredump.conf</filename> file that
+    is installed by default.</para>
   </refsect1>
 
   <refsect1>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -27,21 +28,26 @@
  * http://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames
  *
  * Two character prefixes based on the type of interface:
- *   en -- ethernet
- *   sl -- serial line IP (slip)
- *   wl -- wlan
- *   ww -- wwan
+ *   en — Ethernet
+ *   sl — serial line IP (slip)
+ *   wl — wlan
+ *   ww — wwan
  *
  * Type of names:
- *   b<number>                             -- BCMA bus core number
- *   ccw<name>                             -- CCW bus group name
- *   o<index>[d<dev_port>]                 -- on-board device index number
- *   s<slot>[f<function>][d<dev_port>]     -- hotplug slot index number
- *   x<MAC>                                -- MAC address
- *   [P<domain>]p<bus>s<slot>[f<function>][d<dev_port>]
- *                                         -- PCI geographical location
+ *   b<number>                             — BCMA bus core number
+ *   c<bus_id>                             — bus id of a grouped CCW or CCW device,
+ *                                           with all leading zeros stripped [s390]
+ *   o<index>[n<phys_port_name>|d<dev_port>]
+ *                                         — on-board device index number
+ *   s<slot>[f<function>][n<phys_port_name>|d<dev_port>]
+ *                                         — hotplug slot index number
+ *   x<MAC>                                — MAC address
+ *   [P<domain>]p<bus>s<slot>[f<function>][n<phys_port_name>|d<dev_port>]
+ *                                         — PCI geographical location
  *   [P<domain>]p<bus>s<slot>[f<function>][u<port>][..][c<config>][i<interface>]
- *                                         -- USB port number chain
+ *                                         — USB port number chain
+ *   v<slot>                               - VIO slot number (IBM PowerVM)
+ *   a<vendor><model>i<instance>           — Platform bus ACPI instance id
  *
  * All multi-function PCI devices will carry the [f<function>] number in the
  * device name, including the function 0 device.
@@ -53,17 +59,17 @@
  * exported.
  * The usual USB configuration == 1 and interface == 0 values are suppressed.
  *
- * PCI ethernet card with firmware index "1":
+ * PCI Ethernet card with firmware index "1":
  *   ID_NET_NAME_ONBOARD=eno1
  *   ID_NET_NAME_ONBOARD_LABEL=Ethernet Port 1
  *
- * PCI ethernet card in hotplug slot with firmware index number:
+ * PCI Ethernet card in hotplug slot with firmware index number:
  *   /sys/devices/pci0000:00/0000:00:1c.3/0000:05:00.0/net/ens1
  *   ID_NET_NAME_MAC=enx000000000466
  *   ID_NET_NAME_PATH=enp5s0
  *   ID_NET_NAME_SLOT=ens1
  *
- * PCI ethernet multi-function card with 2 ports:
+ * PCI Ethernet multi-function card with 2 ports:
  *   /sys/devices/pci0000:00/0000:00:1c.0/0000:02:00.0/net/enp2s0f0
  *   ID_NET_NAME_MAC=enx78e7d1ea46da
  *   ID_NET_NAME_PATH=enp2s0f0
@@ -85,21 +91,32 @@
  *   /sys/devices/pci0000:00/0000:00:1d.0/usb2/2-1/2-1.2/2-1.2:1.0/net/enp0s29u1u2
  *   ID_NET_NAME_MAC=enxd626b3450fb5
  *   ID_NET_NAME_PATH=enp0s29u1u2
+ *
+ * s390 grouped CCW interface:
+ *  /sys/devices/css0/0.0.0007/0.0.f5f0/group_device/net/encf5f0
+ *  ID_NET_NAME_MAC=enx026d3c00000a
+ *  ID_NET_NAME_PATH=encf5f0
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <net/if_arp.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <linux/pci_regs.h>
 
-#include "udev.h"
+#include "dirent-util.h"
+#include "fd-util.h"
 #include "fileio.h"
+#include "stdio-util.h"
+#include "string-util.h"
+#include "udev.h"
+
+#define ONBOARD_INDEX_MAX (16*1024-1)
 
 enum netname_type{
         NET_UNDEF,
@@ -107,7 +124,9 @@ enum netname_type{
         NET_USB,
         NET_BCMA,
         NET_VIRTIO,
-        NET_CCWGROUP,
+        NET_CCW,
+        NET_VIO,
+        NET_PLATFORM,
 };
 
 struct netnames {
@@ -124,20 +143,34 @@ struct netnames {
 
         char usb_ports[IFNAMSIZ];
         char bcma_core[IFNAMSIZ];
-        char ccw_group[IFNAMSIZ];
+        char ccw_busid[IFNAMSIZ];
+        char vio_slot[IFNAMSIZ];
+        char platform_path[IFNAMSIZ];
 };
+
+/* skip intermediate virtio devices */
+static struct udev_device *skip_virtio(struct udev_device *dev) {
+        struct udev_device *parent = dev;
+
+        /* there can only ever be one virtio bus per parent device, so we can
+           safely ignore any virtio buses. see
+           <http://lists.linuxfoundation.org/pipermail/virtualization/2015-August/030331.html> */
+        while (parent && streq_ptr("virtio", udev_device_get_subsystem(parent)))
+                parent = udev_device_get_parent(parent);
+        return parent;
+}
 
 /* retrieve on-board index number and label from firmware */
 static int dev_pci_onboard(struct udev_device *dev, struct netnames *names) {
         unsigned dev_port = 0;
         size_t l;
         char *s;
-        const char *attr;
+        const char *attr, *port_name;
         int idx;
 
-        /* ACPI _DSM  -- device specific method for naming a PCI or PCI Express device */
+        /* ACPI _DSM  — device specific method for naming a PCI or PCI Express device */
         attr = udev_device_get_sysattr_value(names->pcidev, "acpi_index");
-        /* SMBIOS type 41 -- Onboard Devices Extended Information */
+        /* SMBIOS type 41 — Onboard Devices Extended Information */
         if (!attr)
                 attr = udev_device_get_sysattr_value(names->pcidev, "index");
         if (!attr)
@@ -147,15 +180,27 @@ static int dev_pci_onboard(struct udev_device *dev, struct netnames *names) {
         if (idx <= 0)
                 return -EINVAL;
 
+        /* Some BIOSes report rubbish indexes that are excessively high (2^24-1 is an index VMware likes to report for
+         * example). Let's define a cut-off where we don't consider the index reliable anymore. We pick some arbitrary
+         * cut-off, which is somewhere beyond the realistic number of physical network interface a system might
+         * have. Ideally the kernel would already filter his crap for us, but it doesn't currently. */
+        if (idx > ONBOARD_INDEX_MAX)
+                return -ENOENT;
+
         /* kernel provided port index for multiple ports on a single PCI function */
         attr = udev_device_get_sysattr_value(dev, "dev_port");
         if (attr)
                 dev_port = strtol(attr, NULL, 10);
 
+        /* kernel provided front panel port name for multiple port PCI device */
+        port_name = udev_device_get_sysattr_value(dev, "phys_port_name");
+
         s = names->pci_onboard;
         l = sizeof(names->pci_onboard);
         l = strpcpyf(&s, l, "o%d", idx);
-        if (dev_port > 0)
+        if (port_name)
+                l = strpcpyf(&s, l, "n%s", port_name);
+        else if (dev_port > 0)
                 l = strpcpyf(&s, l, "d%d", dev_port);
         if (l == 0)
                 names->pci_onboard[0] = '\0';
@@ -190,9 +235,9 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
         unsigned domain, bus, slot, func, dev_port = 0;
         size_t l;
         char *s;
-        const char *attr;
+        const char *attr, *port_name;
         struct udev_device *pci = NULL;
-        char slots[256], str[256];
+        char slots[PATH_MAX];
         _cleanup_closedir_ DIR *dir = NULL;
         struct dirent *dent;
         int hotplug_slot = 0, err = 0;
@@ -205,6 +250,9 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
         if (attr)
                 dev_port = strtol(attr, NULL, 10);
 
+        /* kernel provided front panel port name for multiple port PCI device */
+        port_name = udev_device_get_sysattr_value(dev, "phys_port_name");
+
         /* compose a name based on the raw kernel's PCI bus, slot numbers */
         s = names->pci_path;
         l = sizeof(names->pci_path);
@@ -213,28 +261,30 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
         l = strpcpyf(&s, l, "p%us%u", bus, slot);
         if (func > 0 || is_pci_multifunction(names->pcidev))
                 l = strpcpyf(&s, l, "f%u", func);
-        if (dev_port > 0)
+        if (port_name)
+                l = strpcpyf(&s, l, "n%s", port_name);
+        else if (dev_port > 0)
                 l = strpcpyf(&s, l, "d%u", dev_port);
         if (l == 0)
                 names->pci_path[0] = '\0';
 
-        /* ACPI _SUN  -- slot user number */
+        /* ACPI _SUN  — slot user number */
         pci = udev_device_new_from_subsystem_sysname(udev, "subsystem", "pci");
         if (!pci) {
                 err = -ENOENT;
                 goto out;
         }
-        snprintf(slots, sizeof(slots), "%s/slots", udev_device_get_syspath(pci));
+
+        xsprintf(slots, "%s/slots", udev_device_get_syspath(pci));
         dir = opendir(slots);
         if (!dir) {
                 err = -errno;
                 goto out;
         }
 
-        for (dent = readdir(dir); dent != NULL; dent = readdir(dir)) {
+        FOREACH_DIRENT_ALL(dent, dir, break) {
                 int i;
-                char *rest;
-                char *address;
+                char *rest, *address, str[PATH_MAX];
 
                 if (dent->d_name[0] == '.')
                         continue;
@@ -243,7 +293,8 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
                         continue;
                 if (i < 1)
                         continue;
-                snprintf(str, sizeof(str), "%s/%s/address", slots, dent->d_name);
+
+                xsprintf(str, "%s/%s/address", slots, dent->d_name);
                 if (read_one_line_file(str, &address) >= 0) {
                         /* match slot address with device by stripping the function */
                         if (strneq(address, udev_device_get_sysname(names->pcidev), strlen(address)))
@@ -263,7 +314,9 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
                 l = strpcpyf(&s, l, "s%d", hotplug_slot);
                 if (func > 0 || is_pci_multifunction(names->pcidev))
                         l = strpcpyf(&s, l, "f%d", func);
-                if (dev_port > 0)
+                if (port_name)
+                        l = strpcpyf(&s, l, "n%s", port_name);
+                else if (dev_port > 0)
                         l = strpcpyf(&s, l, "d%d", dev_port);
                 if (l == 0)
                         names->pci_slot[0] = '\0';
@@ -273,6 +326,87 @@ out:
         return err;
 }
 
+static int names_vio(struct udev_device *dev, struct netnames *names) {
+        struct udev_device *parent;
+        unsigned busid, slotid, ethid;
+        const char *syspath;
+
+        /* check if our direct parent is a VIO device with no other bus in-between */
+        parent = udev_device_get_parent(dev);
+        if (!parent)
+                return -ENOENT;
+
+        if (!streq_ptr("vio", udev_device_get_subsystem(parent)))
+                 return -ENOENT;
+
+        /* The devices' $DEVPATH number is tied to (virtual) hardware (slot id
+         * selected in the HMC), thus this provides a reliable naming (e.g.
+         * "/devices/vio/30000002/net/eth1"); we ignore the bus number, as
+         * there should only ever be one bus, and then remove leading zeros. */
+        syspath = udev_device_get_syspath(dev);
+
+        if (sscanf(syspath, "/sys/devices/vio/%4x%4x/net/eth%u", &busid, &slotid, &ethid) != 3)
+                return -EINVAL;
+
+        xsprintf(names->vio_slot, "v%u", slotid);
+        names->type = NET_VIO;
+        return 0;
+}
+
+#define _PLATFORM_TEST "/sys/devices/platform/vvvvPPPP"
+#define _PLATFORM_PATTERN4 "/sys/devices/platform/%4s%4x:%2x/net/eth%u"
+#define _PLATFORM_PATTERN3 "/sys/devices/platform/%3s%4x:%2x/net/eth%u"
+
+static int names_platform(struct udev_device *dev, struct netnames *names, bool test) {
+        struct udev_device *parent;
+        char vendor[5];
+        unsigned model, instance, ethid;
+        const char *syspath, *pattern, *validchars;
+
+        /* check if our direct parent is a platform device with no other bus in-between */
+        parent = udev_device_get_parent(dev);
+        if (!parent)
+                return -ENOENT;
+
+        if (!streq_ptr("platform", udev_device_get_subsystem(parent)))
+                 return -ENOENT;
+
+        syspath = udev_device_get_syspath(dev);
+
+        /* syspath is too short, to have a valid ACPI instance */
+        if (strlen(syspath) < sizeof _PLATFORM_TEST)
+                return -EINVAL;
+
+        /* Vendor ID can be either PNP ID (3 chars A-Z) or ACPI ID (4 chars A-Z and numerals) */
+        if (syspath[sizeof _PLATFORM_TEST - 1] == ':') {
+                pattern = _PLATFORM_PATTERN4;
+                validchars = UPPERCASE_LETTERS DIGITS;
+        } else {
+                pattern = _PLATFORM_PATTERN3;
+                validchars = UPPERCASE_LETTERS;
+        }
+
+        /* Platform devices are named after ACPI table match, and instance id
+         * eg. "/sys/devices/platform/HISI00C2:00");
+         * The Vendor (3 or 4 char), followed by hexdecimal model number : instance id.
+         */
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        if (sscanf(syspath, pattern, vendor, &model, &instance, &ethid) != 4)
+                return -EINVAL;
+#pragma GCC diagnostic pop
+
+        if (!in_charset(vendor, validchars))
+                return -ENOENT;
+
+        ascii_strlower(vendor);
+
+        xsprintf(names->platform_path, "a%s%xi%u", vendor, model, instance);
+        names->type = NET_PLATFORM;
+        return 0;
+}
+
 static int names_pci(struct udev_device *dev, struct netnames *names) {
         struct udev_device *parent;
 
@@ -280,8 +414,12 @@ static int names_pci(struct udev_device *dev, struct netnames *names) {
         assert(names);
 
         parent = udev_device_get_parent(dev);
+        /* skip virtio subsystem if present */
+        parent = skip_virtio(parent);
+
         if (!parent)
                 return -ENOENT;
+
         /* check if our direct parent is a PCI device with no other bus in-between */
         if (streq_ptr("pci", udev_device_get_subsystem(parent))) {
                 names->type = NET_PCI;
@@ -368,7 +506,7 @@ static int names_bcma(struct udev_device *dev, struct netnames *names) {
                 return -EINVAL;
         /* suppress the common core == 0 */
         if (core > 0)
-                snprintf(names->bcma_core, sizeof(names->bcma_core), "b%u", core);
+                xsprintf(names->bcma_core, "b%u", core);
 
         names->type = NET_BCMA;
         return 0;
@@ -376,8 +514,9 @@ static int names_bcma(struct udev_device *dev, struct netnames *names) {
 
 static int names_ccw(struct  udev_device *dev, struct netnames *names) {
         struct udev_device *cdev;
-        const char *bus_id;
+        const char *bus_id, *subsys;
         size_t bus_id_len;
+        size_t bus_id_start;
         int rc;
 
         assert(dev);
@@ -385,14 +524,17 @@ static int names_ccw(struct  udev_device *dev, struct netnames *names) {
 
         /* Retrieve the associated CCW device */
         cdev = udev_device_get_parent(dev);
+        /* skip virtio subsystem if present */
+        cdev = skip_virtio(cdev);
         if (!cdev)
                 return -ENOENT;
 
-        /* Network devices are always grouped CCW devices */
-        if (!streq_ptr("ccwgroup", udev_device_get_subsystem(cdev)))
+        /* Network devices are either single or grouped CCW devices */
+        subsys = udev_device_get_subsystem(cdev);
+        if (!STRPTR_IN_SET(subsys, "ccwgroup", "ccw"))
                 return -ENOENT;
 
-        /* Retrieve bus-ID of the grouped CCW device.  The bus-ID uniquely
+        /* Retrieve bus-ID of the CCW device.  The bus-ID uniquely
          * identifies the network device on the Linux on System z channel
          * subsystem.  Note that the bus-ID contains lowercase characters.
          */
@@ -405,13 +547,21 @@ static int names_ccw(struct  udev_device *dev, struct netnames *names) {
          * verify each bus-ID part...
          */
         bus_id_len = strlen(bus_id);
-        if (!bus_id_len || bus_id_len < 8 || bus_id_len > 9)
+        if (!IN_SET(bus_id_len, 8, 9))
                 return -EINVAL;
 
+        /* Strip leading zeros from the bus id for aesthetic purposes. This
+         * keeps the ccw names stable, yet much shorter in general case of
+         * bus_id 0.0.0600 -> 600. This is similar to e.g. how PCI domain is
+         * not prepended when it is zero. Preserve the last 0 for 0.0.0000.
+         */
+        bus_id_start = strspn(bus_id, ".0");
+        bus_id += bus_id_start < bus_id_len ? bus_id_start : bus_id_len - 1;
+
         /* Store the CCW bus-ID for use as network device name */
-        rc = snprintf(names->ccw_group, sizeof(names->ccw_group), "ccw%s", bus_id);
-        if (rc >= 0 && rc < (int)sizeof(names->ccw_group))
-                names->type = NET_CCWGROUP;
+        rc = snprintf(names->ccw_busid, sizeof(names->ccw_busid), "c%s", bus_id);
+        if (rc >= 0 && rc < (int)sizeof(names->ccw_busid))
+                names->type = NET_CCW;
         return 0;
 }
 
@@ -457,9 +607,9 @@ static int ieee_oui(struct udev_device *dev, struct netnames *names, bool test) 
         /* skip commonly misused 00:00:00 (Xerox) prefix */
         if (memcmp(names->mac, "\0\0\0", 3) == 0)
                 return -EINVAL;
-        snprintf(str, sizeof(str), "OUI:%02X%02X%02X%02X%02X%02X",
-                 names->mac[0], names->mac[1], names->mac[2],
-                 names->mac[3], names->mac[4], names->mac[5]);
+        xsprintf(str, "OUI:%02X%02X%02X%02X%02X%02X", names->mac[0],
+                 names->mac[1], names->mac[2], names->mac[3], names->mac[4],
+                 names->mac[5]);
         udev_builtin_hwdb_lookup(dev, NULL, str, NULL, test);
         return 0;
 }
@@ -511,7 +661,7 @@ static int builtin_net_id(struct udev_device *dev, int argc, char *argv[], bool 
         if (err >= 0 && names.mac_valid) {
                 char str[IFNAMSIZ];
 
-                snprintf(str, sizeof(str), "%sx%02x%02x%02x%02x%02x%02x", prefix,
+                xsprintf(str, "%sx%02x%02x%02x%02x%02x%02x", prefix,
                          names.mac[0], names.mac[1], names.mac[2],
                          names.mac[3], names.mac[4], names.mac[5]);
                 udev_builtin_add_property(dev, test, "ID_NET_NAME_MAC", str);
@@ -521,10 +671,30 @@ static int builtin_net_id(struct udev_device *dev, int argc, char *argv[], bool 
 
         /* get path names for Linux on System z network devices */
         err = names_ccw(dev, &names);
-        if (err >= 0 && names.type == NET_CCWGROUP) {
+        if (err >= 0 && names.type == NET_CCW) {
                 char str[IFNAMSIZ];
 
-                if (snprintf(str, sizeof(str), "%s%s", prefix, names.ccw_group) < (int)sizeof(str))
+                if (snprintf(str, sizeof(str), "%s%s", prefix, names.ccw_busid) < (int)sizeof(str))
+                        udev_builtin_add_property(dev, test, "ID_NET_NAME_PATH", str);
+                goto out;
+        }
+
+        /* get ibmveth/ibmvnic slot-based names. */
+        err = names_vio(dev, &names);
+        if (err >= 0 && names.type == NET_VIO) {
+                char str[IFNAMSIZ];
+
+                if (snprintf(str, sizeof(str), "%s%s", prefix, names.vio_slot) < (int)sizeof(str))
+                        udev_builtin_add_property(dev, test, "ID_NET_NAME_SLOT", str);
+                goto out;
+        }
+
+        /* get ACPI path names for ARM64 platform devices */
+        err = names_platform(dev, &names, test);
+        if (err >= 0 && names.type == NET_PLATFORM) {
+                char str[IFNAMSIZ];
+
+                if (snprintf(str, sizeof(str), "%s%s", prefix, names.platform_path) < (int)sizeof(str))
                         udev_builtin_add_property(dev, test, "ID_NET_NAME_PATH", str);
                 goto out;
         }

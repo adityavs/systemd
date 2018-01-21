@@ -1,4 +1,5 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
 
 /***
   This file is part of systemd.
@@ -18,8 +19,6 @@
   You should have received a copy of the GNU Lesser General Public License
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
-
-#pragma once
 
 void sigbus_install(void);
 void sigbus_reset(void);

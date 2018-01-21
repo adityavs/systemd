@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2013 Lennart Poettering
@@ -98,6 +100,11 @@
     <varname>WatchdogSec=</varname> in service files. See
     <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for details.</para>
+
+    <para>Use
+    <citerefentry><refentrytitle>sd_event_set_watchdog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+    to enable automatic watchdog support in
+    <citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry>-based event loops.</para>
   </refsect1>
 
   <refsect1>
@@ -116,7 +123,7 @@
 
     <xi:include href="libsystemd-pkgconfig.xml" xpointer="pkgconfig-text"/>
 
-    <para>Internally, this functions parses the
+    <para>Internally, this function parses the
     <varname>$WATCHDOG_PID</varname> and
     <varname>$WATCHDOG_USEC</varname> environment variable. The call
     will ignore these variables if <varname>$WATCHDOG_PID</varname>
@@ -143,22 +150,10 @@
 
         <listitem><para>Set by the system manager for supervised
         process for which watchdog support is enabled, and contains
-        the watchdog timeout in µs See above for
+        the watchdog timeout in µs. See above for
         details.</para></listitem>
       </varlistentry>
     </variablelist>
-  </refsect1>
-
-  <refsect1>
-    <title>History</title>
-
-    <para>The watchdog functionality and the
-    <varname>$WATCHDOG_USEC</varname> variable were added in
-    systemd-41.</para>
-
-    <para><function>sd_watchdog_enabled()</function> function was
-    added in systemd-209. Since that version the
-    <varname>$WATCHDOG_PID</varname> variable is also set.</para>
   </refsect1>
 
   <refsect1>
@@ -168,7 +163,8 @@
       <citerefentry><refentrytitle>sd-daemon</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>daemon</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+      <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>sd_event_set_watchdog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     </para>
   </refsect1>
 

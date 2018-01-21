@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,23 +18,25 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 
+#include "env-util.h"
+#include "fileio.h"
 #include "locale-setup.h"
+#include "locale-util.h"
+#include "string-util.h"
+#include "strv.h"
 #include "util.h"
 #include "virt.h"
-#include "fileio.h"
-#include "strv.h"
-#include "env-util.h"
-#include "locale-util.h"
 
 int locale_setup(char ***environment) {
         char **add;
         char *variables[_VARIABLE_LC_MAX] = {};
         int r = 0, i;
 
-        if (detect_container(NULL) <= 0) {
+        if (detect_container() <= 0) {
                 r = parse_env_file("/proc/cmdline", WHITESPACE,
                                    "locale.LANG",              &variables[VARIABLE_LANG],
                                    "locale.LANGUAGE",          &variables[VARIABLE_LANGUAGE],
@@ -88,7 +89,7 @@ int locale_setup(char ***environment) {
                 if (!variables[i])
                         continue;
 
-                s = strjoin(locale_variable_to_string(i), "=", variables[i], NULL);
+                s = strjoin(locale_variable_to_string(i), "=", variables[i]);
                 if (!s) {
                         r = -ENOMEM;
                         goto finish;

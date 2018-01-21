@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,30 +21,35 @@
 ***/
 
 #include "sd-event.h"
-#include "sd-network.h"
 #include "sd-netlink.h"
-#include "list.h"
+#include "sd-network.h"
+
 #include "hashmap.h"
+#include "list.h"
+#include "ordered-set.h"
+#include "resolve-util.h"
 
 typedef struct Manager Manager;
-typedef enum Support Support;
 
-enum Support {
-        SUPPORT_NO,
-        SUPPORT_YES,
-        SUPPORT_RESOLVE,
-        _SUPPORT_MAX,
-        _SUPPORT_INVALID = -1
-};
-
+#include "resolved-conf.h"
 #include "resolved-dns-query.h"
+#include "resolved-dns-search-domain.h"
+#include "resolved-dns-server.h"
 #include "resolved-dns-stream.h"
+#include "resolved-dns-trust-anchor.h"
 #include "resolved-link.h"
+
+#define MANAGER_SEARCH_DOMAINS_MAX 32
+#define MANAGER_DNS_SERVERS_MAX 32
 
 struct Manager {
         sd_event *event;
 
-        Support llmnr_support;
+        ResolveSupport llmnr_support;
+        ResolveSupport mdns_support;
+        DnssecMode dnssec_mode;
+        bool enable_cache;
+        DnsStubListenerMode dns_stub_listener_mode;
 
         /* Network */
         Hashmap *links;
@@ -65,18 +69,20 @@ struct Manager {
         unsigned n_dns_streams;
 
         /* Unicast dns */
-        int dns_ipv4_fd;
-        int dns_ipv6_fd;
-
-        sd_event_source *dns_ipv4_event_source;
-        sd_event_source *dns_ipv6_event_source;
-
         LIST_HEAD(DnsServer, dns_servers);
         LIST_HEAD(DnsServer, fallback_dns_servers);
+        unsigned n_dns_servers; /* counts both main and fallback */
         DnsServer *current_dns_server;
 
-        bool read_resolv_conf;
+        LIST_HEAD(DnsSearchDomain, search_domains);
+        unsigned n_search_domains;
+
+        bool need_builtin_fallbacks:1;
+
+        bool read_resolv_conf:1;
         usec_t resolv_conf_mtime;
+
+        DnsTrustAnchor trust_anchor;
 
         LIST_HEAD(DnsScope, dns_scopes);
         DnsScope *unicast_scope;
@@ -92,14 +98,28 @@ struct Manager {
         sd_event_source *llmnr_ipv4_tcp_event_source;
         sd_event_source *llmnr_ipv6_tcp_event_source;
 
+        /* mDNS */
+        int mdns_ipv4_fd;
+        int mdns_ipv6_fd;
+
+        /* DNS-SD */
+        Hashmap *dnssd_services;
+
+        sd_event_source *mdns_ipv4_event_source;
+        sd_event_source *mdns_ipv6_event_source;
+
         /* dbus */
         sd_bus *bus;
         sd_event_source *bus_retry_event_source;
 
         /* The hostname we publish on LLMNR and mDNS */
-        char *hostname;
-        DnsResourceKey *host_ipv4_key;
-        DnsResourceKey *host_ipv6_key;
+        char *full_hostname;
+        char *llmnr_hostname;
+        char *mdns_hostname;
+        DnsResourceKey *llmnr_host_ipv4_key;
+        DnsResourceKey *llmnr_host_ipv6_key;
+        DnsResourceKey *mdns_host_ipv4_key;
+        DnsResourceKey *mdns_host_ipv6_key;
 
         /* Watch the system hostname */
         int hostname_fd;
@@ -107,6 +127,27 @@ struct Manager {
 
         /* Watch for system suspends */
         sd_bus_slot *prepare_for_sleep_slot;
+
+        sd_event_source *sigusr1_event_source;
+        sd_event_source *sigusr2_event_source;
+        sd_event_source *sigrtmin1_event_source;
+
+        unsigned n_transactions_total;
+        unsigned n_dnssec_verdict[_DNSSEC_VERDICT_MAX];
+
+        /* Data from /etc/hosts */
+        Set* etc_hosts_by_address;
+        Hashmap* etc_hosts_by_name;
+        usec_t etc_hosts_last, etc_hosts_mtime;
+
+        /* Local DNS stub on 127.0.0.53:53 */
+        int dns_stub_udp_fd;
+        int dns_stub_tcp_fd;
+
+        sd_event_source *dns_stub_udp_event_source;
+        sd_event_source *dns_stub_tcp_event_source;
+
+        Hashmap *polkit_registry;
 };
 
 /* Manager */
@@ -115,25 +156,12 @@ int manager_new(Manager **ret);
 Manager* manager_free(Manager *m);
 
 int manager_start(Manager *m);
-int manager_read_resolv_conf(Manager *m);
-int manager_write_resolv_conf(Manager *m);
-
-DnsServer *manager_set_dns_server(Manager *m, DnsServer *s);
-DnsServer *manager_find_dns_server(Manager *m, int family, const union in_addr_union *in_addr);
-DnsServer *manager_get_dns_server(Manager *m);
-void manager_next_dns_server(Manager *m);
 
 uint32_t manager_find_mtu(Manager *m);
 
-int manager_send(Manager *m, int fd, int ifindex, int family, const union in_addr_union *addr, uint16_t port, DnsPacket *p);
+int manager_write(Manager *m, int fd, DnsPacket *p);
+int manager_send(Manager *m, int fd, int ifindex, int family, const union in_addr_union *destination, uint16_t port, const union in_addr_union *source, DnsPacket *p);
 int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret);
-
-int manager_dns_ipv4_fd(Manager *m);
-int manager_dns_ipv6_fd(Manager *m);
-int manager_llmnr_ipv4_udp_fd(Manager *m);
-int manager_llmnr_ipv6_udp_fd(Manager *m);
-int manager_llmnr_ipv4_tcp_fd(Manager *m);
-int manager_llmnr_ipv6_tcp_fd(Manager *m);
 
 int manager_find_ifindex(Manager *m, int family, const union in_addr_union *in_addr);
 LinkAddress* manager_find_link_address(Manager *m, int family, const union in_addr_union *in_addr);
@@ -146,11 +174,25 @@ DnsScope* manager_find_scope(Manager *m, DnsPacket *p);
 
 void manager_verify_all(Manager *m);
 
-void manager_flush_dns_servers(Manager *m, DnsServerType t);
-
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
 #define EXTRA_CMSG_SPACE 1024
 
-const char* support_to_string(Support p) _const_;
-int support_from_string(const char *s) _pure_;
+int manager_is_own_hostname(Manager *m, const char *name);
+
+int manager_compile_dns_servers(Manager *m, OrderedSet **servers);
+int manager_compile_search_domains(Manager *m, OrderedSet **domains, int filter_route);
+
+DnssecMode manager_get_dnssec_mode(Manager *m);
+bool manager_dnssec_supported(Manager *m);
+
+void manager_dnssec_verdict(Manager *m, DnssecVerdict verdict, const DnsResourceKey *key);
+
+bool manager_routable(Manager *m, int family);
+
+void manager_flush_caches(Manager *m);
+void manager_reset_server_features(Manager *m);
+
+void manager_cleanup_saved_user(Manager *m);
+
+bool manager_next_dnssd_names(Manager *m);

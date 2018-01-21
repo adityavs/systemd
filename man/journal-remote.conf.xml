@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2015 Chris Morgan
@@ -45,22 +47,21 @@
   <refnamediv>
     <refname>journal-remote.conf</refname>
     <refname>journal-remote.conf.d</refname>
-    <refpurpose>Journal remote service configuration files</refpurpose>
+    <refpurpose>Configuration files for the service accepting remote journal uploads</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
     <para><filename>/etc/systemd/journal-remote.conf</filename></para>
-    <para><filename>/etc/systemd/journald.conf.d/*.conf</filename></para>
-    <para><filename>/run/systemd/journald.conf.d/*.conf</filename></para>
-    <para><filename>/usr/lib/systemd/journald.conf.d/*.conf</filename></para>
+    <para><filename>/etc/systemd/journal-remote.conf.d/*.conf</filename></para>
+    <para><filename>/run/systemd/journal-remote.conf.d/*.conf</filename></para>
+    <para><filename>/usr/lib/systemd/journal-remote.conf.d/*.conf</filename></para>
   </refsynopsisdiv>
 
   <refsect1>
     <title>Description</title>
 
-    <para>These files configure various parameters of the systemd-remote-journal
-    application,
-    <citerefentry><refentrytitle>systemd-journal-remote</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    <para>These files configure various parameters of
+    <citerefentry><refentrytitle>systemd-journal-remote.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
   </refsect1>
 
   <xi:include href="standard-conf.xml" xpointer="main-conf" />
@@ -72,6 +73,13 @@
     <literal>[Remote]</literal> section:</para>
 
     <variablelist>
+      <varlistentry>
+        <term><varname>Seal=</varname></term>
+
+        <listitem><para>Periodically sign the data in the journal using Forward Secure Sealing.
+        </para></listitem>
+      </varlistentry>
+
 
       <varlistentry>
         <term><varname>SplitMode=</varname></term>
@@ -105,7 +113,7 @@
   <refsect1>
       <title>See Also</title>
       <para>
-        <citerefentry><refentrytitle>systemd-journal-remote</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
+        <citerefentry><refentrytitle>systemd-journal-remote</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
         <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
         <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
       </para>

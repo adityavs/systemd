@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,29 +18,38 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <unistd.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "bus-util.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
-#include "log.h"
-#include "path-util.h"
-#include "util.h"
-#include "pager.h"
-#include "build.h"
-#include "output-mode.h"
 #include "fileio.h"
-#include "sd-bus.h"
-#include "bus-util.h"
-#include "bus-error.h"
+#include "log.h"
+#include "output-mode.h"
+#include "pager.h"
+#include "path-util.h"
+#include "strv.h"
 #include "unit-name.h"
+#include "util.h"
 
 static bool arg_no_pager = false;
 static bool arg_kernel_threads = false;
 static bool arg_all = false;
+
+static enum {
+        SHOW_UNIT_NONE,
+        SHOW_UNIT_SYSTEM,
+        SHOW_UNIT_USER,
+} arg_show_unit = SHOW_UNIT_NONE;
+static char **arg_names = NULL;
+
 static int arg_full = -1;
 static char* arg_machine = NULL;
 
@@ -52,9 +60,11 @@ static void help(void) {
                "     --version        Show package version\n"
                "     --no-pager       Do not pipe output into a pager\n"
                "  -a --all            Show all groups, including empty\n"
+               "  -u --unit           Show the subtrees of specifified system units\n"
+               "     --user-unit      Show the subtrees of specifified user units\n"
                "  -l --full           Do not ellipsize output\n"
                "  -k                  Include kernel threads in output\n"
-               "  -M --machine        Show container\n"
+               "  -M --machine=       Show container\n"
                , program_invocation_short_name);
 }
 
@@ -63,15 +73,18 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_NO_PAGER = 0x100,
                 ARG_VERSION,
+                ARG_USER_UNIT,
         };
 
         static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'          },
-                { "version",   no_argument,       NULL, ARG_VERSION  },
-                { "no-pager",  no_argument,       NULL, ARG_NO_PAGER },
-                { "all",       no_argument,       NULL, 'a'          },
-                { "full",      no_argument,       NULL, 'l'          },
-                { "machine",   required_argument, NULL, 'M'          },
+                { "help",      no_argument,       NULL, 'h'           },
+                { "version",   no_argument,       NULL, ARG_VERSION   },
+                { "no-pager",  no_argument,       NULL, ARG_NO_PAGER  },
+                { "all",       no_argument,       NULL, 'a'           },
+                { "full",      no_argument,       NULL, 'l'           },
+                { "machine",   required_argument, NULL, 'M'           },
+                { "unit",      optional_argument, NULL, 'u'           },
+                { "user-unit", optional_argument, NULL, ARG_USER_UNIT },
                 {}
         };
 
@@ -80,7 +93,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 1);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hkalM:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "-hkalM:u::", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -89,9 +102,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_NO_PAGER:
                         arg_no_pager = true;
@@ -99,6 +110,24 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case 'a':
                         arg_all = true;
+                        break;
+
+                case 'u':
+                        arg_show_unit = SHOW_UNIT_SYSTEM;
+                        if (strv_push(&arg_names, optarg) < 0) /* push optarg if not empty */
+                                return log_oom();
+                        break;
+
+                case ARG_USER_UNIT:
+                        arg_show_unit = SHOW_UNIT_USER;
+                        if (strv_push(&arg_names, optarg) < 0) /* push optarg if not empty */
+                                return log_oom();
+                        break;
+
+                case 1:
+                        /* positional argument */
+                        if (strv_push(&arg_names, optarg) < 0)
+                                return log_oom();
                         break;
 
                 case 'l':
@@ -120,149 +149,169 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
+        if (arg_machine && arg_show_unit != SHOW_UNIT_NONE) {
+                log_error("Cannot combine --unit or --user-unit with --machine=.");
+                return -EINVAL;
+        }
+
         return 1;
 }
 
+static void show_cg_info(const char *controller, const char *path) {
+
+        if (cg_all_unified() == 0 && controller && !streq(controller, SYSTEMD_CGROUP_CONTROLLER))
+                printf("Controller %s; ", controller);
+
+        printf("Control group %s:\n", isempty(path) ? "/" : path);
+        fflush(stdout);
+}
+
 int main(int argc, char *argv[]) {
-        int r = 0, retval = EXIT_FAILURE;
-        int output_flags;
-        _cleanup_free_ char *root = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        int r, output_flags;
 
         log_parse_environment();
         log_open();
 
         r = parse_argv(argc, argv);
-        if (r < 0)
+        if (r <= 0)
                 goto finish;
-        else if (r == 0) {
-                retval = EXIT_SUCCESS;
-                goto finish;
-        }
 
         if (!arg_no_pager) {
-                r = pager_open(false);
-                if (r > 0) {
-                        if (arg_full == -1)
-                                arg_full = true;
-                }
+                r = pager_open(arg_no_pager, false);
+                if (r > 0 && arg_full < 0)
+                        arg_full = true;
         }
 
         output_flags =
                 arg_all * OUTPUT_SHOW_ALL |
-                (arg_full > 0) * OUTPUT_FULL_WIDTH;
+                (arg_full > 0) * OUTPUT_FULL_WIDTH |
+                arg_kernel_threads * OUTPUT_KERNEL_THREADS;
 
-        r = bus_open_transport(BUS_TRANSPORT_LOCAL, NULL, false, &bus);
-        if (r < 0) {
-                log_error_errno(r, "Failed to create bus connection: %m");
-                goto finish;
-        }
+        if (arg_names) {
+                _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+                _cleanup_free_ char *root = NULL;
+                char **name;
 
-        if (optind < argc) {
-                int i;
-
-                for (i = optind; i < argc; i++) {
+                STRV_FOREACH(name, arg_names) {
                         int q;
 
-                        fprintf(stdout, "%s:\n", argv[i]);
-                        fflush(stdout);
+                        if (arg_show_unit != SHOW_UNIT_NONE) {
+                                /* Command line arguments are unit names */
+                                _cleanup_free_ char *cgroup = NULL;
 
-                        if (arg_machine)
-                                root = strjoin("machine/", arg_machine, "/", argv[i], NULL);
-                        else
-                                root = strdup(argv[i]);
-                        if (!root)
-                                return log_oom();
+                                if (!bus) {
+                                        /* Connect to the bus only if necessary */
+                                        r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL,
+                                                                          arg_show_unit == SHOW_UNIT_USER,
+                                                                          &bus);
+                                        if (r < 0) {
+                                                log_error_errno(r, "Failed to create bus connection: %m");
+                                                goto finish;
+                                        }
+                                }
 
-                        q = show_cgroup_by_path(root, NULL, 0,
-                                                arg_kernel_threads, output_flags);
-                        if (q < 0)
+                                q = show_cgroup_get_unit_path_and_warn(bus, *name, &cgroup);
+                                if (q < 0)
+                                        goto failed;
+
+                                if (isempty(cgroup)) {
+                                        log_warning("Unit %s not found.", *name);
+                                        q = -ENOENT;
+                                        goto failed;
+                                }
+
+                                printf("Unit %s (%s):\n", *name, cgroup);
+                                fflush(stdout);
+
+                                q = show_cgroup_by_path(cgroup, NULL, 0, output_flags);
+
+                        } else if (path_startswith(*name, "/sys/fs/cgroup")) {
+
+                                printf("Directory %s:\n", *name);
+                                fflush(stdout);
+
+                                q = show_cgroup_by_path(*name, NULL, 0, output_flags);
+                        } else {
+                                _cleanup_free_ char *c = NULL, *p = NULL, *j = NULL;
+                                const char *controller, *path;
+
+                                if (!root) {
+                                        /* Query root only if needed, treat error as fatal */
+                                        r = show_cgroup_get_path_and_warn(arg_machine, NULL, &root);
+                                        if (r < 0)
+                                                goto finish;
+                                }
+
+                                q = cg_split_spec(*name, &c, &p);
+                                if (q < 0) {
+                                        log_error_errno(q, "Failed to split argument %s: %m", *name);
+                                        goto failed;
+                                }
+
+                                controller = c ?: SYSTEMD_CGROUP_CONTROLLER;
+                                if (p) {
+                                        j = strjoin(root, "/", p);
+                                        if (!j) {
+                                                r = log_oom();
+                                                goto finish;
+                                        }
+
+                                        path_kill_slashes(j);
+                                        path = j;
+                                } else
+                                        path = root;
+
+                                show_cg_info(controller, path);
+
+                                q = show_cgroup(controller, path, NULL, 0, output_flags);
+                        }
+
+                failed:
+                        if (q < 0 && r >= 0)
                                 r = q;
                 }
 
         } else {
-                _cleanup_free_ char *p;
+                bool done = false;
 
-                p = get_current_dir_name();
-                if (!p) {
-                        log_error_errno(errno, "Cannot determine current working directory: %m");
-                        goto finish;
-                }
+                if (!arg_machine)  {
+                        _cleanup_free_ char *cwd = NULL;
 
-                if (path_startswith(p, "/sys/fs/cgroup") && !arg_machine) {
-                        printf("Working Directory %s:\n", p);
-                        r = show_cgroup_by_path(p, NULL, 0,
-                                                arg_kernel_threads, output_flags);
-                } else {
-                        if (arg_machine) {
-                                char *m;
-                                const char *cgroup;
-                                _cleanup_free_ char *scope = NULL;
-                                _cleanup_free_ char *path = NULL;
-                                _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-                                _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-
-                                m = strjoina("/run/systemd/machines/", arg_machine);
-                                r = parse_env_file(m, NEWLINE, "SCOPE", &scope, NULL);
-                                if (r < 0) {
-                                        log_error_errno(r, "Failed to get machine path: %m");
-                                        goto finish;
-                                }
-
-                                path = unit_dbus_path_from_name(scope);
-                                if (!path) {
-                                        log_oom();
-                                        goto finish;
-                                }
-
-                                r = sd_bus_get_property(
-                                                bus,
-                                                "org.freedesktop.systemd1",
-                                                path,
-                                                "org.freedesktop.systemd1.Scope",
-                                                "ControlGroup",
-                                                &error,
-                                                &reply,
-                                                "s");
-
-                                if (r < 0) {
-                                        log_error("Failed to query ControlGroup: %s", bus_error_message(&error, -r));
-                                        goto finish;
-                                }
-
-                                r = sd_bus_message_read(reply, "s", &cgroup);
-                                if (r < 0) {
-                                        bus_log_parse_error(r);
-                                        goto finish;
-                                }
-
-                                root = strdup(cgroup);
-                                if (!root) {
-                                        log_oom();
-                                        goto finish;
-                                }
-
-                        } else
-                                r = cg_get_root_path(&root);
+                        r = safe_getcwd(&cwd);
                         if (r < 0) {
-                                log_error_errno(r, "Failed to get %s path: %m",
-                                                arg_machine ? "machine" : "root");
+                                log_error_errno(r, "Cannot determine current working directory: %m");
                                 goto finish;
                         }
 
-                        r = show_cgroup(SYSTEMD_CGROUP_CONTROLLER, root, NULL, 0,
-                                        arg_kernel_threads, output_flags);
+                        if (path_startswith(cwd, "/sys/fs/cgroup")) {
+                                printf("Working directory %s:\n", cwd);
+                                fflush(stdout);
+
+                                r = show_cgroup_by_path(cwd, NULL, 0, output_flags);
+                                done = true;
+                        }
+                }
+
+                if (!done) {
+                        _cleanup_free_ char *root = NULL;
+
+                        r = show_cgroup_get_path_and_warn(arg_machine, NULL, &root);
+                        if (r < 0)
+                                goto finish;
+
+                        show_cg_info(SYSTEMD_CGROUP_CONTROLLER, root);
+
+                        printf("-.slice\n");
+                        r = show_cgroup(SYSTEMD_CGROUP_CONTROLLER, root, NULL, 0, output_flags);
                 }
         }
 
-        if (r < 0) {
-                log_error_errno(r, "Failed to list cgroup tree %s: %m", root);
-                retval = EXIT_FAILURE;
-        } else
-                retval = EXIT_SUCCESS;
+        if (r < 0)
+                log_error_errno(r, "Failed to list cgroup tree: %m");
 
 finish:
         pager_close();
+        free(arg_names); /* don't free the strings */
 
-        return retval;
+        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

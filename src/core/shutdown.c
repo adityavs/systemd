@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,35 +18,47 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/mman.h>
-#include <sys/reboot.h>
-#include <linux/reboot.h>
-#include <sys/stat.h>
-#include <sys/mount.h>
 #include <errno.h>
-#include <unistd.h>
+#include <getopt.h>
+#include <linux/reboot.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <getopt.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/reboot.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#include "missing.h"
-#include "log.h"
+#include "alloc-util.h"
+#include "async.h"
+#include "cgroup-util.h"
+#include "def.h"
+#include "exec-util.h"
+#include "fd-util.h"
 #include "fileio.h"
+#include "killall.h"
+#include "log.h"
+#include "missing.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "signal-util.h"
+#include "string-util.h"
+#include "switch-root.h"
+#include "terminal-util.h"
 #include "umount.h"
 #include "util.h"
 #include "virt.h"
 #include "watchdog.h"
-#include "killall.h"
-#include "cgroup-util.h"
-#include "def.h"
-#include "switch-root.h"
-#include "process-util.h"
-#include "terminal-util.h"
 
 #define FINALIZE_ATTEMPTS 50
 
+#define SYNC_PROGRESS_ATTEMPTS 3
+#define SYNC_TIMEOUT_USEC (10*USEC_PER_SEC)
+
 static char* arg_verb;
+static uint8_t arg_exit_code;
+static usec_t arg_timeout = DEFAULT_TIMEOUT_USEC;
 
 static int parse_argv(int argc, char *argv[]) {
         enum {
@@ -55,6 +66,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_LOG_TARGET,
                 ARG_LOG_COLOR,
                 ARG_LOG_LOCATION,
+                ARG_EXIT_CODE,
+                ARG_TIMEOUT,
         };
 
         static const struct option options[] = {
@@ -62,6 +75,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "log-target",    required_argument, NULL, ARG_LOG_TARGET   },
                 { "log-color",     optional_argument, NULL, ARG_LOG_COLOR    },
                 { "log-location",  optional_argument, NULL, ARG_LOG_LOCATION },
+                { "exit-code",     required_argument, NULL, ARG_EXIT_CODE    },
+                { "timeout",       required_argument, NULL, ARG_TIMEOUT      },
                 {}
         };
 
@@ -110,6 +125,20 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
+                case ARG_EXIT_CODE:
+                        r = safe_atou8(optarg, &arg_exit_code);
+                        if (r < 0)
+                                log_error("Failed to parse exit code %s, ignoring", optarg);
+
+                        break;
+
+                case ARG_TIMEOUT:
+                        r = parse_sec(optarg, &arg_timeout);
+                        if (r < 0)
+                                log_error("Failed to parse shutdown timeout %s, ignoring", optarg);
+
+                        break;
+
                 case '\001':
                         if (!arg_verb)
                                 arg_verb = optarg;
@@ -146,6 +175,96 @@ static int switch_root_initramfs(void) {
         return switch_root("/run/initramfs", "/oldroot", false, MS_BIND);
 }
 
+/* Read the following fields from /proc/meminfo:
+ *
+ *  NFS_Unstable
+ *  Writeback
+ *  Dirty
+ *
+ * Return true if the sum of these fields is greater than the previous
+ * value input. For all other issues, report the failure and indicate that
+ * the sync is not making progress.
+ */
+static bool sync_making_progress(unsigned long long *prev_dirty) {
+        _cleanup_fclose_ FILE *f = NULL;
+        char line[LINE_MAX];
+        bool r = false;
+        unsigned long long val = 0;
+
+        f = fopen("/proc/meminfo", "re");
+        if (!f)
+                return log_warning_errno(errno, "Failed to open /proc/meminfo: %m");
+
+        FOREACH_LINE(line, f, log_warning_errno(errno, "Failed to parse /proc/meminfo: %m")) {
+                unsigned long long ull = 0;
+
+                if (!first_word(line, "NFS_Unstable:") && !first_word(line, "Writeback:") && !first_word(line, "Dirty:"))
+                        continue;
+
+                errno = 0;
+                if (sscanf(line, "%*s %llu %*s", &ull) != 1) {
+                        if (errno != 0)
+                                log_warning_errno(errno, "Failed to parse /proc/meminfo: %m");
+                        else
+                                log_warning("Failed to parse /proc/meminfo");
+
+                        return false;
+                }
+
+                val += ull;
+        }
+
+        r = *prev_dirty > val;
+
+        *prev_dirty = val;
+
+        return r;
+}
+
+static void sync_with_progress(void) {
+        unsigned long long dirty = ULONG_LONG_MAX;
+        unsigned checks;
+        pid_t pid;
+        int r;
+
+        BLOCK_SIGNALS(SIGCHLD);
+
+        /* Due to the possiblity of the sync operation hanging, we fork a child process and monitor the progress. If
+         * the timeout lapses, the assumption is that that particular sync stalled. */
+
+        r = asynchronous_sync(&pid);
+        if (r < 0) {
+                log_error_errno(r, "Failed to fork sync(): %m");
+                return;
+        }
+
+        log_info("Syncing filesystems and block devices.");
+
+        /* Start monitoring the sync operation. If more than
+         * SYNC_PROGRESS_ATTEMPTS lapse without progress being made,
+         * we assume that the sync is stalled */
+        for (checks = 0; checks < SYNC_PROGRESS_ATTEMPTS; checks++) {
+                r = wait_for_terminate_with_timeout(pid, SYNC_TIMEOUT_USEC);
+                if (r == 0)
+                        /* Sync finished without error.
+                         * (The sync itself does not return an error code) */
+                        return;
+                else if (r == -ETIMEDOUT) {
+                        /* Reset the check counter if the "Dirty" value is
+                         * decreasing */
+                        if (sync_making_progress(&dirty))
+                                checks = 0;
+                } else {
+                        log_error_errno(r, "Failed to sync filesystems and block devices: %m");
+                        return;
+                }
+        }
+
+        /* Only reached in the event of a timeout. We should issue a kill
+         * to the stray process. */
+        log_error("Syncing filesystems and block devices - timed out, issuing SIGKILL to PID "PID_FMT".", pid);
+        (void) kill(pid, SIGKILL);
+}
 
 int main(int argc, char *argv[]) {
         bool need_umount, need_swapoff, need_loop_detach, need_dm_detach;
@@ -155,6 +274,7 @@ int main(int argc, char *argv[]) {
         unsigned retries;
         int cmd, r;
         static const char* const dirs[] = {SYSTEM_SHUTDOWN_PATH, NULL};
+        char *watchdog_device;
 
         log_parse_environment();
         r = parse_argv(argc, argv);
@@ -169,7 +289,7 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        if (getpid() != 1) {
+        if (getpid_cached() != 1) {
                 log_error("Not executed by init (PID 1).");
                 r = -EPERM;
                 goto error;
@@ -183,26 +303,43 @@ int main(int argc, char *argv[]) {
                 cmd = RB_HALT_SYSTEM;
         else if (streq(arg_verb, "kexec"))
                 cmd = LINUX_REBOOT_CMD_KEXEC;
+        else if (streq(arg_verb, "exit"))
+                cmd = 0; /* ignored, just checking that arg_verb is valid */
         else {
                 r = -EINVAL;
                 log_error("Unknown action '%s'.", arg_verb);
                 goto error;
         }
 
-        cg_get_root_path(&cgroup);
+        (void) cg_get_root_path(&cgroup);
+        in_container = detect_container() > 0;
 
         use_watchdog = !!getenv("WATCHDOG_USEC");
+        watchdog_device = getenv("WATCHDOG_DEVICE");
+        if (watchdog_device) {
+                r = watchdog_set_device(watchdog_device);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to set watchdog device to %s, ignoring: %m",
+                                          watchdog_device);
+        }
 
-        /* lock us into memory */
+        /* Lock us into memory */
         mlockall(MCL_CURRENT|MCL_FUTURE);
 
+        /* Synchronize everything that is not written to disk yet at this point already. This is a good idea so that
+         * slow IO is processed here already and the final process killing spree is not impacted by processes
+         * desperately trying to sync IO to disk within their timeout. Do not remove this sync, data corruption will
+         * result. */
+        if (!in_container)
+                sync_with_progress();
+
+        disable_coredumps();
+
         log_info("Sending SIGTERM to remaining processes...");
-        broadcast_signal(SIGTERM, true, true);
+        broadcast_signal(SIGTERM, true, true, arg_timeout);
 
         log_info("Sending SIGKILL to remaining processes...");
-        broadcast_signal(SIGKILL, true, false);
-
-        in_container = detect_container(NULL) > 0;
+        broadcast_signal(SIGKILL, true, false, arg_timeout);
 
         need_umount = !in_container;
         need_swapoff = !in_container;
@@ -301,10 +438,13 @@ int main(int argc, char *argv[]) {
 
  initrd_jump:
 
+        /* We're done with the watchdog. */
+        watchdog_free_device();
+
         arguments[0] = NULL;
         arguments[1] = arg_verb;
         arguments[2] = NULL;
-        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, arguments);
+        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, arguments);
 
         if (!in_container && !in_initrd() &&
             access("/run/initramfs/shutdown", X_OK) == 0) {
@@ -332,12 +472,22 @@ int main(int argc, char *argv[]) {
                           need_loop_detach ? " loop devices," : "",
                           need_dm_detach ? " DM devices," : "");
 
-        /* The kernel will automaticall flush ATA disks and suchlike
-         * on reboot(), but the file systems need to be synce'd
-         * explicitly in advance. So let's do this here, but not
-         * needlessly slow down containers. */
+        /* The kernel will automatically flush ATA disks and suchlike on reboot(), but the file systems need to be
+         * sync'ed explicitly in advance. So let's do this here, but not needlessly slow down containers. Note that we
+         * sync'ed things already once above, but we did some more work since then which might have caused IO, hence
+         * let's do it once more. Do not remove this sync, data corruption will result. */
         if (!in_container)
-                sync();
+                sync_with_progress();
+
+        if (streq(arg_verb, "exit")) {
+                if (in_container)
+                        exit(arg_exit_code);
+                else {
+                        /* We cannot exit() on the host, fallback on another
+                         * method. */
+                        cmd = RB_POWER_OFF;
+                }
+        }
 
         switch (cmd) {
 
@@ -345,15 +495,10 @@ int main(int argc, char *argv[]) {
 
                 if (!in_container) {
                         /* We cheat and exec kexec to avoid doing all its work */
-                        pid_t pid;
-
                         log_info("Rebooting with kexec.");
 
-                        pid = fork();
-                        if (pid < 0)
-                                log_error_errno(errno, "Failed to fork: %m");
-                        else if (pid == 0) {
-
+                        r = safe_fork("(sd-kexec)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_WAIT, NULL);
+                        if (r == 0) {
                                 const char * const args[] = {
                                         KEXEC, "-e", NULL
                                 };
@@ -362,21 +507,26 @@ int main(int argc, char *argv[]) {
 
                                 execv(args[0], (char * const *) args);
                                 _exit(EXIT_FAILURE);
-                        } else
-                                wait_for_terminate_and_warn("kexec", pid, true);
+                        }
+
+                        /* If we are still running, then the kexec can't have worked, let's fall through */
                 }
 
                 cmd = RB_AUTOBOOT;
-                /* Fall through */
-
+                _fallthrough_;
         case RB_AUTOBOOT:
 
                 if (!in_container) {
                         _cleanup_free_ char *param = NULL;
 
-                        if (read_one_line_file(REBOOT_PARAM_FILE, &param) >= 0) {
+                        r = read_one_line_file("/run/systemd/reboot-param", &param);
+                        if (r < 0 && r != -ENOENT)
+                                log_warning_errno(r, "Failed to read reboot parameter file: %m");
+
+                        if (!isempty(param)) {
                                 log_info("Rebooting with argument '%s'.", param);
                                 syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, param);
+                                log_warning_errno(errno, "Failed to reboot with parameter, retrying without: %m");
                         }
                 }
 
@@ -401,14 +551,12 @@ int main(int argc, char *argv[]) {
                  * CAP_SYS_BOOT just exit, this will kill our
                  * container for good. */
                 log_info("Exiting container.");
-                exit(0);
+                exit(EXIT_SUCCESS);
         }
 
-        log_error_errno(errno, "Failed to invoke reboot(): %m");
-        r = -errno;
+        r = log_error_errno(errno, "Failed to invoke reboot(): %m");
 
   error:
         log_emergency_errno(r, "Critical error while doing system shutdown: %m");
-
         freeze();
 }

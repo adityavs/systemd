@@ -2,6 +2,8 @@
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -61,16 +63,16 @@
     responsible for file system checks. They are instantiated for each
     device that is configured for file system checking.
     <filename>systemd-fsck-root.service</filename> is responsible for
-    file system checks on the root file system, but in only if the
-    root filesystem wasn't checked in the initramfs.
+    file system checks on the root file system, but only if the
+    root filesystem was not checked in the initramfs.
     <filename>systemd-fsck@.service</filename> is used for all other
     file systems and for the root file system in the initramfs.</para>
 
-    <para>Those services are started at boot if
+    <para>These services are started at boot if
     <option>passno</option> in <filename>/etc/fstab</filename> for the
     file system is set to a value greater than zero. The file system
     check for root is performed before the other file systems. Other
-    file systems may be checked in parallel, except when they are one
+    file systems may be checked in parallel, except when they are on
     the same rotating disk.</para>
 
     <para><filename>systemd-fsck</filename> does not know any details
@@ -88,8 +90,8 @@
   <refsect1>
     <title>Kernel Command Line</title>
 
-    <para><filename>systemd-fsck</filename> understands one kernel
-    command line parameter:</para>
+    <para><filename>systemd-fsck</filename> understands these kernel
+    command line parameters:</para>
 
     <variablelist class='kernel-commandline-options'>
       <varlistentry>
@@ -110,9 +112,9 @@
 
         <listitem><para>One of <literal>preen</literal>,
         <literal>yes</literal>, <literal>no</literal>. Controls the
-        mode of operation. The default is <literal> preen</literal>,
+        mode of operation. The default is <literal>preen</literal>,
         and will automatically repair problems that can be safely
-        fixed. <literal>yes </literal> will answer yes to all
+        fixed. <literal>yes</literal> will answer yes to all
         questions by fsck and <literal>no</literal> will answer no to
         all questions. </para></listitem>
       </varlistentry>

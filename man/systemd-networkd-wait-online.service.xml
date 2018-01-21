@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2014 Tom Gundersen
@@ -80,12 +82,13 @@
         several interfaces which will be configured, but a particular
         one is necessary to access some network resources. This option
         may be used more than once to wait for multiple network
-        interfaces.</para></listitem>
+        interfaces. When used, all other interfaces are ignored.
+        </para></listitem>
       </varlistentry>
       <varlistentry>
         <term><option>--ignore=</option></term>
         <listitem><para>Network interfaces to be ignored when deciding
-        if the system is online. By default only the loopback
+        if the system is online. By default, only the loopback
         interface is ignored. This option may be used more than once
         to ignore multiple network interfaces. </para></listitem>
       </varlistentry>

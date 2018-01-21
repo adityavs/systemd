@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,15 +18,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/sendfile.h>
-
 #include "sd-daemon.h"
-#include "util.h"
-#include "ratelimit.h"
+
+#include "alloc-util.h"
 #include "btrfs-util.h"
-#include "import-common.h"
 #include "export-tar.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "import-common.h"
 #include "process-util.h"
+#include "ratelimit.h"
+#include "string-util.h"
+#include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
@@ -78,7 +80,7 @@ TarExport *tar_export_unref(TarExport *e) {
         }
 
         if (e->temp_path) {
-                (void) btrfs_subvol_remove(e->temp_path, false);
+                (void) btrfs_subvol_remove(e->temp_path, BTRFS_REMOVE_QUOTA);
                 free(e->temp_path);
         }
 
@@ -90,9 +92,7 @@ TarExport *tar_export_unref(TarExport *e) {
 
         free(e->buffer);
         free(e->path);
-        free(e);
-
-        return NULL;
+        return mfree(e);
 }
 
 int tar_export_new(
@@ -283,12 +283,11 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
         if (e->st.st_ino == 256) { /* might be a btrfs subvolume? */
                 BtrfsQuotaInfo q;
 
-                r = btrfs_subvol_get_quota_fd(sfd, &q);
+                r = btrfs_subvol_get_subtree_quota_fd(sfd, 0, &q);
                 if (r >= 0)
                         e->quota_referenced = q.referenced;
 
-                free(e->temp_path);
-                e->temp_path = NULL;
+                e->temp_path = mfree(e->temp_path);
 
                 r = tempfn_random(path, NULL, &e->temp_path);
                 if (r < 0)
@@ -298,8 +297,7 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
                 r = btrfs_subvol_snapshot_fd(sfd, e->temp_path, BTRFS_SNAPSHOT_READ_ONLY|BTRFS_SNAPSHOT_RECURSIVE);
                 if (r < 0) {
                         log_debug_errno(r, "Couldn't create snapshot %s of %s, not exporting atomically: %m", e->temp_path, path);
-                        free(e->temp_path);
-                        e->temp_path = NULL;
+                        e->temp_path = mfree(e->temp_path);
                 }
         }
 

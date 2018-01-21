@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,9 +20,18 @@
 
 #include <sys/xattr.h>
 
-#include "strv.h"
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "hexdecoct.h"
+#include "import-util.h"
+#include "io-util.h"
 #include "machine-pool.h"
+#include "parse-util.h"
+#include "pull-common.h"
 #include "pull-job.h"
+#include "string-util.h"
+#include "strv.h"
+#include "xattr-util.h"
 
 PullJob* pull_job_unref(PullJob *j) {
         if (!j)
@@ -45,16 +53,13 @@ PullJob* pull_job_unref(PullJob *j) {
         free(j->payload);
         free(j->checksum);
 
-        free(j);
-
-        return NULL;
+        return mfree(j);
 }
 
 static void pull_job_finish(PullJob *j, int ret) {
         assert(j);
 
-        if (j->state == PULL_JOB_DONE ||
-            j->state == PULL_JOB_FAILED)
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return;
 
         if (ret == 0) {
@@ -70,6 +75,31 @@ static void pull_job_finish(PullJob *j, int ret) {
                 j->on_finished(j);
 }
 
+static int pull_job_restart(PullJob *j) {
+        int r;
+        char *chksum_url = NULL;
+
+        r = import_url_change_last_component(j->url, "SHA256SUMS", &chksum_url);
+        if (r < 0)
+                return r;
+
+        free(j->url);
+        j->url = chksum_url;
+        j->state = PULL_JOB_INIT;
+        j->payload = mfree(j->payload);
+        j->payload_size = 0;
+        j->payload_allocated = 0;
+        j->written_compressed = 0;
+        j->written_uncompressed = 0;
+        j->written_since_last_grow = 0;
+
+        r = pull_job_begin(j);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
 void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         PullJob *j = NULL;
         CURLcode code;
@@ -79,7 +109,7 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         if (curl_easy_getinfo(curl, CURLINFO_PRIVATE, (char **)&j) != CURLE_OK)
                 return;
 
-        if (!j || j->state == PULL_JOB_DONE || j->state == PULL_JOB_FAILED)
+        if (!j || IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return;
 
         if (result != CURLE_OK) {
@@ -99,6 +129,26 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 r = 0;
                 goto finish;
         } else if (status >= 300) {
+                if (status == 404 && j->style == VERIFICATION_PER_FILE) {
+
+                        /* retry pull job with SHA256SUMS file */
+                        r = pull_job_restart(j);
+                        if (r < 0)
+                                goto finish;
+
+                        code = curl_easy_getinfo(j->curl, CURLINFO_RESPONSE_CODE, &status);
+                        if (code != CURLE_OK) {
+                                log_error("Failed to retrieve response code: %s", curl_easy_strerror(code));
+                                r = -EIO;
+                                goto finish;
+                        }
+
+                        if (status == 0) {
+                                j->style = VERIFICATION_PER_DIRECTORY;
+                                return;
+                        }
+                }
+
                 log_error("HTTP request to %s failed with code %li.", j->url, status);
                 r = -EIO;
                 goto finish;
@@ -392,7 +442,7 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
         assert(contents);
         assert(j);
 
-        if (j->state == PULL_JOB_DONE || j->state == PULL_JOB_FAILED) {
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED)) {
                 r = -ESTALE;
                 goto fail;
         }
@@ -524,7 +574,8 @@ int pull_job_new(PullJob **ret, const char *url, CurlGlue *glue, void *userdata)
         j->glue = glue;
         j->content_length = (uint64_t) -1;
         j->start_usec = now(CLOCK_MONOTONIC);
-        j->compressed_max = j->uncompressed_max = 8LLU * 1024LLU * 1024LLU * 1024LLU; /* 8GB */
+        j->compressed_max = j->uncompressed_max = 64LLU * 1024LLU * 1024LLU * 1024LLU; /* 64GB safety limit */
+        j->style = VERIFICATION_STYLE_UNSET;
 
         j->url = strdup(url);
         if (!j->url)

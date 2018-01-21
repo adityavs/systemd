@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,13 +18,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <string.h>
 #include <errno.h>
+#include <fnmatch.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include "util.h"
+#include "alloc-util.h"
+#include "escape.h"
+#include "extract-word.h"
+#include "fileio.h"
+#include "string-util.h"
 #include "strv.h"
+#include "util.h"
 
 char *strv_find(char **l, const char *name) {
         char **i;
@@ -82,8 +88,16 @@ void strv_clear(char **l) {
 
 char **strv_free(char **l) {
         strv_clear(l);
-        free(l);
-        return NULL;
+        return mfree(l);
+}
+
+char **strv_free_erase(char **l) {
+        char **i;
+
+        STRV_FOREACH(i, l)
+                string_erase(*i);
+
+        return strv_free(l);
 }
 
 char **strv_copy(char * const *l) {
@@ -125,16 +139,16 @@ char **strv_new_ap(const char *x, va_list ap) {
         va_list aq;
 
         /* As a special trick we ignore all listed strings that equal
-         * (const char*) -1. This is supposed to be used with the
+         * STRV_IGNORE. This is supposed to be used with the
          * STRV_IFNOTNULL() macro to include possibly NULL strings in
          * the string list. */
 
         if (x) {
-                n = x == (const char*) -1 ? 0 : 1;
+                n = x == STRV_IGNORE ? 0 : 1;
 
                 va_copy(aq, ap);
                 while ((s = va_arg(aq, const char*))) {
-                        if (s == (const char*) -1)
+                        if (s == STRV_IGNORE)
                                 continue;
 
                         n++;
@@ -148,7 +162,7 @@ char **strv_new_ap(const char *x, va_list ap) {
                 return NULL;
 
         if (x) {
-                if (x != (const char*) -1) {
+                if (x != STRV_IGNORE) {
                         a[i] = strdup(x);
                         if (!a[i])
                                 goto fail;
@@ -157,7 +171,7 @@ char **strv_new_ap(const char *x, va_list ap) {
 
                 while ((s = va_arg(ap, const char*))) {
 
-                        if (s == (const char*) -1)
+                        if (s == STRV_IGNORE)
                                 continue;
 
                         a[i] = strdup(s);
@@ -188,17 +202,48 @@ char **strv_new(const char *x, ...) {
         return r;
 }
 
-int strv_extend_strv(char ***a, char **b) {
-        int r;
-        char **s;
+int strv_extend_strv(char ***a, char **b, bool filter_duplicates) {
+        char **s, **t;
+        size_t p, q, i = 0, j;
+
+        assert(a);
+
+        if (strv_isempty(b))
+                return 0;
+
+        p = strv_length(*a);
+        q = strv_length(b);
+
+        t = realloc(*a, sizeof(char*) * (p + q + 1));
+        if (!t)
+                return -ENOMEM;
+
+        t[p] = NULL;
+        *a = t;
 
         STRV_FOREACH(s, b) {
-                r = strv_extend(a, *s);
-                if (r < 0)
-                        return r;
+
+                if (filter_duplicates && strv_contains(t, *s))
+                        continue;
+
+                t[p+i] = strdup(*s);
+                if (!t[p+i])
+                        goto rollback;
+
+                i++;
+                t[p+i] = NULL;
         }
 
-        return 0;
+        assert(i <= q);
+
+        return (int) i;
+
+rollback:
+        for (j = 0; j < i; j++)
+                free(t[p + j]);
+
+        t[p] = NULL;
+        return -ENOMEM;
 }
 
 int strv_extend_strv_concat(char ***a, char **b, const char *suffix) {
@@ -270,17 +315,15 @@ char **strv_split_newlines(const char *s) {
         if (n <= 0)
                 return l;
 
-        if (isempty(l[n-1])) {
-                free(l[n-1]);
-                l[n-1] = NULL;
-        }
+        if (isempty(l[n - 1]))
+                l[n - 1] = mfree(l[n - 1]);
 
         return l;
 }
 
-int strv_split_quoted(char ***t, const char *s, UnquoteFlags flags) {
-        size_t n = 0, allocated = 0;
+int strv_split_extract(char ***t, const char *s, const char *separators, ExtractFlags flags) {
         _cleanup_strv_free_ char **l = NULL;
+        size_t n = 0, allocated = 0;
         int r;
 
         assert(t);
@@ -289,7 +332,7 @@ int strv_split_quoted(char ***t, const char *s, UnquoteFlags flags) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = unquote_first_word(&s, &word, flags);
+                r = extract_first_word(&s, &word, separators, flags);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -304,13 +347,16 @@ int strv_split_quoted(char ***t, const char *s, UnquoteFlags flags) {
                 l[n] = NULL;
         }
 
-        if (!l)
+        if (!l) {
                 l = new0(char*, 1);
+                if (!l)
+                        return -ENOMEM;
+        }
 
         *t = l;
         l = NULL;
 
-        return 0;
+        return (int) n;
 }
 
 char *strv_join(char **l, const char *separator) {
@@ -325,7 +371,7 @@ char *strv_join(char **l, const char *separator) {
 
         n = 0;
         STRV_FOREACH(s, l) {
-                if (n != 0)
+                if (s != l)
                         n += k;
                 n += strlen(*s);
         }
@@ -336,7 +382,7 @@ char *strv_join(char **l, const char *separator) {
 
         e = r;
         STRV_FOREACH(s, l) {
-                if (e != r)
+                if (s != l)
                         e = stpcpy(e, separator);
 
                 e = stpcpy(e, *s);
@@ -380,8 +426,7 @@ char *strv_join_quoted(char **l) {
         return buf;
 
  oom:
-        free(buf);
-        return NULL;
+        return mfree(buf);
 }
 
 int strv_push(char ***l, char *value) {
@@ -512,6 +557,42 @@ int strv_extend(char ***l, const char *value) {
         return strv_consume(l, v);
 }
 
+int strv_extend_front(char ***l, const char *value) {
+        size_t n, m;
+        char *v, **c;
+
+        assert(l);
+
+        /* Like strv_extend(), but prepends rather than appends the new entry */
+
+        if (!value)
+                return 0;
+
+        n = strv_length(*l);
+
+        /* Increase and overflow check. */
+        m = n + 2;
+        if (m < n)
+                return -ENOMEM;
+
+        v = strdup(value);
+        if (!v)
+                return -ENOMEM;
+
+        c = realloc_multiply(*l, sizeof(char*), m);
+        if (!c) {
+                free(v);
+                return -ENOMEM;
+        }
+
+        memmove(c+1, c, n * sizeof(char*));
+        c[0] = v;
+        c[n+1] = NULL;
+
+        *l = c;
+        return 0;
+}
+
 char **strv_uniq(char **l) {
         char **i;
 
@@ -556,6 +637,17 @@ char **strv_remove(char **l, const char *s) {
 }
 
 char **strv_parse_nulstr(const char *s, size_t l) {
+        /* l is the length of the input data, which will be split at NULs into
+         * elements of the resulting strv. Hence, the number of items in the resulting strv
+         * will be equal to one plus the number of NUL bytes in the l bytes starting at s,
+         * unless s[l-1] is NUL, in which case the final empty string is not stored in
+         * the resulting strv, and length is equal to the number of NUL bytes.
+         *
+         * Note that contrary to a normal nulstr which cannot contain empty strings, because
+         * the input data is terminated by any two consequent NUL bytes, this parser accepts
+         * empty strings in s.
+         */
+
         const char *p;
         unsigned c = 0, i = 0;
         char **v;
@@ -617,6 +709,51 @@ char **strv_split_nulstr(const char *s) {
         return r;
 }
 
+int strv_make_nulstr(char **l, char **p, size_t *q) {
+        /* A valid nulstr with two NULs at the end will be created, but
+         * q will be the length without the two trailing NULs. Thus the output
+         * string is a valid nulstr and can be iterated over using NULSTR_FOREACH,
+         * and can also be parsed by strv_parse_nulstr as long as the length
+         * is provided separately.
+         */
+
+        size_t n_allocated = 0, n = 0;
+        _cleanup_free_ char *m = NULL;
+        char **i;
+
+        assert(p);
+        assert(q);
+
+        STRV_FOREACH(i, l) {
+                size_t z;
+
+                z = strlen(*i);
+
+                if (!GREEDY_REALLOC(m, n_allocated, n + z + 2))
+                        return -ENOMEM;
+
+                memcpy(m + n, *i, z + 1);
+                n += z + 1;
+        }
+
+        if (!m) {
+                m = new0(char, 1);
+                if (!m)
+                        return -ENOMEM;
+                n = 1;
+        } else
+                /* make sure there is a second extra NUL at the end of resulting nulstr */
+                m[n] = '\0';
+
+        assert(n > 0);
+        *p = m;
+        *q = n - 1;
+
+        m = NULL;
+
+        return 0;
+}
+
 bool strv_overlap(char **a, char **b) {
         char **i;
 
@@ -634,17 +771,17 @@ static int str_compare(const void *_a, const void *_b) {
 }
 
 char **strv_sort(char **l) {
-
-        if (strv_isempty(l))
-                return l;
-
-        qsort(l, strv_length(l), sizeof(char*), str_compare);
+        qsort_safe(l, strv_length(l), sizeof(char*), str_compare);
         return l;
 }
 
 bool strv_equal(char **a, char **b) {
-        if (!a || !b)
-                return a == b;
+
+        if (strv_isempty(a))
+                return strv_isempty(b);
+
+        if (strv_isempty(b))
+                return false;
 
         for ( ; *a || *b; ++a, ++b)
                 if (!streq_ptr(*a, *b))
@@ -682,12 +819,27 @@ char **strv_reverse(char **l) {
         if (n <= 1)
                 return l;
 
-        for (i = 0; i < n / 2; i++) {
-                char *t;
+        for (i = 0; i < n / 2; i++)
+                SWAP_TWO(l[i], l[n-1-i]);
 
-                t = l[i];
-                l[i] = l[n-1-i];
-                l[n-1-i] = t;
+        return l;
+}
+
+char **strv_shell_escape(char **l, const char *bad) {
+        char **s;
+
+        /* Escapes every character in every string in l that is in bad,
+         * edits in-place, does not roll-back on error. */
+
+        STRV_FOREACH(s, l) {
+                char *v;
+
+                v = shell_escape(*s, bad);
+                if (!v)
+                        return NULL;
+
+                free(*s);
+                *s = v;
         }
 
         return l;
@@ -697,8 +849,89 @@ bool strv_fnmatch(char* const* patterns, const char *s, int flags) {
         char* const* p;
 
         STRV_FOREACH(p, patterns)
-                if (fnmatch(*p, s, 0) == 0)
+                if (fnmatch(*p, s, flags) == 0)
                         return true;
 
         return false;
+}
+
+char ***strv_free_free(char ***l) {
+        char ***i;
+
+        if (!l)
+                return NULL;
+
+        for (i = l; *i; i++)
+                strv_free(*i);
+
+        return mfree(l);
+}
+
+char **strv_skip(char **l, size_t n) {
+
+        while (n > 0) {
+                if (strv_isempty(l))
+                        return l;
+
+                l++, n--;
+        }
+
+        return l;
+}
+
+int strv_extend_n(char ***l, const char *value, size_t n) {
+        size_t i, j, k;
+        char **nl;
+
+        assert(l);
+
+        if (!value)
+                return 0;
+        if (n == 0)
+                return 0;
+
+        /* Adds the value n times to l */
+
+        k = strv_length(*l);
+
+        nl = realloc(*l, sizeof(char*) * (k + n + 1));
+        if (!nl)
+                return -ENOMEM;
+
+        *l = nl;
+
+        for (i = k; i < k + n; i++) {
+                nl[i] = strdup(value);
+                if (!nl[i])
+                        goto rollback;
+        }
+
+        nl[i] = NULL;
+        return 0;
+
+rollback:
+        for (j = k; j < i; j++)
+                free(nl[j]);
+
+        nl[k] = NULL;
+        return -ENOMEM;
+}
+
+int fputstrv(FILE *f, char **l, const char *separator, bool *space) {
+        bool b = false;
+        char **s;
+        int r;
+
+        /* Like fputs(), but for strv, and with a less stupid argument order */
+
+        if (!space)
+                space = &b;
+
+        STRV_FOREACH(s, l) {
+                r = fputs_with_space(f, *s, separator, space);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }

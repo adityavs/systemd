@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,14 +20,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <assert.h>
-#include <sys/param.h>
-#include <sys/types.h>
-#include <sys/uio.h>
 #include <inttypes.h>
+#include <stdbool.h>
+#include <sys/param.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 
 #define _printf_(a,b) __attribute__ ((format (printf, a, b)))
-#define _alloc_(...) __attribute__ ((alloc_size(__VA_ARGS__)))
+#ifdef __clang__
+#  define _alloc_(...)
+#else
+#  define _alloc_(...) __attribute__ ((alloc_size(__VA_ARGS__)))
+#endif
 #define _sentinel_ __attribute__ ((sentinel))
 #define _unused_ __attribute__ ((unused))
 #define _destructor_ __attribute__ ((destructor))
@@ -45,6 +48,11 @@
 #define _weakref_(x) __attribute__((weakref(#x)))
 #define _alignas_(x) __attribute__((aligned(__alignof(x))))
 #define _cleanup_(x) __attribute__((cleanup(x)))
+#if __GNUC__ >= 7
+#define _fallthrough_ __attribute__((fallthrough))
+#else
+#define _fallthrough_
+#endif
 
 /* Temporarily disable some warnings */
 #define DISABLE_WARNING_DECLARATION_AFTER_STATEMENT                     \
@@ -86,6 +94,15 @@
 #define UNIQ_T(x, uniq) CONCATENATE(__unique_prefix_, CONCATENATE(x, uniq))
 #define UNIQ __COUNTER__
 
+/* builtins */
+#if __SIZEOF_INT__ == 4
+#define BUILTIN_FFS_U32(x) __builtin_ffs(x);
+#elif __SIZEOF_LONG__ == 4
+#define BUILTIN_FFS_U32(x) __builtin_ffsl(x);
+#else
+#error "neither int nor long are four bytes long?!?"
+#endif
+
 /* Rounds up */
 
 #define ALIGN4(l) (((l) + 3) & ~3)
@@ -122,7 +139,24 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
         return 1UL << (sizeof(u) * 8 - __builtin_clzl(u - 1UL));
 }
 
-#define ELEMENTSOF(x) (sizeof(x)/sizeof((x)[0]))
+#ifndef __COVERITY__
+#  define VOID_0 ((void)0)
+#else
+#  define VOID_0 ((void*)0)
+#endif
+
+#define ELEMENTSOF(x)                                                    \
+        __extension__ (__builtin_choose_expr(                            \
+                !__builtin_types_compatible_p(typeof(x), typeof(&*(x))), \
+                sizeof(x)/sizeof((x)[0]),                                \
+                VOID_0))
+
+/*
+ * STRLEN - return the length of a string literal, minus the trailing NUL byte.
+ *          Contrary to strlen(), this is a constant expression.
+ * @x: a string literal.
+ */
+#define STRLEN(x) (sizeof(""x"") - 1)
 
 /*
  * container_of - cast a member of a structure out to the containing structure
@@ -153,7 +187,7 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
                 __builtin_constant_p(_B) &&                             \
                 __builtin_types_compatible_p(typeof(_A), typeof(_B)),   \
                 ((_A) > (_B)) ? (_A) : (_B),                            \
-                (void)0))
+                VOID_0))
 
 /* takes two types and returns the size of the larger one */
 #define MAXSIZE(A, B) (sizeof(union _packed_ { typeof(A) a; typeof(B) b; }))
@@ -212,18 +246,20 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
                 (__x / __y + !!(__x % __y));                            \
         })
 
-#define assert_se(expr)                                                 \
+#define assert_message_se(expr, message)                                \
         do {                                                            \
                 if (_unlikely_(!(expr)))                                \
-                        log_assert_failed(#expr, __FILE__, __LINE__, __PRETTY_FUNCTION__); \
-        } while (false)                                                 \
+                        log_assert_failed(message, __FILE__, __LINE__, __PRETTY_FUNCTION__); \
+        } while (false)
+
+#define assert_se(expr) assert_message_se(expr, #expr)
 
 /* We override the glibc assert() here. */
 #undef assert
 #ifdef NDEBUG
-#define assert(expr) do {} while(false)
+#define assert(expr) do {} while (false)
 #else
-#define assert(expr) assert_se(expr)
+#define assert(expr) assert_message_se(expr, #expr)
 #endif
 
 #define assert_not_reached(t)                                           \
@@ -248,19 +284,19 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
         REENABLE_WARNING
 #endif
 
-#define assert_log(expr) ((_likely_(expr))      \
-        ? (true)                                \
-        : (log_assert_failed_return(#expr, __FILE__, __LINE__, __PRETTY_FUNCTION__), false))
+#define assert_log(expr, message) ((_likely_(expr))                     \
+        ? (true)                                                        \
+        : (log_assert_failed_return(message, __FILE__, __LINE__, __PRETTY_FUNCTION__), false))
 
 #define assert_return(expr, r)                                          \
         do {                                                            \
-                if (!assert_log(expr))                                  \
+                if (!assert_log(expr, #expr))                           \
                         return (r);                                     \
         } while (false)
 
 #define assert_return_errno(expr, r, err)                               \
         do {                                                            \
-                if (!assert_log(expr)) {                                \
+                if (!assert_log(expr, #expr)) {                         \
                         errno = err;                                    \
                         return (r);                                     \
                 }                                                       \
@@ -289,107 +325,9 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
 #define PTR_TO_SIZE(p) ((size_t) ((uintptr_t) (p)))
 #define SIZE_TO_PTR(u) ((void *) ((uintptr_t) (u)))
 
-/* The following macros add 1 when converting things, since UID 0 is a
- * valid UID, while the pointer NULL is special */
-#define PTR_TO_UID(p) ((uid_t) (((uintptr_t) (p))-1))
-#define UID_TO_PTR(u) ((void*) (((uintptr_t) (u))+1))
-
-#define PTR_TO_GID(p) ((gid_t) (((uintptr_t) (p))-1))
-#define GID_TO_PTR(u) ((void*) (((uintptr_t) (u))+1))
-
-#define memzero(x,l) (memset((x), 0, (l)))
-#define zero(x) (memzero(&(x), sizeof(x)))
-
 #define CHAR_TO_STR(x) ((char[2]) { x, 0 })
 
 #define char_array_0(x) x[sizeof(x)-1] = 0;
-
-#define IOVEC_SET_STRING(i, s)                  \
-        do {                                    \
-                struct iovec *_i = &(i);        \
-                char *_s = (char *)(s);         \
-                _i->iov_base = _s;              \
-                _i->iov_len = strlen(_s);       \
-        } while(false)
-
-static inline size_t IOVEC_TOTAL_SIZE(const struct iovec *i, unsigned n) {
-        unsigned j;
-        size_t r = 0;
-
-        for (j = 0; j < n; j++)
-                r += i[j].iov_len;
-
-        return r;
-}
-
-static inline size_t IOVEC_INCREMENT(struct iovec *i, unsigned n, size_t k) {
-        unsigned j;
-
-        for (j = 0; j < n; j++) {
-                size_t sub;
-
-                if (_unlikely_(k <= 0))
-                        break;
-
-                sub = MIN(i[j].iov_len, k);
-                i[j].iov_len -= sub;
-                i[j].iov_base = (uint8_t*) i[j].iov_base + sub;
-                k -= sub;
-        }
-
-        return k;
-}
-
-#define VA_FORMAT_ADVANCE(format, ap)                                   \
-do {                                                                    \
-        int _argtypes[128];                                             \
-        size_t _i, _k;                                                  \
-        _k = parse_printf_format((format), ELEMENTSOF(_argtypes), _argtypes); \
-        assert(_k < ELEMENTSOF(_argtypes));                             \
-        for (_i = 0; _i < _k; _i++) {                                   \
-                if (_argtypes[_i] & PA_FLAG_PTR)  {                     \
-                        (void) va_arg(ap, void*);                       \
-                        continue;                                       \
-                }                                                       \
-                                                                        \
-                switch (_argtypes[_i]) {                                \
-                case PA_INT:                                            \
-                case PA_INT|PA_FLAG_SHORT:                              \
-                case PA_CHAR:                                           \
-                        (void) va_arg(ap, int);                         \
-                        break;                                          \
-                case PA_INT|PA_FLAG_LONG:                               \
-                        (void) va_arg(ap, long int);                    \
-                        break;                                          \
-                case PA_INT|PA_FLAG_LONG_LONG:                          \
-                        (void) va_arg(ap, long long int);               \
-                        break;                                          \
-                case PA_WCHAR:                                          \
-                        (void) va_arg(ap, wchar_t);                     \
-                        break;                                          \
-                case PA_WSTRING:                                        \
-                case PA_STRING:                                         \
-                case PA_POINTER:                                        \
-                        (void) va_arg(ap, void*);                       \
-                        break;                                          \
-                case PA_FLOAT:                                          \
-                case PA_DOUBLE:                                         \
-                        (void) va_arg(ap, double);                      \
-                        break;                                          \
-                case PA_DOUBLE|PA_FLAG_LONG_DOUBLE:                     \
-                        (void) va_arg(ap, long double);                 \
-                        break;                                          \
-                default:                                                \
-                        assert_not_reached("Unknown format string argument."); \
-                }                                                       \
-        }                                                               \
-} while(false)
-
- /* Because statfs.t_type can be int on some architectures, we have to cast
-  * the const magic to the type, otherwise the compiler warns about
-  * signed/unsigned comparison, because the magic can be 32 bit unsigned.
- */
-#define F_TYPE_EQUAL(a, b) (a == (typeof(a)) b)
 
 /* Returns the number of chars needed to format variables of the
  * specified type as a decimal string. Adds in extra space for a
@@ -401,37 +339,66 @@ do {                                                                    \
             sizeof(type) <= 4 ? 10 :                                    \
             sizeof(type) <= 8 ? 20 : sizeof(int[-2*(sizeof(type) > 8)])))
 
+#define DECIMAL_STR_WIDTH(x)                            \
+        ({                                              \
+                typeof(x) _x_ = (x);                    \
+                unsigned ans = 1;                       \
+                while (_x_ /= 10)                       \
+                        ans++;                          \
+                ans;                                    \
+        })
+
 #define SET_FLAG(v, flag, b) \
         (v) = (b) ? ((v) | (flag)) : ((v) & ~(flag))
 
-#define IN_SET(x, y, ...)                                               \
-        ({                                                              \
-                const typeof(y) _y = (y);                               \
-                const typeof(_y) _x = (x);                              \
-                unsigned _i;                                            \
-                bool _found = false;                                    \
-                for (_i = 0; _i < 1 + sizeof((const typeof(_x)[]) { __VA_ARGS__ })/sizeof(const typeof(_x)); _i++) \
-                        if (((const typeof(_x)[]) { _y, __VA_ARGS__ })[_i] == _x) { \
-                                _found = true;                          \
-                                break;                                  \
-                        }                                               \
-                _found;                                                 \
+#define CASE_F(X) case X:
+#define CASE_F_1(CASE, X) CASE_F(X)
+#define CASE_F_2(CASE, X, ...)  CASE(X) CASE_F_1(CASE, __VA_ARGS__)
+#define CASE_F_3(CASE, X, ...)  CASE(X) CASE_F_2(CASE, __VA_ARGS__)
+#define CASE_F_4(CASE, X, ...)  CASE(X) CASE_F_3(CASE, __VA_ARGS__)
+#define CASE_F_5(CASE, X, ...)  CASE(X) CASE_F_4(CASE, __VA_ARGS__)
+#define CASE_F_6(CASE, X, ...)  CASE(X) CASE_F_5(CASE, __VA_ARGS__)
+#define CASE_F_7(CASE, X, ...)  CASE(X) CASE_F_6(CASE, __VA_ARGS__)
+#define CASE_F_8(CASE, X, ...)  CASE(X) CASE_F_7(CASE, __VA_ARGS__)
+#define CASE_F_9(CASE, X, ...)  CASE(X) CASE_F_8(CASE, __VA_ARGS__)
+#define CASE_F_10(CASE, X, ...) CASE(X) CASE_F_9(CASE, __VA_ARGS__)
+#define CASE_F_11(CASE, X, ...) CASE(X) CASE_F_10(CASE, __VA_ARGS__)
+#define CASE_F_12(CASE, X, ...) CASE(X) CASE_F_11(CASE, __VA_ARGS__)
+#define CASE_F_13(CASE, X, ...) CASE(X) CASE_F_12(CASE, __VA_ARGS__)
+#define CASE_F_14(CASE, X, ...) CASE(X) CASE_F_13(CASE, __VA_ARGS__)
+#define CASE_F_15(CASE, X, ...) CASE(X) CASE_F_14(CASE, __VA_ARGS__)
+#define CASE_F_16(CASE, X, ...) CASE(X) CASE_F_15(CASE, __VA_ARGS__)
+#define CASE_F_17(CASE, X, ...) CASE(X) CASE_F_16(CASE, __VA_ARGS__)
+#define CASE_F_18(CASE, X, ...) CASE(X) CASE_F_17(CASE, __VA_ARGS__)
+#define CASE_F_19(CASE, X, ...) CASE(X) CASE_F_18(CASE, __VA_ARGS__)
+#define CASE_F_20(CASE, X, ...) CASE(X) CASE_F_19(CASE, __VA_ARGS__)
+
+#define GET_CASE_F(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,_17,_18,_19,_20,NAME,...) NAME
+#define FOR_EACH_MAKE_CASE(...) \
+        GET_CASE_F(__VA_ARGS__,CASE_F_20,CASE_F_19,CASE_F_18,CASE_F_17,CASE_F_16,CASE_F_15,CASE_F_14,CASE_F_13,CASE_F_12,CASE_F_11, \
+                               CASE_F_10,CASE_F_9,CASE_F_8,CASE_F_7,CASE_F_6,CASE_F_5,CASE_F_4,CASE_F_3,CASE_F_2,CASE_F_1) \
+                   (CASE_F,__VA_ARGS__)
+
+#define IN_SET(x, ...)                          \
+        ({                                      \
+                bool _found = false;            \
+                /* If the build breaks in the line below, you need to extend the case macros */ \
+                static _unused_ char _static_assert__macros_need_to_be_extended[20 - sizeof((int[]){__VA_ARGS__})/sizeof(int)]; \
+                switch(x) {                     \
+                FOR_EACH_MAKE_CASE(__VA_ARGS__) \
+                        _found = true;          \
+                        break;                  \
+                default:                        \
+                        break;                  \
+                }                               \
+                _found;                         \
         })
 
-/* Return a nulstr for a standard cascade of configuration directories,
- * suitable to pass to conf_files_list_nulstr or config_parse_many. */
-#define CONF_DIRS_NULSTR(n) \
-        "/etc/" n ".d\0" \
-        "/run/" n ".d\0" \
-        "/usr/local/lib/" n ".d\0" \
-        "/usr/lib/" n ".d\0" \
-        CONF_DIR_SPLIT_USR(n)
-
-#ifdef HAVE_SPLIT_USR
-#define CONF_DIR_SPLIT_USR(n) "/lib/" n ".d\0"
-#else
-#define CONF_DIR_SPLIT_USR(n)
-#endif
+#define SWAP_TWO(x, y) do {                        \
+                typeof(x) _t = (x);                \
+                (x) = (y);                         \
+                (y) = (_t);                        \
+        } while (false)
 
 /* Define C11 thread_local attribute even on older gcc compiler
  * version */
@@ -457,18 +424,11 @@ do {                                                                    \
 #endif
 #endif
 
-#define UID_INVALID ((uid_t) -1)
-#define GID_INVALID ((gid_t) -1)
-#define MODE_INVALID ((mode_t) -1)
-
 #define DEFINE_TRIVIAL_CLEANUP_FUNC(type, func)                 \
         static inline void func##p(type *p) {                   \
                 if (*p)                                         \
                         func(*p);                               \
         }                                                       \
         struct __useless_struct_to_allow_trailing_semicolon__
-
-#define CMSG_FOREACH(cmsg, mh)                                          \
-        for ((cmsg) = CMSG_FIRSTHDR(mh); (cmsg); (cmsg) = CMSG_NXTHDR((mh), (cmsg)))
 
 #include "log.h"

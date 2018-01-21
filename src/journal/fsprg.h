@@ -1,4 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #ifndef __fsprgh__
 #define __fsprgh__
@@ -25,10 +25,11 @@
  *
  */
 
-#include <sys/types.h>
 #include <inttypes.h>
+#include <sys/types.h>
 
 #include "macro.h"
+#include "util.h"
 
 #ifdef __cplusplus
 extern "C" {

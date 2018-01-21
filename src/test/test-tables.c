@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd
 
@@ -17,6 +18,7 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "architecture.h"
 #include "automount.h"
 #include "cgroup.h"
 #include "compress.h"
@@ -25,39 +27,33 @@
 #include "execute.h"
 #include "install.h"
 #include "job.h"
+#include "journald-server.h"
 #include "kill.h"
+#include "link-config.h"
+#include "locale-util.h"
 #include "log.h"
 #include "logs-show.h"
 #include "mount.h"
 #include "path.h"
+#include "rlimit-util.h"
 #include "scope.h"
 #include "service.h"
 #include "slice.h"
-#include "snapshot.h"
 #include "socket-util.h"
 #include "socket.h"
 #include "swap.h"
 #include "target.h"
+#include "test-tables.h"
 #include "timer.h"
 #include "unit-name.h"
 #include "unit.h"
 #include "util.h"
-#include "architecture.h"
-#include "link-config.h"
-#include "bus-xml-policy.h"
-#include "busname.h"
-#include "journald-server.h"
-#include "locale-util.h"
-
-#include "test-tables.h"
+#include "virt.h"
 
 int main(int argc, char **argv) {
         test_table(architecture, ARCHITECTURE);
         test_table(automount_result, AUTOMOUNT_RESULT);
         test_table(automount_state, AUTOMOUNT_STATE);
-        test_table(bus_policy_access, BUS_POLICY_ACCESS);
-        test_table(busname_result, BUSNAME_RESULT);
-        test_table(busname_state, BUSNAME_STATE);
         test_table(cgroup_device_policy, CGROUP_DEVICE_POLICY);
         test_table(condition_type, CONDITION_TYPE);
         test_table(assert_type, CONDITION_TYPE);
@@ -65,7 +61,7 @@ int main(int argc, char **argv) {
         test_table(device_state, DEVICE_STATE);
         test_table(exec_input, EXEC_INPUT);
         test_table(exec_output, EXEC_OUTPUT);
-        test_table(failure_action, FAILURE_ACTION);
+        test_table(emergency_action, EMERGENCY_ACTION);
         test_table(job_mode, JOB_MODE);
         test_table(job_result, JOB_RESULT);
         test_table(job_state, JOB_STATE);
@@ -84,8 +80,6 @@ int main(int argc, char **argv) {
         test_table(path_result, PATH_RESULT);
         test_table(path_state, PATH_STATE);
         test_table(path_type, PATH_TYPE);
-        test_table(policy_item_class, POLICY_ITEM_CLASS);
-        test_table(policy_item_type, POLICY_ITEM_TYPE);
         test_table(protect_home, PROTECT_HOME);
         test_table(protect_system, PROTECT_SYSTEM);
         test_table(rlimit, RLIMIT);
@@ -97,7 +91,6 @@ int main(int argc, char **argv) {
         test_table(service_state, SERVICE_STATE);
         test_table(service_type, SERVICE_TYPE);
         test_table(slice_state, SLICE_STATE);
-        test_table(snapshot_state, SNAPSHOT_STATE);
         test_table(socket_address_bind_ipv6_only, SOCKET_ADDRESS_BIND_IPV6_ONLY);
         test_table(socket_exec_command, SOCKET_EXEC_COMMAND);
         test_table(socket_result, SOCKET_RESULT);
@@ -119,6 +112,7 @@ int main(int argc, char **argv) {
         test_table(unit_load_state, UNIT_LOAD_STATE);
         test_table(unit_type, UNIT_TYPE);
         test_table(locale_variable, VARIABLE_LC);
+        test_table(virtualization, VIRTUALIZATION);
 
         test_table_sparse(object_compressed, OBJECT_COMPRESSED);
 

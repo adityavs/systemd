@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,14 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "bus-type.h"
+#include <errno.h>
+#include <string.h>
+
+#include "sd-bus.h"
+
 #include "bus-gvariant.h"
 #include "bus-signature.h"
+#include "bus-type.h"
 
 int bus_gvariant_get_size(const char *signature) {
         const char *p;
@@ -75,14 +79,19 @@ int bus_gvariant_get_size(const char *signature) {
 
                 case SD_BUS_TYPE_STRUCT_BEGIN:
                 case SD_BUS_TYPE_DICT_ENTRY_BEGIN: {
-                        char t[n-1];
+                        if (n == 2) {
+                                /* unary type () has fixed size of 1 */
+                                r = 1;
+                        } else {
+                                char t[n-1];
 
-                        memcpy(t, p + 1, n - 2);
-                        t[n - 2] = 0;
+                                memcpy(t, p + 1, n - 2);
+                                t[n - 2] = 0;
 
-                        r = bus_gvariant_get_size(t);
-                        if (r < 0)
-                                return r;
+                                r = bus_gvariant_get_size(t);
+                                if (r < 0)
+                                        return r;
+                        }
 
                         sum += r;
                         break;

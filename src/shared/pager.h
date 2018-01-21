@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -25,7 +24,7 @@
 
 #include "macro.h"
 
-int pager_open(bool jump_to_end);
+int pager_open(bool no_pager, bool jump_to_end);
 void pager_close(void);
 bool pager_have(void) _pure_;
 

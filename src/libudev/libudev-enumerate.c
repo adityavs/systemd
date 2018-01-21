@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -18,22 +19,23 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <errno.h>
-#include <string.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fnmatch.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 #include "libudev.h"
-#include "libudev-device-internal.h"
 #include "sd-device.h"
-#include "device-util.h"
-#include "device-enumerator-private.h"
 
+#include "alloc-util.h"
+#include "device-enumerator-private.h"
+#include "device-util.h"
+#include "libudev-device-internal.h"
 
 /**
  * SECTION:libudev-enumerate
@@ -111,7 +113,7 @@ _public_ struct udev_enumerate *udev_enumerate_new(struct udev *udev) {
  **/
 _public_ struct udev_enumerate *udev_enumerate_ref(struct udev_enumerate *udev_enumerate) {
         if (udev_enumerate)
-                udev_enumerate->refcount ++;
+                udev_enumerate->refcount++;
 
         return udev_enumerate;
 }
@@ -158,6 +160,8 @@ _public_ struct udev *udev_enumerate_get_udev(struct udev_enumerate *udev_enumer
  * Returns: a udev_list_entry.
  */
 _public_ struct udev_list_entry *udev_enumerate_get_list_entry(struct udev_enumerate *udev_enumerate) {
+        struct udev_list_entry *e;
+
         assert_return_errno(udev_enumerate, NULL, EINVAL);
 
         if (!udev_enumerate->devices_uptodate) {
@@ -181,7 +185,11 @@ _public_ struct udev_list_entry *udev_enumerate_get_list_entry(struct udev_enume
                 udev_enumerate->devices_uptodate = true;
         }
 
-        return udev_list_get_entry(&udev_enumerate->devices_list);
+        e = udev_list_get_entry(&udev_enumerate->devices_list);
+        if (!e)
+                errno = ENODATA;
+
+        return e;
 }
 
 /**
@@ -369,7 +377,7 @@ _public_ int udev_enumerate_add_match_sysname(struct udev_enumerate *udev_enumer
  * Returns: 0 on success, otherwise a negative error value.
  */
 _public_ int udev_enumerate_add_syspath(struct udev_enumerate *udev_enumerate, const char *syspath) {
-        _cleanup_device_unref_ sd_device *device = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
         assert_return(udev_enumerate, -EINVAL);

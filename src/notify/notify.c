@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,25 +18,30 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <getopt.h>
 #include <errno.h>
-#include <unistd.h>
+#include <getopt.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
-#include "systemd/sd-daemon.h"
+#include "sd-daemon.h"
 
-#include "strv.h"
-#include "util.h"
-#include "log.h"
-#include "build.h"
+#include "alloc-util.h"
 #include "env-util.h"
-#include "formats-util.h"
+#include "format-util.h"
+#include "log.h"
+#include "parse-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
 
 static bool arg_ready = false;
 static pid_t arg_pid = 0;
 static const char *arg_status = NULL;
 static bool arg_booted = false;
+static uid_t arg_uid = UID_INVALID;
+static gid_t arg_gid = GID_INVALID;
 
 static void help(void) {
         printf("%s [OPTIONS...] [VARIABLE=VALUE...]\n\n"
@@ -45,7 +49,8 @@ static void help(void) {
                "  -h --help            Show this help\n"
                "     --version         Show package version\n"
                "     --ready           Inform the init system about service start-up completion\n"
-               "     --pid[=PID]       Set main pid of daemon\n"
+               "     --pid[=PID]       Set main PID of daemon\n"
+               "     --uid=USER        Set user to send from\n"
                "     --status=TEXT     Set status text\n"
                "     --booted          Check if the system was booted up with systemd\n",
                program_invocation_short_name);
@@ -59,6 +64,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_PID,
                 ARG_STATUS,
                 ARG_BOOTED,
+                ARG_UID,
         };
 
         static const struct option options[] = {
@@ -68,10 +74,11 @@ static int parse_argv(int argc, char *argv[]) {
                 { "pid",       optional_argument, NULL, ARG_PID       },
                 { "status",    required_argument, NULL, ARG_STATUS    },
                 { "booted",    no_argument,       NULL, ARG_BOOTED    },
+                { "uid",       required_argument, NULL, ARG_UID       },
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
@@ -85,9 +92,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_READY:
                         arg_ready = true;
@@ -112,6 +117,18 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_BOOTED:
                         arg_booted = true;
                         break;
+
+                case ARG_UID: {
+                        const char *u = optarg;
+
+                        r = get_user_creds(&u, &arg_uid, &arg_gid, NULL, NULL);
+                        if (r == -ESRCH) /* If the user doesn't exist, then accept it anyway as numeric */
+                                r = parse_uid(u, &arg_uid);
+                        if (r < 0)
+                                return log_error_errno(r, "Can't resolve user %s: %m", optarg);
+
+                        break;
+                }
 
                 case '?':
                         return -EINVAL;
@@ -180,7 +197,7 @@ int main(int argc, char* argv[]) {
                 goto finish;
         }
 
-        if (strv_length(final_env) <= 0) {
+        if (strv_isempty(final_env)) {
                 r = 0;
                 goto finish;
         }
@@ -191,14 +208,30 @@ int main(int argc, char* argv[]) {
                 goto finish;
         }
 
-        r = sd_pid_notify(arg_pid, false, n);
+        /* If this is requested change to the requested UID/GID. Note thta we only change the real UID here, and leave
+           the effective UID in effect (which is 0 for this to work). That's because we want the privileges to fake the
+           ucred data, and sd_pid_notify() uses the real UID for filling in ucred. */
+
+        if (arg_gid != GID_INVALID)
+                if (setregid(arg_gid, (gid_t) -1) < 0) {
+                        r = log_error_errno(errno, "Failed to change GID: %m");
+                        goto finish;
+                }
+
+        if (arg_uid != UID_INVALID)
+                if (setreuid(arg_uid, (uid_t) -1) < 0) {
+                        r = log_error_errno(errno, "Failed to change UID: %m");
+                        goto finish;
+                }
+
+        r = sd_pid_notify(arg_pid ? arg_pid : getppid(), false, n);
         if (r < 0) {
                 log_error_errno(r, "Failed to notify init system: %m");
                 goto finish;
-        }
-
-        if (r == 0)
+        } else if (r == 0) {
+                log_error("No status data could be sent: $NOTIFY_SOCKET was not set");
                 r = -EOPNOTSUPP;
+        }
 
 finish:
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

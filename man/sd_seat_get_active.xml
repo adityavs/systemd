@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
@@ -105,8 +107,9 @@
     one (<constant>NULL</constant> terminated) with the session
     identifiers of the sessions and one with the user identifiers of
     the Unix users the sessions belong to. An additional parameter may
-    be used to return the number of entries in the latter array. The
-    two arrays and the latter parameter may be passed as
+    be used to return the number of entries in the latter array. This
+    value is the same the return value, if the latter is nonnegative.
+    The two arrays and the last parameter may be passed as
     <constant>NULL</constant> in case these values need not to be
     determined. The arrays and the strings referenced by them need to
     be freed with the libc
@@ -149,13 +152,50 @@
   </refsect1>
 
   <refsect1>
+    <title>Errors</title>
+
+    <para>Returned errors may indicate the following problems:</para>
+
+    <variablelist>
+
+      <varlistentry>
+        <term><constant>-ENODATA</constant></term>
+
+        <listitem><para>The given field is not specified for the described
+        seat.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-ENXIO</constant></term>
+
+        <listitem><para>The specified seat is unknown.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-EINVAL</constant></term>
+
+        <listitem><para>An input parameter was invalid (out of range,
+        or NULL, where that is not accepted).</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-ENOMEM</constant></term>
+
+        <listitem><para>Memory allocation failed.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
     <title>Notes</title>
 
     <para>The <function>sd_seat_get_active()</function>,
     <function>sd_seat_get_sessions()</function>,
     <function>sd_seat_can_multi_session()</function>,
     <function>sd_seat_can_tty()</function> and
-    <function>sd_seat_can_grapical()</function> interfaces are
+    <function>sd_seat_can_graphical()</function> interfaces are
     available as a shared library, which can be compiled and linked to
     with the
     <constant>libsystemd</constant> <citerefentry project='die-net'><refentrytitle>pkg-config</refentrytitle><manvolnum>1</manvolnum></citerefentry>

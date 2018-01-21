@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -18,29 +19,31 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/sockios.h>
+#include <net/if.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
-#include <unistd.h>
-#include <stdbool.h>
-#include <errno.h>
 #include <string.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <ctype.h>
-#include <net/if.h>
-#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <linux/sockios.h>
-
-#include "sd-device.h"
-#include "device-util.h"
-#include "device-private.h"
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "libudev.h"
-#include "libudev-private.h"
+#include "sd-device.h"
+
+#include "alloc-util.h"
+#include "device-private.h"
+#include "device-util.h"
 #include "libudev-device-internal.h"
+#include "libudev-private.h"
+#include "parse-util.h"
 
 /**
  * SECTION:libudev-device
@@ -493,7 +496,7 @@ _public_ struct udev_device *udev_device_get_parent_with_subsystem_devtype(struc
                 return NULL;
         }
 
-        /* then walk the chain of udev_device parents until the correspanding
+        /* then walk the chain of udev_device parents until the corresponding
            one is found */
         while ((udev_device = udev_device_get_parent(udev_device))) {
                 if (udev_device->device == parent)
@@ -617,7 +620,7 @@ _public_ const char *udev_device_get_syspath(struct udev_device *udev_device)
  *
  * Get the kernel device name in /sys.
  *
- * Returns: the name string of the device device
+ * Returns: the name string of the device
  **/
 _public_ const char *udev_device_get_sysname(struct udev_device *udev_device)
 {

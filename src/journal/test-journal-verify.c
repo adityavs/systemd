@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h>
 
-#include "util.h"
-#include "log.h"
-#include "rm-rf.h"
+#include "fd-util.h"
 #include "journal-file.h"
 #include "journal-verify.h"
+#include "log.h"
+#include "rm-rf.h"
 #include "terminal-util.h"
+#include "util.h"
 
 #define N_ENTRIES 6000
 #define RANDOM_RANGE 77
@@ -56,12 +56,12 @@ static int raw_verify(const char *fn, const char *verification_key) {
         JournalFile *f;
         int r;
 
-        r = journal_file_open(fn, O_RDONLY, 0666, true, !!verification_key, NULL, NULL, NULL, &f);
+        r = journal_file_open(-1, fn, O_RDONLY, 0666, true, !!verification_key, NULL, NULL, NULL, NULL, &f);
         if (r < 0)
                 return r;
 
         r = journal_file_verify(f, verification_key, NULL, NULL, NULL, false);
-        journal_file_close(f);
+        (void) journal_file_close(f);
 
         return r;
 }
@@ -89,7 +89,7 @@ int main(int argc, char *argv[]) {
 
         log_info("Generating...");
 
-        assert_se(journal_file_open("test.journal", O_RDWR|O_CREAT, 0666, true, !!verification_key, NULL, NULL, NULL, &f) == 0);
+        assert_se(journal_file_open(-1, "test.journal", O_RDWR|O_CREAT, 0666, true, !!verification_key, NULL, NULL, NULL, NULL, &f) == 0);
 
         for (n = 0; n < N_ENTRIES; n++) {
                 struct iovec iovec;
@@ -108,24 +108,23 @@ int main(int argc, char *argv[]) {
                 free(test);
         }
 
-        journal_file_close(f);
+        (void) journal_file_close(f);
 
         log_info("Verifying...");
 
-        assert_se(journal_file_open("test.journal", O_RDONLY, 0666, true, !!verification_key, NULL, NULL, NULL, &f) == 0);
+        assert_se(journal_file_open(-1, "test.journal", O_RDONLY, 0666, true, !!verification_key, NULL, NULL, NULL, NULL, &f) == 0);
         /* journal_file_print_header(f); */
         journal_file_dump(f);
 
         assert_se(journal_file_verify(f, verification_key, &from, &to, &total, true) >= 0);
 
-        if (verification_key && JOURNAL_HEADER_SEALED(f->header)) {
+        if (verification_key && JOURNAL_HEADER_SEALED(f->header))
                 log_info("=> Validated from %s to %s, %s missing",
                          format_timestamp(a, sizeof(a), from),
                          format_timestamp(b, sizeof(b), to),
                          format_timespan(c, sizeof(c), total > to ? total - to : 0, 0));
-        }
 
-        journal_file_close(f);
+        (void) journal_file_close(f);
 
         if (verification_key) {
                 log_info("Toggling bits...");
@@ -138,7 +137,7 @@ int main(int argc, char *argv[]) {
                         log_info("[ %"PRIu64"+%"PRIu64"]", p / 8, p % 8);
 
                         if (raw_verify("test.journal", verification_key) >= 0)
-                                log_notice(ANSI_HIGHLIGHT_RED_ON ">>>> %"PRIu64" (bit %"PRIu64") can be toggled without detection." ANSI_HIGHLIGHT_OFF, p / 8, p % 8);
+                                log_notice(ANSI_HIGHLIGHT_RED ">>>> %"PRIu64" (bit %"PRIu64") can be toggled without detection." ANSI_NORMAL, p / 8, p % 8);
 
                         bit_toggle("test.journal", p);
                 }

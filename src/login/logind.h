@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,20 +21,21 @@
 ***/
 
 #include <stdbool.h>
-#include <libudev.h>
 
-#include "sd-event.h"
+#include "libudev.h"
 #include "sd-bus.h"
-#include "list.h"
+#include "sd-event.h"
+
 #include "hashmap.h"
+#include "list.h"
 #include "set.h"
 
 typedef struct Manager Manager;
 
+#include "logind-action.h"
+#include "logind-button.h"
 #include "logind-device.h"
 #include "logind-inhibit.h"
-#include "logind-button.h"
-#include "logind-action.h"
 
 struct Manager {
         sd_event *event;
@@ -47,8 +47,6 @@ struct Manager {
         Hashmap *users;
         Hashmap *inhibitors;
         Hashmap *buttons;
-
-        Set *busnames;
 
         LIST_HEAD(Seat, seat_gc_queue);
         LIST_HEAD(Session, session_gc_queue);
@@ -109,6 +107,8 @@ struct Manager {
         unsigned enable_wall_messages;
         sd_event_source *wall_message_timeout_source;
 
+        bool shutdown_dry_run;
+
         sd_event_source *idle_action_event_source;
         usec_t idle_action_usec;
         usec_t idle_action_not_before_usec;
@@ -133,6 +133,9 @@ struct Manager {
         sd_event_source *lid_switch_ignore_event_source;
 
         size_t runtime_dir_size;
+        uint64_t user_tasks_max;
+        uint64_t sessions_max;
+        uint64_t inhibitors_max;
 };
 
 int manager_add_device(Manager *m, const char *sysfs, bool master, Device **_device);
@@ -170,7 +173,8 @@ int bus_manager_shutdown_or_sleep_now_or_later(Manager *m, const char *unit_name
 
 int manager_send_changed(Manager *manager, const char *property, ...) _sentinel_;
 
-int manager_start_scope(Manager *manager, const char *scope, pid_t pid, const char *slice, const char *description, const char *after, const char *after2, sd_bus_error *error, char **job);
+int manager_start_slice(Manager *manager, const char *slice, const char *description, const char *after, const char *after2, uint64_t tasks_max, sd_bus_error *error, char **job);
+int manager_start_scope(Manager *manager, const char *scope, pid_t pid, const char *slice, const char *description, const char *after, const char *after2, uint64_t tasks_max, sd_bus_error *error, char **job);
 int manager_start_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job);
 int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job);
 int manager_abandon_scope(Manager *manager, const char *scope, sd_bus_error *error);
@@ -179,14 +183,13 @@ int manager_unit_is_active(Manager *manager, const char *unit);
 int manager_job_is_active(Manager *manager, const char *path);
 
 /* gperf lookup function */
-const struct ConfigPerfItem* logind_gperf_lookup(const char *key, unsigned length);
-
-int manager_watch_busname(Manager *manager, const char *name);
-void manager_drop_busname(Manager *manager, const char *name);
+const struct ConfigPerfItem* logind_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
 
 int manager_set_lid_switch_ignore(Manager *m, usec_t until);
 
+int config_parse_n_autovts(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
 int config_parse_tmpfs_size(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
+int config_parse_user_tasks_max(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
 
 int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Session **ret);
 int manager_get_user_from_creds(Manager *m, sd_bus_message *message, uid_t uid, sd_bus_error *error, User **ret);
@@ -194,3 +197,5 @@ int manager_get_seat_from_creds(Manager *m, sd_bus_message *message, const char 
 
 int manager_setup_wall_message_timer(Manager *m);
 bool logind_wall_tty_filter(const char *tty, void *userdata);
+
+int manager_dispatch_delayed(Manager *manager, bool timeout);

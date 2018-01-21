@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -35,5 +34,6 @@ int bus_socket_read_message(sd_bus *bus);
 
 int bus_socket_process_opening(sd_bus *b);
 int bus_socket_process_authenticating(sd_bus *b);
+int bus_socket_process_watch_bind(sd_bus *b);
 
 bool bus_socket_auth_needs_write(sd_bus *b);

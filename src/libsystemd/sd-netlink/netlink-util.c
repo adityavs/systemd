@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
  This file is part of systemd.
 
@@ -19,14 +18,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-
 #include "sd-netlink.h"
 
-#include "netlink-util.h"
 #include "netlink-internal.h"
+#include "netlink-util.h"
 
 int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
-        _cleanup_netlink_message_unref_ sd_netlink_message *message = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         int r;
 
         assert(rtnl);
@@ -56,7 +54,7 @@ int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
 
 int rtnl_set_link_properties(sd_netlink **rtnl, int ifindex, const char *alias,
                              const struct ether_addr *mac, unsigned mtu) {
-        _cleanup_netlink_message_unref_ sd_netlink_message *message = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         int r;
 
         assert(rtnl);
@@ -100,13 +98,13 @@ int rtnl_set_link_properties(sd_netlink **rtnl, int ifindex, const char *alias,
         return 0;
 }
 
-int rtnl_message_new_synthetic_error(int error, uint32_t serial, sd_netlink_message **ret) {
+int rtnl_message_new_synthetic_error(sd_netlink *rtnl, int error, uint32_t serial, sd_netlink_message **ret) {
         struct nlmsgerr *err;
         int r;
 
         assert(error <= 0);
 
-        r = message_new(NULL, ret, NLMSG_ERROR);
+        r = message_new(rtnl, ret, NLMSG_ERROR);
         if (r < 0)
                 return r;
 
@@ -117,51 +115,6 @@ int rtnl_message_new_synthetic_error(int error, uint32_t serial, sd_netlink_mess
         err->error = error;
 
         return 0;
-}
-
-bool rtnl_message_type_is_neigh(uint16_t type) {
-        switch (type) {
-                case RTM_NEWNEIGH:
-                case RTM_GETNEIGH:
-                case RTM_DELNEIGH:
-                        return true;
-                default:
-                        return false;
-        }
-}
-
-bool rtnl_message_type_is_route(uint16_t type) {
-        switch (type) {
-                case RTM_NEWROUTE:
-                case RTM_GETROUTE:
-                case RTM_DELROUTE:
-                        return true;
-                default:
-                        return false;
-        }
-}
-
-bool rtnl_message_type_is_link(uint16_t type) {
-        switch (type) {
-                case RTM_NEWLINK:
-                case RTM_SETLINK:
-                case RTM_GETLINK:
-                case RTM_DELLINK:
-                        return true;
-                default:
-                        return false;
-        }
-}
-
-bool rtnl_message_type_is_addr(uint16_t type) {
-        switch (type) {
-                case RTM_NEWADDR:
-                case RTM_GETADDR:
-                case RTM_DELADDR:
-                        return true;
-                default:
-                        return false;
-        }
 }
 
 int rtnl_log_parse_error(int r) {

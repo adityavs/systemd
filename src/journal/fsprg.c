@@ -1,6 +1,5 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
-/*
+/* SPDX-License-Identifier: LGPL-2.1+
+ *
  * fsprg v0.1  -  (seekable) forward-secure pseudorandom generator
  * Copyright (C) 2012 B. Poettering
  * Contact: fsprg@point-at-infinity.org
@@ -32,6 +31,7 @@
 #include <string.h>
 
 #include "fsprg.h"
+#include "gcrypt-util.h"
 
 #define ISVALID_SECPAR(secpar) (((secpar) % 16 == 0) && ((secpar) >= 16) && ((secpar) <= 16384))
 #define VALIDATE_SECPAR(secpar) assert(ISVALID_SECPAR(secpar));
@@ -40,6 +40,9 @@
 #define RND_GEN_P 0x01
 #define RND_GEN_Q 0x02
 #define RND_GEN_X 0x03
+
+#pragma GCC diagnostic ignored "-Wpointer-arith"
+/* TODO: remove void* arithmetic and this work-around */
 
 /******************************************************************************/
 
@@ -59,7 +62,7 @@ static gcry_mpi_t mpi_import(const void *buf, size_t buflen) {
         gcry_mpi_t h;
         unsigned len;
 
-        gcry_mpi_scan(&h, GCRYMPI_FMT_USG, buf, buflen, NULL);
+        assert_se(gcry_mpi_scan(&h, GCRYMPI_FMT_USG, buf, buflen, NULL) == 0);
         len = (gcry_mpi_get_nbits(h) + 7) / 8;
         assert(len <= buflen);
         assert(gcry_mpi_cmp_ui(h, 0) >= 0);
@@ -208,20 +211,6 @@ static void CRT_compose(gcry_mpi_t *x, const gcry_mpi_t xp, const gcry_mpi_t xq,
         gcry_mpi_release(u);
 }
 
-static void initialize_libgcrypt(void) {
-        const char *p;
-        if (gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P))
-                return;
-
-        p = gcry_check_version("1.4.5");
-        assert(p);
-
-        /* Turn off "secmem". Clients which whish to make use of this
-         * feature should initialize the library manually */
-        gcry_control(GCRYCTL_DISABLE_SECMEM);
-        gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
-}
-
 /******************************************************************************/
 
 size_t FSPRG_mskinbytes(unsigned _secpar) {
@@ -261,7 +250,7 @@ void FSPRG_GenMK(void *msk, void *mpk, const void *seed, size_t seedlen, unsigne
         VALIDATE_SECPAR(_secpar);
         secpar = _secpar;
 
-        initialize_libgcrypt();
+        initialize_libgcrypt(false);
 
         if (!seed) {
                 gcry_randomize(iseed, FSPRG_RECOMMENDED_SEEDLEN, GCRY_STRONG_RANDOM);
@@ -297,7 +286,7 @@ void FSPRG_GenState0(void *state, const void *mpk, const void *seed, size_t seed
         gcry_mpi_t n, x;
         uint16_t secpar;
 
-        initialize_libgcrypt();
+        initialize_libgcrypt(false);
 
         secpar = read_secpar(mpk + 0);
         n = mpi_import(mpk + 2, secpar / 8);
@@ -316,7 +305,7 @@ void FSPRG_Evolve(void *state) {
         uint16_t secpar;
         uint64_t epoch;
 
-        initialize_libgcrypt();
+        initialize_libgcrypt(false);
 
         secpar = read_secpar(state + 0);
         n = mpi_import(state + 2 + 0 * secpar / 8, secpar / 8);
@@ -343,7 +332,7 @@ void FSPRG_Seek(void *state, uint64_t epoch, const void *msk, const void *seed, 
         gcry_mpi_t p, q, n, x, xp, xq, kp, kq, xm;
         uint16_t secpar;
 
-        initialize_libgcrypt();
+        initialize_libgcrypt(false);
 
         secpar = read_secpar(msk + 0);
         p  = mpi_import(msk + 2 + 0 * (secpar / 2) / 8, (secpar / 2) / 8);
@@ -382,7 +371,7 @@ void FSPRG_Seek(void *state, uint64_t epoch, const void *msk, const void *seed, 
 void FSPRG_GetKey(const void *state, void *key, size_t keylen, uint32_t idx) {
         uint16_t secpar;
 
-        initialize_libgcrypt();
+        initialize_libgcrypt(false);
 
         secpar = read_secpar(state + 0);
         det_randomize(key, keylen, state + 2, 2 * secpar / 8 + 8, idx);

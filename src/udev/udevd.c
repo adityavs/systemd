@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2004-2012 Kay Sievers <kay@vrfy.org>
  * Copyright (C) 2004 Chris Friesen <chris_friesen@sympatico.ca>
@@ -18,44 +19,54 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stddef.h>
-#include <signal.h>
-#include <unistd.h>
 #include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <sys/file.h>
-#include <sys/time.h>
-#include <sys/prctl.h>
-#include <sys/socket.h>
-#include <sys/signalfd.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/epoll.h>
-#include <sys/mount.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
-#include "terminal-util.h"
-#include "signal-util.h"
-#include "event-util.h"
-#include "netlink-util.h"
+#include "alloc-util.h"
 #include "cgroup-util.h"
-#include "process-util.h"
+#include "cpu-set-util.h"
 #include "dev-setup.h"
+#include "fd-util.h"
 #include "fileio.h"
-#include "selinux-util.h"
-#include "udev.h"
-#include "udev-util.h"
-#include "formats-util.h"
+#include "format-util.h"
+#include "fs-util.h"
 #include "hashmap.h"
+#include "io-util.h"
+#include "list.h"
+#include "netlink-util.h"
+#include "parse-util.h"
+#include "proc-cmdline.h"
+#include "process-util.h"
+#include "selinux-util.h"
+#include "signal-util.h"
+#include "socket-util.h"
+#include "string-util.h"
+#include "terminal-util.h"
+#include "udev-util.h"
+#include "udev.h"
+#include "user-util.h"
 
 static bool arg_debug = false;
 static int arg_daemonize = false;
@@ -69,7 +80,7 @@ typedef struct Manager {
         struct udev *udev;
         sd_event *event;
         Hashmap *workers;
-        struct udev_list_node events;
+        LIST_HEAD(struct event, events);
         const char *cgroup;
         pid_t pid; /* the process that originally allocated the manager object */
 
@@ -99,7 +110,7 @@ enum event_state {
 };
 
 struct event {
-        struct udev_list_node node;
+        LIST_FIELDS(struct event, event);
         Manager *manager;
         struct udev *udev;
         struct udev_device *dev;
@@ -118,10 +129,6 @@ struct event {
         sd_event_source *timeout;
 };
 
-static inline struct event *node_to_event(struct udev_list_node *node) {
-        return container_of(node, struct event, node);
-}
-
 static void event_queue_cleanup(Manager *manager, enum event_state type);
 
 enum worker_state {
@@ -133,7 +140,6 @@ enum worker_state {
 
 struct worker {
         Manager *manager;
-        struct udev_list_node node;
         int refcount;
         pid_t pid;
         struct udev_monitor *monitor;
@@ -150,8 +156,9 @@ static void event_free(struct event *event) {
 
         if (!event)
                 return;
+        assert(event->manager);
 
-        udev_list_node_remove(&event->node);
+        LIST_REMOVE(event, event->manager->events, event);
         udev_device_unref(event->dev);
         udev_device_unref(event->dev_kernel);
 
@@ -161,11 +168,9 @@ static void event_free(struct event *event) {
         if (event->worker)
                 event->worker->event = NULL;
 
-        assert(event->manager);
-
-        if (udev_list_node_is_empty(&event->manager->events)) {
+        if (LIST_IS_EMPTY(event->manager->events)) {
                 /* only clean up the queue from the process that created it */
-                if (event->manager->pid == getpid()) {
+                if (event->manager->pid == getpid_cached()) {
                         r = unlink("/run/udev/queue");
                         if (r < 0)
                                 log_warning_errno(errno, "could not unlink /run/udev/queue: %m");
@@ -181,7 +186,7 @@ static void worker_free(struct worker *worker) {
 
         assert(worker->manager);
 
-        hashmap_remove(worker->manager->workers, UINT_TO_PTR(worker->pid));
+        hashmap_remove(worker->manager->workers, PID_TO_PTR(worker->pid));
         udev_monitor_unref(worker->monitor);
         event_free(worker->event);
 
@@ -224,7 +229,7 @@ static int worker_new(struct worker **ret, Manager *manager, struct udev_monitor
         if (r < 0)
                 return r;
 
-        r = hashmap_put(manager->workers, UINT_TO_PTR(pid), worker);
+        r = hashmap_put(manager->workers, PID_TO_PTR(pid), worker);
         if (r < 0)
                 return r;
 
@@ -261,7 +266,6 @@ static int on_event_timeout_warning(sd_event_source *s, uint64_t usec, void *use
 static void worker_attach_event(struct worker *worker, struct event *event) {
         sd_event *e;
         uint64_t usec;
-        int r;
 
         assert(worker);
         assert(worker->manager);
@@ -276,14 +280,12 @@ static void worker_attach_event(struct worker *worker, struct event *event) {
 
         e = worker->manager->event;
 
-        r = sd_event_now(e, clock_boottime_or_monotonic(), &usec);
-        if (r < 0)
-                return;
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &usec) >= 0);
 
-        (void) sd_event_add_time(e, &event->timeout_warning, clock_boottime_or_monotonic(),
+        (void) sd_event_add_time(e, &event->timeout_warning, CLOCK_MONOTONIC,
                                  usec + arg_event_timeout_warn_usec, USEC_PER_SEC, on_event_timeout_warning, event);
 
-        (void) sd_event_add_time(e, &event->timeout, clock_boottime_or_monotonic(),
+        (void) sd_event_add_time(e, &event->timeout, CLOCK_MONOTONIC,
                                  usec + arg_event_timeout_usec, USEC_PER_SEC, on_event_timeout, event);
 }
 
@@ -327,6 +329,7 @@ static void worker_spawn(Manager *manager, struct event *event) {
         struct udev *udev = event->udev;
         _cleanup_udev_monitor_unref_ struct udev_monitor *worker_monitor = NULL;
         pid_t pid;
+        int r = 0;
 
         /* listen for new events */
         worker_monitor = udev_monitor_new_from_netlink(udev, NULL);
@@ -334,19 +337,20 @@ static void worker_spawn(Manager *manager, struct event *event) {
                 return;
         /* allow the main daemon netlink address to send devices to the worker */
         udev_monitor_allow_unicast_sender(worker_monitor, manager->monitor);
-        udev_monitor_enable_receiving(worker_monitor);
+        r = udev_monitor_enable_receiving(worker_monitor);
+        if (r < 0)
+                log_error_errno(r, "worker: could not enable receiving of device: %m");
 
         pid = fork();
         switch (pid) {
         case 0: {
                 struct udev_device *dev = NULL;
-                _cleanup_netlink_unref_ sd_netlink *rtnl = NULL;
+                _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
                 int fd_monitor;
                 _cleanup_close_ int fd_signal = -1, fd_ep = -1;
                 struct epoll_event ep_signal = { .events = EPOLLIN };
                 struct epoll_event ep_monitor = { .events = EPOLLIN };
                 sigset_t mask;
-                int r = 0;
 
                 /* take initial device from queue */
                 dev = event->dev;
@@ -360,7 +364,6 @@ static void worker_spawn(Manager *manager, struct event *event) {
                 manager->monitor = udev_monitor_unref(manager->monitor);
                 manager->ctrl_conn_blocking = udev_ctrl_connection_unref(manager->ctrl_conn_blocking);
                 manager->ctrl = udev_ctrl_unref(manager->ctrl);
-                manager->ctrl_conn_blocking = udev_ctrl_connection_unref(manager->ctrl_conn_blocking);
                 manager->worker_watch[READ_END] = safe_close(manager->worker_watch[READ_END]);
 
                 manager->ctrl_event = sd_event_source_unref(manager->ctrl_event);
@@ -392,11 +395,12 @@ static void worker_spawn(Manager *manager, struct event *event) {
                         goto out;
                 }
 
-                /* request TERM signal if parent exits */
-                prctl(PR_SET_PDEATHSIG, SIGTERM);
+                /* Request TERM signal if parent exits.
+                   Ignore error, not much we can do in that case. */
+                (void) prctl(PR_SET_PDEATHSIG, SIGTERM);
 
-                /* reset OOM score, we only protect the main daemon */
-                write_string_file("/proc/self/oom_score_adj", "0");
+                /* Reset OOM score, we only protect the main daemon. */
+                write_string_file("/proc/self/oom_score_adj", "0", 0);
 
                 for (;;) {
                         struct udev_event *udev_event;
@@ -528,7 +532,6 @@ out:
         default:
         {
                 struct worker *worker;
-                int r;
 
                 r = worker_new(&worker, manager, worker_monitor, pid);
                 if (r < 0)
@@ -586,9 +589,9 @@ static int event_queue_insert(Manager *manager, struct udev_device *dev) {
 
         /* only one process can add events to the queue */
         if (manager->pid == 0)
-                manager->pid = getpid();
+                manager->pid = getpid_cached();
 
-        assert(manager->pid == getpid());
+        assert(manager->pid == getpid_cached());
 
         event = new0(struct event, 1);
         if (!event)
@@ -612,13 +615,13 @@ static int event_queue_insert(Manager *manager, struct udev_device *dev) {
 
         event->state = EVENT_QUEUED;
 
-        if (udev_list_node_is_empty(&manager->events)) {
+        if (LIST_IS_EMPTY(manager->events)) {
                 r = touch("/run/udev/queue");
                 if (r < 0)
                         log_warning_errno(r, "could not touch /run/udev/queue: %m");
         }
 
-        udev_list_node_append(&event->node, &manager->events);
+        LIST_APPEND(event, manager->events, event);
 
         return 0;
 }
@@ -640,13 +643,11 @@ static void manager_kill_workers(Manager *manager) {
 
 /* lookup event for identical, parent, child device */
 static bool is_devpath_busy(Manager *manager, struct event *event) {
-        struct udev_list_node *loop;
+        struct event *loop_event;
         size_t common;
 
         /* check if queue contains events we depend on */
-        udev_list_node_foreach(loop, &manager->events) {
-                struct event *loop_event = node_to_event(loop);
-
+        LIST_FOREACH(event, loop_event, manager->events) {
                 /* we already found a later event, earlier can not block us, no need to check again */
                 if (loop_event->seqnum < event->delaying_seqnum)
                         continue;
@@ -748,11 +749,9 @@ static void manager_exit(Manager *manager) {
         event_queue_cleanup(manager, EVENT_QUEUED);
         manager_kill_workers(manager);
 
-        r = sd_event_now(manager->event, clock_boottime_or_monotonic(), &usec);
-        if (r < 0)
-                return;
+        assert_se(sd_event_now(manager->event, CLOCK_MONOTONIC, &usec) >= 0);
 
-        r = sd_event_add_time(manager->event, NULL, clock_boottime_or_monotonic(),
+        r = sd_event_add_time(manager->event, NULL, CLOCK_MONOTONIC,
                               usec + 30 * USEC_PER_SEC, USEC_PER_SEC, on_exit_timeout, manager);
         if (r < 0)
                 return;
@@ -771,33 +770,30 @@ static void manager_reload(Manager *manager) {
         manager->rules = udev_rules_unref(manager->rules);
         udev_builtin_exit(manager->udev);
 
-        sd_notify(false,
-                  "READY=1\n"
-                  "STATUS=Processing...");
+        sd_notifyf(false,
+                   "READY=1\n"
+                   "STATUS=Processing with %u children at max", arg_children_max);
 }
 
 static void event_queue_start(Manager *manager) {
-        struct udev_list_node *loop;
+        struct event *event;
         usec_t usec;
-        int r;
 
         assert(manager);
 
-        if (udev_list_node_is_empty(&manager->events) ||
+        if (LIST_IS_EMPTY(manager->events) ||
             manager->exit || manager->stop_exec_queue)
                 return;
 
-        r = sd_event_now(manager->event, clock_boottime_or_monotonic(), &usec);
-        if (r >= 0) {
-                /* check for changed config, every 3 seconds at most */
-                if (manager->last_usec == 0 ||
-                    (usec - manager->last_usec) > 3 * USEC_PER_SEC) {
-                        if (udev_rules_check_timestamp(manager->rules) ||
-                            udev_builtin_validate(manager->udev))
-                                manager_reload(manager);
+        assert_se(sd_event_now(manager->event, CLOCK_MONOTONIC, &usec) >= 0);
+        /* check for changed config, every 3 seconds at most */
+        if (manager->last_usec == 0 ||
+            (usec - manager->last_usec) > 3 * USEC_PER_SEC) {
+                if (udev_rules_check_timestamp(manager->rules) ||
+                    udev_builtin_validate(manager->udev))
+                        manager_reload(manager);
 
-                        manager->last_usec = usec;
-                }
+                manager->last_usec = usec;
         }
 
         udev_builtin_init(manager->udev);
@@ -808,9 +804,7 @@ static void event_queue_start(Manager *manager) {
                         return;
         }
 
-        udev_list_node_foreach(loop, &manager->events) {
-                struct event *event = node_to_event(loop);
-
+        LIST_FOREACH(event,event,manager->events) {
                 if (event->state != EVENT_QUEUED)
                         continue;
 
@@ -823,11 +817,9 @@ static void event_queue_start(Manager *manager) {
 }
 
 static void event_queue_cleanup(Manager *manager, enum event_state match_type) {
-        struct udev_list_node *loop, *tmp;
+        struct event *event, *tmp;
 
-        udev_list_node_foreach_safe(loop, tmp, &manager->events) {
-                struct event *event = node_to_event(loop);
-
+        LIST_FOREACH_SAFE(event, event, tmp, manager->events) {
                 if (match_type != EVENT_UNDEF && match_type != event->state)
                         continue;
 
@@ -888,7 +880,7 @@ static int on_worker(sd_event_source *s, int fd, uint32_t revents, void *userdat
                 }
 
                 /* lookup worker who sent the signal */
-                worker = hashmap_get(manager->workers, UINT_TO_PTR(ucred->pid));
+                worker = hashmap_get(manager->workers, PID_TO_PTR(ucred->pid));
                 if (!worker) {
                         log_debug("worker ["PID_FMT"] returned, but is no longer tracked", ucred->pid);
                         continue;
@@ -998,6 +990,10 @@ static int on_ctrl_msg(sd_event_source *s, int fd, uint32_t revents, void *userd
         if (i >= 0) {
                 log_debug("udevd message (SET_MAX_CHILDREN) received, children_max=%i", i);
                 arg_children_max = i;
+
+                (void) sd_notifyf(false,
+                                  "READY=1\n"
+                                  "STATUS=Processing with %u children at max", arg_children_max);
         }
 
         if (udev_ctrl_get_ping(ctrl_msg) > 0)
@@ -1090,7 +1086,7 @@ static int synthesize_change(struct udev_device *dev) {
                  */
                 log_debug("device %s closed, synthesising 'change'", udev_device_get_devnode(dev));
                 strscpyl(filename, sizeof(filename), udev_device_get_syspath(dev), "/uevent", NULL);
-                write_string_file(filename, "change");
+                write_string_file(filename, "change", WRITE_STRING_FILE_CREATE);
 
                 udev_list_entry_foreach(item, udev_enumerate_get_list_entry(e)) {
                         _cleanup_udev_device_unref_ struct udev_device *d = NULL;
@@ -1105,7 +1101,7 @@ static int synthesize_change(struct udev_device *dev) {
                         log_debug("device %s closed, synthesising partition '%s' 'change'",
                                   udev_device_get_devnode(dev), udev_device_get_devnode(d));
                         strscpyl(filename, sizeof(filename), udev_device_get_syspath(d), "/uevent", NULL);
-                        write_string_file(filename, "change");
+                        write_string_file(filename, "change", WRITE_STRING_FILE_CREATE);
                 }
 
                 return 0;
@@ -1113,7 +1109,7 @@ static int synthesize_change(struct udev_device *dev) {
 
         log_debug("device %s closed, synthesising 'change'", udev_device_get_devnode(dev));
         strscpyl(filename, sizeof(filename), udev_device_get_syspath(dev), "/uevent", NULL);
-        write_string_file(filename, "change");
+        write_string_file(filename, "change", WRITE_STRING_FILE_CREATE);
 
         return 0;
 }
@@ -1128,7 +1124,7 @@ static int on_inotify(sd_event_source *s, int fd, uint32_t revents, void *userda
 
         l = read(fd, &buffer, sizeof(buffer));
         if (l < 0) {
-                if (errno == EAGAIN || errno == EINTR)
+                if (IN_SET(errno, EAGAIN, EINTR))
                         return 1;
 
                 return log_error_errno(errno, "Failed to read inotify fd: %m");
@@ -1192,7 +1188,7 @@ static int on_sigchld(sd_event_source *s, const struct signalfd_siginfo *si, voi
                 if (pid <= 0)
                         break;
 
-                worker = hashmap_get(manager->workers, UINT_TO_PTR(pid));
+                worker = hashmap_get(manager->workers, PID_TO_PTR(pid));
                 if (!worker) {
                         log_warning("worker ["PID_FMT"] is unknown, ignoring", pid);
                         continue;
@@ -1204,7 +1200,7 @@ static int on_sigchld(sd_event_source *s, const struct signalfd_siginfo *si, voi
                         else
                                 log_warning("worker ["PID_FMT"] exited with return code %i", pid, WEXITSTATUS(status));
                 } else if (WIFSIGNALED(status)) {
-                        log_warning("worker ["PID_FMT"] terminated by signal %i (%s)", pid, WTERMSIG(status), strsignal(WTERMSIG(status)));
+                        log_warning("worker ["PID_FMT"] terminated by signal %i (%s)", pid, WTERMSIG(status), signal_to_string(WTERMSIG(status)));
                 } else if (WIFSTOPPED(status)) {
                         log_info("worker ["PID_FMT"] stopped", pid);
                         continue;
@@ -1240,7 +1236,7 @@ static int on_post(sd_event_source *s, void *userdata) {
 
         assert(manager);
 
-        if (udev_list_node_is_empty(&manager->events)) {
+        if (LIST_IS_EMPTY(manager->events)) {
                 /* no pending events */
                 if (!hashmap_isempty(manager->workers)) {
                         /* there are idle workers */
@@ -1254,7 +1250,7 @@ static int on_post(sd_event_source *s, void *userdata) {
                                         return r;
                         } else if (manager->cgroup)
                                 /* cleanup possible left-over processes in our cgroup */
-                                cg_kill(SYSTEMD_CGROUP_CONTROLLER, manager->cgroup, SIGKILL, false, true, NULL);
+                                cg_kill(SYSTEMD_CGROUP_CONTROLLER, manager->cgroup, SIGKILL, CGROUP_IGNORE_SELF, NULL, NULL, NULL);
                 }
         }
 
@@ -1339,7 +1335,7 @@ static int listen_fds(int *rctrl, int *rnetlink) {
                         return log_error_errno(netlink_fd, "could not get uevent fd: %m");
 
                 netlink_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-                if (ctrl_fd < 0)
+                if (netlink_fd < 0)
                         return log_error_errno(errno, "could not dup netlink fd: %m");
         }
 
@@ -1351,49 +1347,58 @@ static int listen_fds(int *rctrl, int *rnetlink) {
 
 /*
  * read the kernel command line, in case we need to get into debug mode
- *   udev.log-priority=<level>                 syslog priority
- *   udev.children-max=<number of workers>     events are fully serialized if set to 1
- *   udev.exec-delay=<number of seconds>       delay execution of every executed program
- *   udev.event-timeout=<number of seconds>    seconds to wait before terminating an event
+ *   udev.log_priority=<level>                 syslog priority
+ *   udev.children_max=<number of workers>     events are fully serialized if set to 1
+ *   udev.exec_delay=<number of seconds>       delay execution of every executed program
+ *   udev.event_timeout=<number of seconds>    seconds to wait before terminating an event
  */
-static int parse_proc_cmdline_item(const char *key, const char *value) {
-        int r;
+static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
+        int r = 0;
 
         assert(key);
 
         if (!value)
                 return 0;
 
-        if (startswith(key, "rd."))
-                key += strlen("rd.");
+        if (proc_cmdline_key_streq(key, "udev.log_priority")) {
 
-        if (startswith(key, "udev."))
-                key += strlen("udev.");
-        else
-                return 0;
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
-        if (streq(key, "log-priority")) {
-                int prio;
+                r = util_log_priority(value);
+                if (r >= 0)
+                        log_set_max_level(r);
 
-                prio = util_log_priority(value);
-                log_set_max_level(prio);
-        } else if (streq(key, "children-max")) {
-                r = safe_atou(value, &arg_children_max);
-                if (r < 0)
-                        log_warning("invalid udev.children-max ignored: %s", value);
-        } else if (streq(key, "exec-delay")) {
-                r = safe_atoi(value, &arg_exec_delay);
-                if (r < 0)
-                        log_warning("invalid udev.exec-delay ignored: %s", value);
-        } else if (streq(key, "event-timeout")) {
+        } else if (proc_cmdline_key_streq(key, "udev.event_timeout")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
+
                 r = safe_atou64(value, &arg_event_timeout_usec);
-                if (r < 0)
-                        log_warning("invalid udev.event-timeout ignored: %s", value);
-                else {
+                if (r >= 0) {
                         arg_event_timeout_usec *= USEC_PER_SEC;
                         arg_event_timeout_warn_usec = (arg_event_timeout_usec / 3) ? : 1;
                 }
-        }
+
+        } else if (proc_cmdline_key_streq(key, "udev.children_max")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
+
+                r = safe_atou(value, &arg_children_max);
+
+        } else if (proc_cmdline_key_streq(key, "udev.exec_delay")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
+
+                r = safe_atoi(value, &arg_exec_delay);
+
+        } else if (startswith(key, "udev."))
+                log_warning("Unknown udev kernel command line option \"%s\"", key);
+
+        if (r < 0)
+                log_warning_errno(r, "Failed to parse \"%s=%s\", ignoring: %m", key, value);
 
         return 0;
 }
@@ -1402,13 +1407,13 @@ static void help(void) {
         printf("%s [OPTIONS...]\n\n"
                "Manages devices.\n\n"
                "  -h --help                   Print this message\n"
-               "     --version                Print version of the program\n"
-               "     --daemon                 Detach and run in the background\n"
-               "     --debug                  Enable debug output\n"
-               "     --children-max=INT       Set maximum number of workers\n"
-               "     --exec-delay=SECONDS     Seconds to wait before executing RUN=\n"
-               "     --event-timeout=SECONDS  Seconds to wait before terminating an event\n"
-               "     --resolve-names=early|late|never\n"
+               "  -V --version                Print version of the program\n"
+               "  -d --daemon                 Detach and run in the background\n"
+               "  -D --debug                  Enable debug output\n"
+               "  -c --children-max=INT       Set maximum number of workers\n"
+               "  -e --exec-delay=SECONDS     Seconds to wait before executing RUN=\n"
+               "  -t --event-timeout=SECONDS  Seconds to wait before terminating an event\n"
+               "  -N --resolve-names=early|late|never\n"
                "                              When to resolve users and groups\n"
                , program_invocation_short_name);
 }
@@ -1431,7 +1436,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "c:de:DtN:hV", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "c:de:Dt:N:hV", options, NULL)) >= 0) {
                 int r;
 
                 switch (c) {
@@ -1477,7 +1482,7 @@ static int parse_argv(int argc, char *argv[]) {
                         help();
                         return 0;
                 case 'V':
-                        printf("%s\n", VERSION);
+                        printf("%s\n", PACKAGE_VERSION);
                         return 0;
                 case '?':
                         return -EINVAL;
@@ -1516,7 +1521,7 @@ static int manager_new(Manager **ret, int fd_ctrl, int fd_uevent, const char *cg
         if (!manager->rules)
                 return log_error_errno(ENOMEM, "error reading rules");
 
-        udev_list_node_init(&manager->events);
+        LIST_HEAD_INIT(manager->events);
         udev_list_init(manager->udev, &manager->properties, true);
 
         manager->cgroup = cgroup;
@@ -1551,7 +1556,7 @@ static int manager_new(Manager **ret, int fd_ctrl, int fd_uevent, const char *cg
 
         r = sd_event_default(&manager->event);
         if (r < 0)
-                return log_error_errno(errno, "could not allocate event loop: %m");
+                return log_error_errno(r, "could not allocate event loop: %m");
 
         r = sd_event_add_signal(manager->event, NULL, SIGINT, on_sigterm, manager);
         if (r < 0)
@@ -1607,12 +1612,48 @@ static int manager_new(Manager **ret, int fd_ctrl, int fd_uevent, const char *cg
         return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int run(int fd_ctrl, int fd_uevent, const char *cgroup) {
         _cleanup_(manager_freep) Manager *manager = NULL;
+        int r;
+
+        r = manager_new(&manager, fd_ctrl, fd_uevent, cgroup);
+        if (r < 0) {
+                r = log_error_errno(r, "failed to allocate manager object: %m");
+                goto exit;
+        }
+
+        r = udev_rules_apply_static_dev_perms(manager->rules);
+        if (r < 0)
+                log_error_errno(r, "failed to apply permissions on static device nodes: %m");
+
+        (void) sd_notifyf(false,
+                          "READY=1\n"
+                          "STATUS=Processing with %u children at max", arg_children_max);
+
+        r = sd_event_loop(manager->event);
+        if (r < 0) {
+                log_error_errno(r, "event loop failed: %m");
+                goto exit;
+        }
+
+        sd_event_get_exit_code(manager->event, &r);
+
+exit:
+        sd_notify(false,
+                  "STOPPING=1\n"
+                  "STATUS=Shutting down...");
+        if (manager)
+                udev_ctrl_cleanup(manager->ctrl);
+        return r;
+}
+
+int main(int argc, char *argv[]) {
         _cleanup_free_ char *cgroup = NULL;
-        int r, fd_ctrl, fd_uevent;
+        int fd_ctrl = -1, fd_uevent = -1;
+        int r;
 
         log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
         log_parse_environment();
         log_open();
 
@@ -1620,26 +1661,26 @@ int main(int argc, char *argv[]) {
         if (r <= 0)
                 goto exit;
 
-        r = parse_proc_cmdline(parse_proc_cmdline_item);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, PROC_CMDLINE_STRIP_RD_PREFIX);
         if (r < 0)
                 log_warning_errno(r, "failed to parse kernel command line, ignoring: %m");
 
-        if (arg_debug)
+        if (arg_debug) {
+                log_set_target(LOG_TARGET_CONSOLE);
                 log_set_max_level(LOG_DEBUG);
-
-        if (getuid() != 0) {
-                r = log_error_errno(EPERM, "root privileges required");
-                goto exit;
         }
+
+        r = must_be_root();
+        if (r < 0)
+                goto exit;
 
         if (arg_children_max == 0) {
                 cpu_set_t cpu_set;
 
                 arg_children_max = 8;
 
-                if (sched_getaffinity(0, sizeof (cpu_set), &cpu_set) == 0) {
+                if (sched_getaffinity(0, sizeof(cpu_set), &cpu_set) == 0)
                         arg_children_max += CPU_COUNT(&cpu_set) * 2;
-                }
 
                 log_debug("set children_max to %u", arg_children_max);
         }
@@ -1653,15 +1694,15 @@ int main(int argc, char *argv[]) {
 
         umask(022);
 
-        r = mac_selinux_init("/dev");
+        r = mac_selinux_init();
         if (r < 0) {
                 log_error_errno(r, "could not initialize labelling: %m");
                 goto exit;
         }
 
-        r = mkdir("/run/udev", 0755);
-        if (r < 0 && errno != EEXIST) {
-                r = log_error_errno(errno, "could not create /run/udev: %m");
+        r = mkdir_errno_wrapper("/run/udev", 0755);
+        if (r < 0 && r != -EEXIST) {
+                log_error_errno(r, "could not create /run/udev: %m");
                 goto exit;
         }
 
@@ -1672,8 +1713,12 @@ int main(int argc, char *argv[]) {
                    we only do this on systemd systems, and only if we are directly spawned
                    by PID1. otherwise we are not guaranteed to have a dedicated cgroup */
                 r = cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, 0, &cgroup);
-                if (r < 0)
-                        log_warning_errno(r, "failed to get cgroup: %m");
+                if (r < 0) {
+                        if (IN_SET(r, -ENOENT, -ENOMEDIUM))
+                                log_debug_errno(r, "did not find dedicated cgroup: %m");
+                        else
+                                log_warning_errno(r, "failed to get cgroup: %m");
+                }
         }
 
         r = listen_fds(&fd_ctrl, &fd_uevent);
@@ -1685,11 +1730,16 @@ int main(int argc, char *argv[]) {
         if (arg_daemonize) {
                 pid_t pid;
 
-                log_info("starting version " VERSION);
+                log_info("starting version " PACKAGE_VERSION);
 
                 /* connect /dev/null to stdin, stdout, stderr */
-                if (log_get_max_level() < LOG_DEBUG)
-                        (void) make_null_stdio();
+                if (log_get_max_level() < LOG_DEBUG) {
+                        r = make_null_stdio();
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to redirect standard streams to /dev/null: %m");
+                }
+
+
 
                 pid = fork();
                 switch (pid) {
@@ -1706,38 +1756,12 @@ int main(int argc, char *argv[]) {
 
                 setsid();
 
-                write_string_file("/proc/self/oom_score_adj", "-1000");
+                write_string_file("/proc/self/oom_score_adj", "-1000", 0);
         }
 
-        r = manager_new(&manager, fd_ctrl, fd_uevent, cgroup);
-        if (r < 0) {
-                r = log_error_errno(r, "failed to allocate manager object: %m");
-                goto exit;
-        }
-
-        r = udev_rules_apply_static_dev_perms(manager->rules);
-        if (r < 0)
-                log_error_errno(r, "failed to apply permissions on static device nodes: %m");
-
-        (void) sd_notify(false,
-                         "READY=1\n"
-                         "STATUS=Processing...");
-
-        r = sd_event_loop(manager->event);
-        if (r < 0) {
-                log_error_errno(r, "event loop failed: %m");
-                goto exit;
-        }
-
-        sd_event_get_exit_code(manager->event, &r);
+        r = run(fd_ctrl, fd_uevent, cgroup);
 
 exit:
-        sd_notify(false,
-                  "STOPPING=1\n"
-                  "STATUS=Shutting down...");
-
-        if (manager)
-                udev_ctrl_cleanup(manager->ctrl);
         mac_selinux_finish();
         log_close();
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

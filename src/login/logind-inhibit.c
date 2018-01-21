@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -24,11 +23,18 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "util.h"
-#include "mkdir.h"
-#include "logind-inhibit.h"
+#include "alloc-util.h"
+#include "escape.h"
+#include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
+#include "logind-inhibit.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "user-util.h"
+#include "util.h"
 
 Inhibitor* inhibitor_new(Manager *m, const char* id) {
         Inhibitor *i;
@@ -40,17 +46,14 @@ Inhibitor* inhibitor_new(Manager *m, const char* id) {
                 return NULL;
 
         i->state_file = strappend("/run/systemd/inhibit/", id);
-        if (!i->state_file) {
-                free(i);
-                return NULL;
-        }
+        if (!i->state_file)
+                return mfree(i);
 
         i->id = basename(i->state_file);
 
         if (hashmap_put(m->inhibitors, i->id, i) < 0) {
                 free(i->state_file);
-                free(i);
-                return NULL;
+                return mfree(i);
         }
 
         i->manager = m;
@@ -84,13 +87,13 @@ int inhibitor_save(Inhibitor *i) {
 
         assert(i);
 
-        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0);
+        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, false);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         r = fopen_temporary(i->state_file, &f, &temp_path);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         fchmod(fileno(f), 0644);
 
@@ -109,38 +112,47 @@ int inhibitor_save(Inhibitor *i) {
                 _cleanup_free_ char *cc = NULL;
 
                 cc = cescape(i->who);
-                if (!cc)
+                if (!cc) {
                         r = -ENOMEM;
-                else
-                        fprintf(f, "WHO=%s\n", cc);
+                        goto fail;
+                }
+
+                fprintf(f, "WHO=%s\n", cc);
         }
 
         if (i->why) {
                 _cleanup_free_ char *cc = NULL;
 
                 cc = cescape(i->why);
-                if (!cc)
+                if (!cc) {
                         r = -ENOMEM;
-                else
-                        fprintf(f, "WHY=%s\n", cc);
+                        goto fail;
+                }
+
+                fprintf(f, "WHY=%s\n", cc);
         }
 
         if (i->fifo_path)
                 fprintf(f, "FIFO=%s\n", i->fifo_path);
 
-        fflush(f);
+        r = fflush_and_check(f);
+        if (r < 0)
+                goto fail;
 
-        if (ferror(f) || rename(temp_path, i->state_file) < 0) {
+        if (rename(temp_path, i->state_file) < 0) {
                 r = -errno;
-                unlink(i->state_file);
-                unlink(temp_path);
+                goto fail;
         }
 
-finish:
-        if (r < 0)
-                log_error_errno(r, "Failed to save inhibit data %s: %m", i->state_file);
+        return 0;
 
-        return r;
+fail:
+        (void) unlink(i->state_file);
+
+        if (temp_path)
+                (void) unlink(temp_path);
+
+        return log_error_errno(r, "Failed to save inhibit data %s: %m", i->state_file);
 }
 
 int inhibitor_start(Inhibitor *i) {
@@ -279,11 +291,11 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Create FIFO */
         if (!i->fifo_path) {
-                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0);
+                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, false);
                 if (r < 0)
                         return r;
 
-                i->fifo_path = strjoin("/run/systemd/inhibit/", i->id, ".ref", NULL);
+                i->fifo_path = strjoin("/run/systemd/inhibit/", i->id, ".ref");
                 if (!i->fifo_path)
                         return -ENOMEM;
 
@@ -303,7 +315,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
                 if (r < 0)
                         return r;
 
-                r = sd_event_source_set_priority(i->event_source, SD_EVENT_PRIORITY_IDLE);
+                r = sd_event_source_set_priority(i->event_source, SD_EVENT_PRIORITY_IDLE-10);
                 if (r < 0)
                         return r;
         }
@@ -324,8 +336,7 @@ void inhibitor_remove_fifo(Inhibitor *i) {
 
         if (i->fifo_path) {
                 unlink(i->fifo_path);
-                free(i->fifo_path);
-                i->fifo_path = NULL;
+                i->fifo_path = mfree(i->fifo_path);
         }
 }
 
@@ -337,7 +348,7 @@ InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mm) {
         assert(m);
 
         HASHMAP_FOREACH(i, m->inhibitors, j)
-                if (i->mode == mm)
+                if (i->mode == mm && i->started)
                         what |= i->what;
 
         return what;
@@ -347,6 +358,8 @@ static int pid_is_active(Manager *m, pid_t pid) {
         Session *s;
         int r;
 
+        /* Get client session.  This is not what you are looking for these days.
+         * FIXME #6852 */
         r = manager_get_session_by_pid(m, pid, &s);
         if (r < 0)
                 return r;
@@ -378,6 +391,9 @@ bool manager_is_inhibited(
         assert(w > 0 && w < _INHIBIT_WHAT_MAX);
 
         HASHMAP_FOREACH(i, m->inhibitors, j) {
+                if (!i->started)
+                        continue;
+
                 if (!(i->what & w))
                         continue;
 

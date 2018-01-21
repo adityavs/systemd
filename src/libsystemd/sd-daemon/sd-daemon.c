@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,29 +18,47 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <stdlib.h>
 #include <errno.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stddef.h>
 #include <limits.h>
 #include <mqueue.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
-#include "util.h"
-#include "path-util.h"
-#include "socket-util.h"
 #include "sd-daemon.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "process-util.h"
+#include "socket-util.h"
+#include "strv.h"
+#include "util.h"
+
+#define SNDBUF_SIZE (8*1024*1024)
+
+static void unsetenv_all(bool unset_environment) {
+
+        if (!unset_environment)
+                return;
+
+        unsetenv("LISTEN_PID");
+        unsetenv("LISTEN_FDS");
+        unsetenv("LISTEN_FDNAMES");
+}
 
 _public_ int sd_listen_fds(int unset_environment) {
         const char *e;
-        unsigned n;
-        int r, fd;
+        int n, r, fd;
         pid_t pid;
 
         e = getenv("LISTEN_PID");
@@ -55,7 +72,7 @@ _public_ int sd_listen_fds(int unset_environment) {
                 goto finish;
 
         /* Is this for us? */
-        if (getpid() != pid) {
+        if (getpid_cached() != pid) {
                 r = 0;
                 goto finish;
         }
@@ -66,31 +83,74 @@ _public_ int sd_listen_fds(int unset_environment) {
                 goto finish;
         }
 
-        r = safe_atou(e, &n);
+        r = safe_atoi(e, &n);
         if (r < 0)
                 goto finish;
 
-        for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + (int) n; fd ++) {
+        assert_cc(SD_LISTEN_FDS_START < INT_MAX);
+        if (n <= 0 || n > INT_MAX - SD_LISTEN_FDS_START) {
+                r = -EINVAL;
+                goto finish;
+        }
+
+        for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd ++) {
                 r = fd_cloexec(fd, true);
                 if (r < 0)
                         goto finish;
         }
 
-        r = (int) n;
+        r = n;
 
 finish:
-        if (unset_environment) {
-                unsetenv("LISTEN_PID");
-                unsetenv("LISTEN_FDS");
+        unsetenv_all(unset_environment);
+        return r;
+}
+
+_public_ int sd_listen_fds_with_names(int unset_environment, char ***names) {
+        _cleanup_strv_free_ char **l = NULL;
+        bool have_names;
+        int n_names = 0, n_fds;
+        const char *e;
+        int r;
+
+        if (!names)
+                return sd_listen_fds(unset_environment);
+
+        e = getenv("LISTEN_FDNAMES");
+        if (e) {
+                n_names = strv_split_extract(&l, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+                if (n_names < 0) {
+                        unsetenv_all(unset_environment);
+                        return n_names;
+                }
+
+                have_names = true;
+        } else
+                have_names = false;
+
+        n_fds = sd_listen_fds(unset_environment);
+        if (n_fds <= 0)
+                return n_fds;
+
+        if (have_names) {
+                if (n_names != n_fds)
+                        return -EINVAL;
+        } else {
+                r = strv_extend_n(&l, "unknown", n_fds);
+                if (r < 0)
+                        return r;
         }
 
-        return r;
+        *names = l;
+        l = NULL;
+
+        return n_fds;
 }
 
 _public_ int sd_is_fifo(int fd, const char *path) {
         struct stat st_fd;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
 
         if (fstat(fd, &st_fd) < 0)
                 return -errno;
@@ -103,7 +163,7 @@ _public_ int sd_is_fifo(int fd, const char *path) {
 
                 if (stat(path, &st_path) < 0) {
 
-                        if (errno == ENOENT || errno == ENOTDIR)
+                        if (IN_SET(errno, ENOENT, ENOTDIR))
                                 return 0;
 
                         return -errno;
@@ -120,7 +180,7 @@ _public_ int sd_is_fifo(int fd, const char *path) {
 _public_ int sd_is_special(int fd, const char *path) {
         struct stat st_fd;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
 
         if (fstat(fd, &st_fd) < 0)
                 return -errno;
@@ -133,7 +193,7 @@ _public_ int sd_is_special(int fd, const char *path) {
 
                 if (stat(path, &st_path) < 0) {
 
-                        if (errno == ENOENT || errno == ENOTDIR)
+                        if (IN_SET(errno, ENOENT, ENOTDIR))
                                 return 0;
 
                         return -errno;
@@ -155,7 +215,7 @@ _public_ int sd_is_special(int fd, const char *path) {
 static int sd_is_socket_internal(int fd, int type, int listening) {
         struct stat st_fd;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
         assert_return(type >= 0, -EINVAL);
 
         if (fstat(fd, &st_fd) < 0)
@@ -198,7 +258,7 @@ static int sd_is_socket_internal(int fd, int type, int listening) {
 _public_ int sd_is_socket(int fd, int family, int type, int listening) {
         int r;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
         assert_return(family >= 0, -EINVAL);
 
         r = sd_is_socket_internal(fd, type, listening);
@@ -226,7 +286,7 @@ _public_ int sd_is_socket_inet(int fd, int family, int type, int listening, uint
         socklen_t l = sizeof(sockaddr);
         int r;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
         assert_return(IN_SET(family, 0, AF_INET, AF_INET6), -EINVAL);
 
         r = sd_is_socket_internal(fd, type, listening);
@@ -239,8 +299,7 @@ _public_ int sd_is_socket_inet(int fd, int family, int type, int listening, uint
         if (l < sizeof(sa_family_t))
                 return -EINVAL;
 
-        if (sockaddr.sa.sa_family != AF_INET &&
-            sockaddr.sa.sa_family != AF_INET6)
+        if (!IN_SET(sockaddr.sa.sa_family, AF_INET, AF_INET6))
                 return 0;
 
         if (family != 0)
@@ -248,20 +307,74 @@ _public_ int sd_is_socket_inet(int fd, int family, int type, int listening, uint
                         return 0;
 
         if (port > 0) {
-                if (sockaddr.sa.sa_family == AF_INET) {
-                        if (l < sizeof(struct sockaddr_in))
-                                return -EINVAL;
+                unsigned sa_port;
 
-                        return htons(port) == sockaddr.in.sin_port;
-                } else {
-                        if (l < sizeof(struct sockaddr_in6))
-                                return -EINVAL;
+                r = sockaddr_port(&sockaddr.sa, &sa_port);
+                if (r < 0)
+                        return r;
 
-                        return htons(port) == sockaddr.in6.sin6_port;
-                }
+                return port == sa_port;
         }
 
         return 1;
+}
+
+_public_ int sd_is_socket_sockaddr(int fd, int type, const struct sockaddr* addr, unsigned addr_len, int listening) {
+        union sockaddr_union sockaddr = {};
+        socklen_t l = sizeof(sockaddr);
+        int r;
+
+        assert_return(fd >= 0, -EBADF);
+        assert_return(addr, -EINVAL);
+        assert_return(addr_len >= sizeof(sa_family_t), -ENOBUFS);
+        assert_return(IN_SET(addr->sa_family, AF_INET, AF_INET6), -EPFNOSUPPORT);
+
+        r = sd_is_socket_internal(fd, type, listening);
+        if (r <= 0)
+                return r;
+
+        if (getsockname(fd, &sockaddr.sa, &l) < 0)
+                return -errno;
+
+        if (l < sizeof(sa_family_t))
+                return -EINVAL;
+
+        if (sockaddr.sa.sa_family != addr->sa_family)
+                return 0;
+
+        if (sockaddr.sa.sa_family == AF_INET) {
+                const struct sockaddr_in *in = (const struct sockaddr_in *) addr;
+
+                if (l < sizeof(struct sockaddr_in) || addr_len < sizeof(struct sockaddr_in))
+                        return -EINVAL;
+
+                if (in->sin_port != 0 &&
+                    sockaddr.in.sin_port != in->sin_port)
+                        return false;
+
+                return sockaddr.in.sin_addr.s_addr == in->sin_addr.s_addr;
+
+        } else {
+                const struct sockaddr_in6 *in = (const struct sockaddr_in6 *) addr;
+
+                if (l < sizeof(struct sockaddr_in6) || addr_len < sizeof(struct sockaddr_in6))
+                        return -EINVAL;
+
+                if (in->sin6_port != 0 &&
+                    sockaddr.in6.sin6_port != in->sin6_port)
+                        return false;
+
+                if (in->sin6_flowinfo != 0 &&
+                    sockaddr.in6.sin6_flowinfo != in->sin6_flowinfo)
+                        return false;
+
+                if (in->sin6_scope_id != 0 &&
+                    sockaddr.in6.sin6_scope_id != in->sin6_scope_id)
+                        return false;
+
+                return memcmp(sockaddr.in6.sin6_addr.s6_addr, in->sin6_addr.s6_addr,
+                              sizeof(in->sin6_addr.s6_addr)) == 0;
+        }
 }
 
 _public_ int sd_is_socket_unix(int fd, int type, int listening, const char *path, size_t length) {
@@ -269,7 +382,7 @@ _public_ int sd_is_socket_unix(int fd, int type, int listening, const char *path
         socklen_t l = sizeof(sockaddr);
         int r;
 
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
 
         r = sd_is_socket_internal(fd, type, listening);
         if (r <= 0)
@@ -310,10 +423,15 @@ _public_ int sd_is_socket_unix(int fd, int type, int listening, const char *path
 _public_ int sd_is_mq(int fd, const char *path) {
         struct mq_attr attr;
 
-        assert_return(fd >= 0, -EINVAL);
+        /* Check that the fd is valid */
+        assert_return(fcntl(fd, F_GETFD) >= 0, -errno);
 
-        if (mq_getattr(fd, &attr) < 0)
+        if (mq_getattr(fd, &attr) < 0) {
+                if (errno == EBADF)
+                        /* A non-mq fd (or an invalid one, but we ruled that out above) */
+                        return 0;
                 return -errno;
+        }
 
         if (path) {
                 char fpath[PATH_MAX];
@@ -338,7 +456,13 @@ _public_ int sd_is_mq(int fd, const char *path) {
         return 1;
 }
 
-_public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, const int *fds, unsigned n_fds) {
+_public_ int sd_pid_notify_with_fds(
+                pid_t pid,
+                int unset_environment,
+                const char *state,
+                const int *fds,
+                unsigned n_fds) {
+
         union sockaddr_union sockaddr = {
                 .sa.sa_family = AF_UNIX,
         };
@@ -353,7 +477,7 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
         _cleanup_close_ int fd = -1;
         struct cmsghdr *cmsg = NULL;
         const char *e;
-        bool have_pid;
+        bool send_ucred;
         int r;
 
         if (!state) {
@@ -371,7 +495,12 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
                 return 0;
 
         /* Must be an abstract socket, or an absolute path */
-        if ((e[0] != '@' && e[0] != '/') || e[1] == 0) {
+        if (!IN_SET(e[0], '@', '/') || e[1] == 0) {
+                r = -EINVAL;
+                goto finish;
+        }
+
+        if (strlen(e) > sizeof(sockaddr.un.sun_path)) {
                 r = -EINVAL;
                 goto finish;
         }
@@ -382,22 +511,28 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
                 goto finish;
         }
 
+        (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
+
         iovec.iov_len = strlen(state);
 
         strncpy(sockaddr.un.sun_path, e, sizeof(sockaddr.un.sun_path));
         if (sockaddr.un.sun_path[0] == '@')
                 sockaddr.un.sun_path[0] = 0;
 
-        msghdr.msg_namelen = offsetof(struct sockaddr_un, sun_path) + strlen(e);
-        if (msghdr.msg_namelen > sizeof(struct sockaddr_un))
-                msghdr.msg_namelen = sizeof(struct sockaddr_un);
+        msghdr.msg_namelen = SOCKADDR_UN_LEN(sockaddr.un);
 
-        have_pid = pid != 0 && pid != getpid();
+        send_ucred =
+                (pid != 0 && pid != getpid_cached()) ||
+                getuid() != geteuid() ||
+                getgid() != getegid();
 
-        if (n_fds > 0 || have_pid) {
-                msghdr.msg_controllen = CMSG_SPACE(sizeof(int) * n_fds) +
-                                        CMSG_SPACE(sizeof(struct ucred) * have_pid);
-                msghdr.msg_control = alloca(msghdr.msg_controllen);
+        if (n_fds > 0 || send_ucred) {
+                /* CMSG_SPACE(0) may return value different than zero, which results in miscalculated controllen. */
+                msghdr.msg_controllen =
+                        (n_fds > 0 ? CMSG_SPACE(sizeof(int) * n_fds) : 0) +
+                        (send_ucred ? CMSG_SPACE(sizeof(struct ucred)) : 0);
+
+                msghdr.msg_control = alloca0(msghdr.msg_controllen);
 
                 cmsg = CMSG_FIRSTHDR(&msghdr);
                 if (n_fds > 0) {
@@ -407,11 +542,11 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
 
                         memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * n_fds);
 
-                        if (have_pid)
+                        if (send_ucred)
                                 assert_se(cmsg = CMSG_NXTHDR(&msghdr, cmsg));
                 }
 
-                if (have_pid) {
+                if (send_ucred) {
                         struct ucred *ucred;
 
                         cmsg->cmsg_level = SOL_SOCKET;
@@ -419,7 +554,7 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
                         cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
 
                         ucred = (struct ucred*) CMSG_DATA(cmsg);
-                        ucred->pid = pid;
+                        ucred->pid = pid != 0 ? pid : getpid_cached();
                         ucred->uid = getuid();
                         ucred->gid = getgid();
                 }
@@ -432,7 +567,7 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
         }
 
         /* If that failed, try with our own ucred instead */
-        if (have_pid) {
+        if (send_ucred) {
                 msghdr.msg_controllen -= CMSG_SPACE(sizeof(struct ucred));
                 if (msghdr.msg_controllen == 0)
                         msghdr.msg_control = NULL;
@@ -497,16 +632,11 @@ _public_ int sd_notifyf(int unset_environment, const char *format, ...) {
 }
 
 _public_ int sd_booted(void) {
-        struct stat st;
-
         /* We test whether the runtime unit file directory has been
          * created. This takes place in mount-setup.c, so is
          * guaranteed to happen very early during boot. */
 
-        if (lstat("/run/systemd/system/", &st) < 0)
-                return 0;
-
-        return !!S_ISDIR(st.st_mode);
+        return laccess("/run/systemd/system/", F_OK) >= 0;
 }
 
 _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
@@ -521,7 +651,7 @@ _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
         r = safe_atou64(s, &u);
         if (r < 0)
                 goto finish;
-        if (u <= 0) {
+        if (u <= 0 || u >= USEC_INFINITY) {
                 r = -EINVAL;
                 goto finish;
         }
@@ -535,7 +665,7 @@ _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
                         goto finish;
 
                 /* Is this for us? */
-                if (getpid() != pid) {
+                if (getpid_cached() != pid) {
                         r = 0;
                         goto finish;
                 }

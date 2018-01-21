@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,13 +20,12 @@
 ***/
 
 #include <errno.h>
-#include <string.h>
 #include <net/ethernet.h>
 #include <net/if_arp.h>
+#include <string.h>
 
-
-#include "dhcp-protocol.h"
 #include "dhcp-internal.h"
+#include "dhcp-protocol.h"
 
 #define DHCP_CLIENT_MIN_OPTIONS_SIZE            312
 
@@ -35,8 +35,8 @@ int dhcp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid,
         size_t offset = 0;
         int r;
 
-        assert(op == BOOTREQUEST || op == BOOTREPLY);
-        assert(arp_type == ARPHRD_ETHER || arp_type == ARPHRD_INFINIBAND);
+        assert(IN_SET(op, BOOTREQUEST, BOOTREPLY));
+        assert(IN_SET(arp_type, ARPHRD_ETHER, ARPHRD_INFINIBAND));
 
         message->op = op;
         message->htype = arp_type;
@@ -45,7 +45,7 @@ int dhcp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid,
         message->magic = htobe32(DHCP_MAGIC_COOKIE);
 
         r = dhcp_option_append(message, optlen, &offset, 0,
-                               DHCP_OPTION_MESSAGE_TYPE, 1, &type);
+                               SD_DHCP_OPTION_MESSAGE_TYPE, 1, &type);
         if (r < 0)
                 return r;
 
@@ -67,7 +67,7 @@ uint16_t dhcp_packet_checksum(uint8_t *buf, size_t len) {
                         /* wrap around in one's complement */
                         sum++;
 
-                buf_64 ++;
+                buf_64++;
         }
 
         if (len % sizeof(uint64_t)) {
@@ -115,7 +115,7 @@ void dhcp_packet_append_ip_headers(DHCPPacket *packet, be32_t source_addr,
         packet->ip.check = dhcp_packet_checksum((uint8_t*)&packet->ip, DHCP_IP_SIZE);
 }
 
-int dhcp_packet_verify_headers(DHCPPacket *packet, size_t len, bool checksum) {
+int dhcp_packet_verify_headers(DHCPPacket *packet, size_t len, bool checksum, uint16_t port) {
         size_t hdrlen;
 
         assert(packet);
@@ -161,10 +161,10 @@ int dhcp_packet_verify_headers(DHCPPacket *packet, size_t len, bool checksum) {
                 return -EINVAL;
         }
 
-        if (be16toh(packet->udp.dest) != DHCP_PORT_CLIENT) {
+        if (be16toh(packet->udp.dest) != port) {
                 log_debug("ignoring packet: to port %u, which "
                           "is not the DHCP client port (%u)",
-                          be16toh(packet->udp.dest), DHCP_PORT_CLIENT);
+                          be16toh(packet->udp.dest), port);
                 return -EINVAL;
         }
 

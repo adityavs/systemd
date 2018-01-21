@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,20 +18,24 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/socket.h>
 #include <poll.h>
-
-#include "missing.h"
-#include "macro.h"
-#include "util.h"
-#include "hashmap.h"
+#include <sys/socket.h>
 
 #include "sd-netlink.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "hashmap.h"
+#include "macro.h"
+#include "missing.h"
 #include "netlink-internal.h"
 #include "netlink-util.h"
+#include "process-util.h"
+#include "socket-util.h"
+#include "util.h"
 
 static int sd_netlink_new(sd_netlink **ret) {
-        _cleanup_netlink_unref_ sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
 
         assert_return(ret, -EINVAL);
 
@@ -41,12 +44,10 @@ static int sd_netlink_new(sd_netlink **ret) {
                 return -ENOMEM;
 
         rtnl->n_ref = REFCNT_INIT;
-
         rtnl->fd = -1;
-
         rtnl->sockaddr.nl.nl_family = AF_NETLINK;
-
-        rtnl->original_pid = getpid();
+        rtnl->original_pid = getpid_cached();
+        rtnl->protocol = -1;
 
         LIST_HEAD_INIT(rtnl->match_callbacks);
 
@@ -68,7 +69,7 @@ static int sd_netlink_new(sd_netlink **ret) {
 }
 
 int sd_netlink_new_from_netlink(sd_netlink **ret, int fd) {
-        _cleanup_netlink_unref_ sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         socklen_t addrlen;
         int r;
 
@@ -84,6 +85,9 @@ int sd_netlink_new_from_netlink(sd_netlink **ret, int fd) {
         if (r < 0)
                 return -errno;
 
+        if (rtnl->sockaddr.nl.nl_family != AF_NETLINK)
+                return -EINVAL;
+
         rtnl->fd = fd;
 
         *ret = rtnl;
@@ -98,25 +102,36 @@ static bool rtnl_pid_changed(sd_netlink *rtnl) {
         /* We don't support people creating an rtnl connection and
          * keeping it around over a fork(). Let's complain. */
 
-        return rtnl->original_pid != getpid();
+        return rtnl->original_pid != getpid_cached();
 }
 
 int sd_netlink_open_fd(sd_netlink **ret, int fd) {
-        _cleanup_netlink_unref_ sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         int r;
+        int protocol;
+        socklen_t l;
 
         assert_return(ret, -EINVAL);
-        assert_return(fd >= 0, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
 
         r = sd_netlink_new(&rtnl);
         if (r < 0)
                 return r;
 
-        rtnl->fd = fd;
-
-        r = socket_bind(rtnl);
+        l = sizeof(protocol);
+        r = getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &l);
         if (r < 0)
                 return r;
+
+        rtnl->fd = fd;
+        rtnl->protocol = protocol;
+
+        r = socket_bind(rtnl);
+        if (r < 0) {
+                rtnl->fd = -1; /* on failure, the caller remains owner of the fd, hence don't close it here */
+                rtnl->protocol = -1;
+                return r;
+        }
 
         *ret = rtnl;
         rtnl = NULL;
@@ -124,11 +139,11 @@ int sd_netlink_open_fd(sd_netlink **ret, int fd) {
         return 0;
 }
 
-int sd_netlink_open(sd_netlink **ret) {
+int netlink_open_family(sd_netlink **ret, int family) {
         _cleanup_close_ int fd = -1;
         int r;
 
-        fd = socket_open(NETLINK_ROUTE);
+        fd = socket_open(family);
         if (fd < 0)
                 return fd;
 
@@ -141,7 +156,14 @@ int sd_netlink_open(sd_netlink **ret) {
         return 0;
 }
 
-int sd_netlink_inc_rcvbuf(const sd_netlink *const rtnl, const int size) {
+int sd_netlink_open(sd_netlink **ret) {
+        return netlink_open_family(ret, NETLINK_ROUTE);
+}
+
+int sd_netlink_inc_rcvbuf(sd_netlink *rtnl, size_t size) {
+        assert_return(rtnl, -EINVAL);
+        assert_return(!rtnl_pid_changed(rtnl), -ECHILD);
+
         return fd_inc_rcvbuf(rtnl->fd, size);
 }
 
@@ -183,9 +205,10 @@ sd_netlink *sd_netlink_unref(sd_netlink *rtnl) {
                 sd_event_unref(rtnl->event);
 
                 while ((f = rtnl->match_callbacks)) {
-                        LIST_REMOVE(match_callbacks, rtnl->match_callbacks, f);
-                        free(f);
+                        sd_netlink_remove_match(rtnl, f->type, f->callback, f->userdata);
                 }
+
+                hashmap_free(rtnl->broadcast_group_refs);
 
                 safe_close(rtnl->fd);
                 free(rtnl);
@@ -269,20 +292,24 @@ static int dispatch_rqueue(sd_netlink *rtnl, sd_netlink_message **message) {
         if (rtnl->rqueue_size <= 0) {
                 /* Try to read a new message */
                 r = socket_read_message(rtnl);
+                if (r == -ENOBUFS) { /* FIXME: ignore buffer overruns for now */
+                        log_debug_errno(r, "Got ENOBUFS from netlink socket, ignoring.");
+                        return 1;
+                }
                 if (r <= 0)
                         return r;
         }
 
         /* Dispatch a queued message */
         *message = rtnl->rqueue[0];
-        rtnl->rqueue_size --;
+        rtnl->rqueue_size--;
         memmove(rtnl->rqueue, rtnl->rqueue + 1, sizeof(sd_netlink_message*) * rtnl->rqueue_size);
 
         return 1;
 }
 
 static int process_timeout(sd_netlink *rtnl) {
-        _cleanup_netlink_message_unref_ sd_netlink_message *m = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         struct reply_callback *c;
         usec_t n;
         int r;
@@ -297,7 +324,7 @@ static int process_timeout(sd_netlink *rtnl) {
         if (c->timeout > n)
                 return 0;
 
-        r = rtnl_message_new_synthetic_error(-ETIMEDOUT, c->serial, &m);
+        r = rtnl_message_new_synthetic_error(rtnl, -ETIMEDOUT, c->serial, &m);
         if (r < 0)
                 return r;
 
@@ -372,7 +399,7 @@ static int process_match(sd_netlink *rtnl, sd_netlink_message *m) {
 }
 
 static int process_running(sd_netlink *rtnl, sd_netlink_message **ret) {
-        _cleanup_netlink_message_unref_ sd_netlink_message *m = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
 
         assert(rtnl);
@@ -414,7 +441,7 @@ null_message:
 }
 
 int sd_netlink_process(sd_netlink *rtnl, sd_netlink_message **ret) {
-        RTNL_DONT_DESTROY(rtnl);
+        NETLINK_DONT_DESTROY(rtnl);
         int r;
 
         assert_return(rtnl, -EINVAL);
@@ -619,7 +646,7 @@ int sd_netlink_call(sd_netlink *rtnl,
                         received_serial = rtnl_message_get_serial(rtnl->rqueue[i]);
 
                         if (received_serial == serial) {
-                                _cleanup_netlink_message_unref_ sd_netlink_message *incoming = NULL;
+                                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *incoming = NULL;
                                 uint16_t type;
 
                                 incoming = rtnl->rqueue[i];
@@ -770,7 +797,7 @@ static int prepare_callback(sd_event_source *s, void *userdata) {
         return 1;
 }
 
-int sd_netlink_attach_event(sd_netlink *rtnl, sd_event *event, int priority) {
+int sd_netlink_attach_event(sd_netlink *rtnl, sd_event *event, int64_t priority) {
         int r;
 
         assert_return(rtnl, -EINVAL);
@@ -856,25 +883,42 @@ int sd_netlink_add_match(sd_netlink *rtnl,
 
         switch (type) {
                 case RTM_NEWLINK:
-                case RTM_SETLINK:
-                case RTM_GETLINK:
                 case RTM_DELLINK:
-                        r = socket_join_broadcast_group(rtnl, RTNLGRP_LINK);
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_LINK);
                         if (r < 0)
                                 return r;
 
                         break;
                 case RTM_NEWADDR:
-                case RTM_GETADDR:
                 case RTM_DELADDR:
-                        r = socket_join_broadcast_group(rtnl, RTNLGRP_IPV4_IFADDR);
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV4_IFADDR);
                         if (r < 0)
                                 return r;
 
-                        r = socket_join_broadcast_group(rtnl, RTNLGRP_IPV6_IFADDR);
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV6_IFADDR);
                         if (r < 0)
                                 return r;
 
+                        break;
+                case RTM_NEWROUTE:
+                case RTM_DELROUTE:
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV4_ROUTE);
+                        if (r < 0)
+                                return r;
+
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV6_ROUTE);
+                        if (r < 0)
+                                return r;
+                        break;
+                case RTM_NEWRULE:
+                case RTM_DELRULE:
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV4_RULE);
+                        if (r < 0)
+                                return r;
+
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV6_RULE);
+                        if (r < 0)
+                                return r;
                         break;
                 default:
                         return -EOPNOTSUPP;
@@ -892,22 +936,49 @@ int sd_netlink_remove_match(sd_netlink *rtnl,
                          sd_netlink_message_handler_t callback,
                          void *userdata) {
         struct match_callback *c;
+        int r;
 
         assert_return(rtnl, -EINVAL);
         assert_return(callback, -EINVAL);
         assert_return(!rtnl_pid_changed(rtnl), -ECHILD);
 
-        /* we should unsubscribe from the broadcast groups at this point, but it is not so
-           trivial for a few reasons: the refcounting is a bit of a mess and not obvious
-           how it will look like after we add genetlink support, and it is also not possible
-           to query what broadcast groups were subscribed to when we inherit the socket to get
-           the initial refcount. The latter could indeed be done for the first 32 broadcast
-           groups (which incidentally is all we currently support in .socket units anyway),
-           but we better not rely on only ever using 32 groups. */
         LIST_FOREACH(match_callbacks, c, rtnl->match_callbacks)
                 if (c->callback == callback && c->type == type && c->userdata == userdata) {
                         LIST_REMOVE(match_callbacks, rtnl->match_callbacks, c);
                         free(c);
+
+                        switch (type) {
+                                case RTM_NEWLINK:
+                                case RTM_DELLINK:
+                                        r = socket_broadcast_group_unref(rtnl, RTNLGRP_LINK);
+                                        if (r < 0)
+                                                return r;
+
+                                        break;
+                                case RTM_NEWADDR:
+                                case RTM_DELADDR:
+                                        r = socket_broadcast_group_unref(rtnl, RTNLGRP_IPV4_IFADDR);
+                                        if (r < 0)
+                                                return r;
+
+                                        r = socket_broadcast_group_unref(rtnl, RTNLGRP_IPV6_IFADDR);
+                                        if (r < 0)
+                                                return r;
+
+                                        break;
+                                case RTM_NEWROUTE:
+                                case RTM_DELROUTE:
+                                        r = socket_broadcast_group_unref(rtnl, RTNLGRP_IPV4_ROUTE);
+                                        if (r < 0)
+                                                return r;
+
+                                        r = socket_broadcast_group_unref(rtnl, RTNLGRP_IPV6_ROUTE);
+                                        if (r < 0)
+                                                return r;
+                                        break;
+                                default:
+                                        return -EOPNOTSUPP;
+                        }
 
                         return 1;
                 }

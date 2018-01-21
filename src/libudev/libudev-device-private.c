@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,10 +20,10 @@
 ***/
 
 #include "libudev.h"
-#include "libudev-private.h"
-#include "libudev-device-internal.h"
 
 #include "device-private.h"
+#include "libudev-device-internal.h"
+#include "libudev-private.h"
 
 int udev_device_tag_index(struct udev_device *udev_device, struct udev_device *udev_device_old, bool add) {
         sd_device *device_old = NULL;
@@ -137,14 +138,10 @@ gid_t udev_device_get_devnode_gid(struct udev_device *udev_device) {
 }
 
 void udev_device_ensure_usec_initialized(struct udev_device *udev_device, struct udev_device *udev_device_old) {
-        sd_device *device_old = NULL;
-
         assert(udev_device);
 
-        if (udev_device_old)
-                device_old = udev_device_old->device;
-
-        device_ensure_usec_initialized(udev_device->device, device_old);
+        device_ensure_usec_initialized(udev_device->device,
+                                       udev_device_old ? udev_device_old->device : NULL);
 }
 
 char **udev_device_get_properties_envp(struct udev_device *udev_device) {

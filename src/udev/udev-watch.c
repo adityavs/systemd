@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2004-2012 Kay Sievers <kay@vrfy.org>
  * Copyright (C) 2009 Canonical Ltd.
@@ -18,12 +19,13 @@
  */
 
 #include <errno.h>
-#include <stdio.h>
-#include <dirent.h>
 #include <stddef.h>
-#include <unistd.h>
+#include <stdio.h>
 #include <sys/inotify.h>
+#include <unistd.h>
 
+#include "dirent-util.h"
+#include "stdio-util.h"
 #include "udev.h"
 
 static int inotify_fd = -1;
@@ -56,7 +58,7 @@ void udev_watch_restore(struct udev *udev) {
                         return;
                 }
 
-                for (ent = readdir(dir); ent != NULL; ent = readdir(dir)) {
+                FOREACH_DIRENT_ALL(ent, dir, break) {
                         char device[UTIL_PATH_SIZE];
                         ssize_t len;
                         struct udev_device *dev;
@@ -83,13 +85,12 @@ unlink:
                 closedir(dir);
                 rmdir("/run/udev/watch.old");
 
-        } else if (errno != ENOENT) {
+        } else if (errno != ENOENT)
                 log_error_errno(errno, "unable to move watches dir /run/udev/watch; old watches will not be restored: %m");
-        }
 }
 
 void udev_watch_begin(struct udev *udev, struct udev_device *dev) {
-        char filename[UTIL_PATH_SIZE];
+        char filename[sizeof("/run/udev/watch/") + DECIMAL_STR_MAX(int)];
         int wd;
         int r;
 
@@ -100,11 +101,11 @@ void udev_watch_begin(struct udev *udev, struct udev_device *dev) {
         wd = inotify_add_watch(inotify_fd, udev_device_get_devnode(dev), IN_CLOSE_WRITE);
         if (wd < 0) {
                 log_error_errno(errno, "inotify_add_watch(%d, %s, %o) failed: %m",
-                    inotify_fd, udev_device_get_devnode(dev), IN_CLOSE_WRITE);
+                                inotify_fd, udev_device_get_devnode(dev), IN_CLOSE_WRITE);
                 return;
         }
 
-        snprintf(filename, sizeof(filename), "/run/udev/watch/%d", wd);
+        xsprintf(filename, "/run/udev/watch/%d", wd);
         mkdir_parents(filename, 0755);
         unlink(filename);
         r = symlink(udev_device_get_id_filename(dev), filename);
@@ -116,7 +117,7 @@ void udev_watch_begin(struct udev *udev, struct udev_device *dev) {
 
 void udev_watch_end(struct udev *udev, struct udev_device *dev) {
         int wd;
-        char filename[UTIL_PATH_SIZE];
+        char filename[sizeof("/run/udev/watch/") + DECIMAL_STR_MAX(int)];
 
         if (inotify_fd < 0)
                 return;
@@ -128,21 +129,21 @@ void udev_watch_end(struct udev *udev, struct udev_device *dev) {
         log_debug("removing watch on '%s'", udev_device_get_devnode(dev));
         inotify_rm_watch(inotify_fd, wd);
 
-        snprintf(filename, sizeof(filename), "/run/udev/watch/%d", wd);
+        xsprintf(filename, "/run/udev/watch/%d", wd);
         unlink(filename);
 
         udev_device_set_watch_handle(dev, -1);
 }
 
 struct udev_device *udev_watch_lookup(struct udev *udev, int wd) {
-        char filename[UTIL_PATH_SIZE];
+        char filename[sizeof("/run/udev/watch/") + DECIMAL_STR_MAX(int)];
         char device[UTIL_NAME_SIZE];
         ssize_t len;
 
         if (inotify_fd < 0 || wd < 0)
                 return NULL;
 
-        snprintf(filename, sizeof(filename), "/run/udev/watch/%d", wd);
+        xsprintf(filename, "/run/udev/watch/%d", wd);
         len = readlink(filename, device, sizeof(device));
         if (len <= 0 || (size_t)len == sizeof(device))
                 return NULL;

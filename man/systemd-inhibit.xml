@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -61,7 +63,7 @@
     <title>Description</title>
 
     <para><command>systemd-inhibit</command> may be used to execute a
-    program with a shutdown, sleep or idle inhibitor lock taken. The
+    program with a shutdown, sleep, or idle inhibitor lock taken. The
     lock will be acquired before the specified command line is
     executed and released afterwards.</para>
 
@@ -72,7 +74,7 @@
     should not be interrupted.</para>
 
     <para>For more information see the <ulink
-    url="http://www.freedesktop.org/wiki/Software/systemd/inhibit">Inhibitor
+    url="https://www.freedesktop.org/wiki/Software/systemd/inhibit">Inhibitor
     Lock Developer Documentation</ulink>.</para>
   </refsect1>
 

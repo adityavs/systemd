@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,7 +18,11 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "alloc-util.h"
 #include "curl-util.h"
+#include "fd-util.h"
+#include "locale-util.h"
+#include "string-util.h"
 
 static void curl_glue_check_finished(CurlGlue *g) {
         CURLMsg *msg;
@@ -45,9 +48,7 @@ static int curl_glue_on_io(sd_event_source *s, int fd, uint32_t revents, void *u
         assert(s);
         assert(g);
 
-        translated_fd = PTR_TO_INT(hashmap_get(g->translate_fds, INT_TO_PTR(fd+1)));
-        assert(translated_fd > 0);
-        translated_fd--;
+        translated_fd = PTR_TO_FD(hashmap_get(g->translate_fds, FD_TO_PTR(fd)));
 
         if ((revents & (EPOLLIN|EPOLLOUT)) == (EPOLLIN|EPOLLOUT))
                 action = CURL_POLL_INOUT;
@@ -76,7 +77,7 @@ static int curl_glue_socket_callback(CURLM *curl, curl_socket_t s, int action, v
         assert(curl);
         assert(g);
 
-        io = hashmap_get(g->ios, INT_TO_PTR(s+1));
+        io = hashmap_get(g->ios, FD_TO_PTR(s));
 
         if (action == CURL_POLL_REMOVE) {
                 if (io) {
@@ -88,8 +89,8 @@ static int curl_glue_socket_callback(CURLM *curl, curl_socket_t s, int action, v
                         sd_event_source_set_enabled(io, SD_EVENT_OFF);
                         sd_event_source_unref(io);
 
-                        hashmap_remove(g->ios, INT_TO_PTR(s+1));
-                        hashmap_remove(g->translate_fds, INT_TO_PTR(fd+1));
+                        hashmap_remove(g->ios, FD_TO_PTR(s));
+                        hashmap_remove(g->translate_fds, FD_TO_PTR(fd));
 
                         safe_close(fd);
                 }
@@ -138,19 +139,19 @@ static int curl_glue_socket_callback(CURLM *curl, curl_socket_t s, int action, v
                 if (sd_event_add_io(g->event, &io, fd, events, curl_glue_on_io, g) < 0)
                         return -1;
 
-                sd_event_source_set_description(io, "curl-io");
+                (void) sd_event_source_set_description(io, "curl-io");
 
-                r = hashmap_put(g->ios, INT_TO_PTR(s+1), io);
+                r = hashmap_put(g->ios, FD_TO_PTR(s), io);
                 if (r < 0) {
                         log_oom();
                         sd_event_source_unref(io);
                         return -1;
                 }
 
-                r = hashmap_put(g->translate_fds, INT_TO_PTR(fd+1), INT_TO_PTR(s+1));
+                r = hashmap_put(g->translate_fds, FD_TO_PTR(fd), FD_TO_PTR(s));
                 if (r < 0) {
                         log_oom();
-                        hashmap_remove(g->ios, INT_TO_PTR(s+1));
+                        hashmap_remove(g->ios, FD_TO_PTR(s));
                         sd_event_source_unref(io);
                         return -1;
                 }
@@ -205,7 +206,7 @@ static int curl_glue_timer_callback(CURLM *curl, long timeout_ms, void *userdata
                 if (sd_event_add_time(g->event, &g->timer, clock_boottime_or_monotonic(), usec, 0, curl_glue_on_timer, g) < 0)
                         return -1;
 
-                sd_event_source_set_description(g->timer, "curl-timer");
+                (void) sd_event_source_set_description(g->timer, "curl-timer");
         }
 
         return 0;
@@ -226,7 +227,7 @@ CurlGlue *curl_glue_unref(CurlGlue *g) {
                 fd = sd_event_source_get_io_fd(io);
                 assert(fd >= 0);
 
-                hashmap_remove(g->translate_fds, INT_TO_PTR(fd+1));
+                hashmap_remove(g->translate_fds, FD_TO_PTR(fd));
 
                 safe_close(fd);
                 sd_event_source_unref(io);
@@ -236,9 +237,7 @@ CurlGlue *curl_glue_unref(CurlGlue *g) {
 
         sd_event_source_unref(g->timer);
         sd_event_unref(g->event);
-        free(g);
-
-        return NULL;
+        return mfree(g);
 }
 
 int curl_glue_new(CurlGlue **glue, sd_event *event) {
@@ -403,7 +402,7 @@ int curl_header_strdup(const void *contents, size_t sz, const char *field, char 
                 sz--;
         }
 
-        /* Truncate trailing whitespace*/
+        /* Truncate trailing whitespace */
         while (sz > 0 && strchr(WHITESPACE, p[sz-1]))
                 sz--;
 
@@ -416,8 +415,8 @@ int curl_header_strdup(const void *contents, size_t sz, const char *field, char 
 }
 
 int curl_parse_http_time(const char *t, usec_t *ret) {
+        _cleanup_(freelocalep) locale_t loc = (locale_t) 0;
         const char *e;
-        locale_t loc;
         struct tm tm;
         time_t v;
 
@@ -436,7 +435,6 @@ int curl_parse_http_time(const char *t, usec_t *ret) {
         if (!e || *e != 0)
                 /* ANSI C */
                 e = strptime_l(t, "%a %b %d %H:%M:%S %Y", &tm, loc);
-        freelocale(loc);
         if (!e || *e != 0)
                 return -EINVAL;
 

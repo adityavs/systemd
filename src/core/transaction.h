@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,10 +22,10 @@
 
 typedef struct Transaction Transaction;
 
-#include "unit.h"
-#include "manager.h"
-#include "job.h"
 #include "hashmap.h"
+#include "job.h"
+#include "manager.h"
+#include "unit.h"
 
 struct Transaction {
         /* Jobs to be added */
@@ -38,13 +37,13 @@ struct Transaction {
 Transaction *transaction_new(bool irreversible);
 void transaction_free(Transaction *tr);
 
+void transaction_add_propagate_reload_jobs(Transaction *tr, Unit *unit, Job *by, bool ignore_order, sd_bus_error *e);
 int transaction_add_job_and_dependencies(
                 Transaction *tr,
                 JobType type,
                 Unit *unit,
                 Job *by,
                 bool matters,
-                bool override,
                 bool conflicts,
                 bool ignore_requirements,
                 bool ignore_order,

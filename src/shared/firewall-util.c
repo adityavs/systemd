@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,33 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
+/* Temporary work-around for broken glibc vs. linux kernel header definitions
+ * This is already fixed upstream, remove this when distributions have updated.
+ */
+#define _NET_IF_H 1
+
+#include <alloca.h>
 #include <arpa/inet.h>
+#include <endian.h>
+#include <errno.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <net/if.h>
+#ifndef IFNAMSIZ
+#define IFNAMSIZ 16
+#endif
+#include <linux/if.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
 #include <linux/netfilter/nf_nat.h>
 #include <linux/netfilter/xt_addrtype.h>
 #include <libiptc/libiptc.h>
 
-#include "util.h"
+#include "alloc-util.h"
 #include "firewall-util.h"
+#include "in-addr-util.h"
+#include "macro.h"
+#include "socket-util.h"
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(struct xtc_handle*, iptc_free);
 
@@ -44,10 +60,9 @@ static int entry_fill_basics(
 
         assert(entry);
 
-        if (out_interface && strlen(out_interface) >= IFNAMSIZ)
+        if (out_interface && !ifname_valid(out_interface))
                 return -EINVAL;
-
-        if (in_interface && strlen(in_interface) >= IFNAMSIZ)
+        if (in_interface && !ifname_valid(in_interface))
                 return -EINVAL;
 
         entry->ip.proto = protocol;
@@ -58,16 +73,20 @@ static int entry_fill_basics(
         }
         if (source) {
                 entry->ip.src = source->in;
-                in_addr_prefixlen_to_netmask(&entry->ip.smsk, source_prefixlen);
+                in4_addr_prefixlen_to_netmask(&entry->ip.smsk, source_prefixlen);
         }
 
         if (out_interface) {
+                size_t l = strlen(out_interface);
+                assert(l < sizeof entry->ip.outiface);
+                assert(l < sizeof entry->ip.outiface_mask);
+
                 strcpy(entry->ip.outiface, out_interface);
-                memset(entry->ip.outiface_mask, 0xFF, strlen(out_interface)+1);
+                memset(entry->ip.outiface_mask, 0xFF, l + 1);
         }
         if (destination) {
                 entry->ip.dst = destination->in;
-                in_addr_prefixlen_to_netmask(&entry->ip.dmsk, destination_prefixlen);
+                in4_addr_prefixlen_to_netmask(&entry->ip.dmsk, destination_prefixlen);
         }
 
         return 0;
@@ -93,7 +112,7 @@ int fw_add_masquerade(
         if (af != AF_INET)
                 return -EOPNOTSUPP;
 
-        if (protocol != 0 && protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+        if (!IN_SET(protocol, 0, IPPROTO_TCP, IPPROTO_UDP))
                 return -EOPNOTSUPP;
 
         h = iptc_init("nat");
@@ -177,7 +196,7 @@ int fw_add_local_dnat(
         if (af != AF_INET)
                 return -EOPNOTSUPP;
 
-        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+        if (!IN_SET(protocol, IPPROTO_TCP, IPPROTO_UDP))
                 return -EOPNOTSUPP;
 
         if (local_port <= 0)

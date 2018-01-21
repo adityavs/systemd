@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,10 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdio_ext.h>
+
+#include "alloc-util.h"
 #include "bus-internal.h"
-#include "bus-message.h"
 #include "bus-match.h"
+#include "bus-message.h"
 #include "bus-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "hexdecoct.h"
+#include "string-util.h"
 #include "strv.h"
 
 /* Example:
@@ -62,12 +68,13 @@
  */
 
 static inline bool BUS_MATCH_IS_COMPARE(enum bus_match_node_type t) {
-        return t >= BUS_MATCH_SENDER && t <= BUS_MATCH_ARG_NAMESPACE_LAST;
+        return t >= BUS_MATCH_SENDER && t <= BUS_MATCH_ARG_HAS_LAST;
 }
 
 static inline bool BUS_MATCH_CAN_HASH(enum bus_match_node_type t) {
         return (t >= BUS_MATCH_MESSAGE_TYPE && t <= BUS_MATCH_PATH) ||
-                (t >= BUS_MATCH_ARG && t <= BUS_MATCH_ARG_LAST);
+                (t >= BUS_MATCH_ARG && t <= BUS_MATCH_ARG_LAST) ||
+                (t >= BUS_MATCH_ARG_HAS && t <= BUS_MATCH_ARG_HAS_LAST);
 }
 
 static void bus_match_node_free(struct bus_match_node *node) {
@@ -179,11 +186,15 @@ static bool value_node_test(
         case BUS_MATCH_INTERFACE:
         case BUS_MATCH_MEMBER:
         case BUS_MATCH_PATH:
-        case BUS_MATCH_ARG ... BUS_MATCH_ARG_LAST: {
-                char **i;
+        case BUS_MATCH_ARG ... BUS_MATCH_ARG_LAST:
 
                 if (value_str)
                         return streq_ptr(node->value.str, value_str);
+
+                return false;
+
+        case BUS_MATCH_ARG_HAS ... BUS_MATCH_ARG_HAS_LAST: {
+                char **i;
 
                 STRV_FOREACH(i, value_strv)
                         if (streq_ptr(node->value.str, *i))
@@ -192,33 +203,20 @@ static bool value_node_test(
                 return false;
         }
 
-        case BUS_MATCH_ARG_NAMESPACE ... BUS_MATCH_ARG_NAMESPACE_LAST: {
-                char **i;
-
+        case BUS_MATCH_ARG_NAMESPACE ... BUS_MATCH_ARG_NAMESPACE_LAST:
                 if (value_str)
                         return namespace_simple_pattern(node->value.str, value_str);
 
-                STRV_FOREACH(i, value_strv)
-                        if (namespace_simple_pattern(node->value.str, *i))
-                                return true;
                 return false;
-        }
 
         case BUS_MATCH_PATH_NAMESPACE:
                 return path_simple_pattern(node->value.str, value_str);
 
-        case BUS_MATCH_ARG_PATH ... BUS_MATCH_ARG_PATH_LAST: {
-                char **i;
-
+        case BUS_MATCH_ARG_PATH ... BUS_MATCH_ARG_PATH_LAST:
                 if (value_str)
                         return path_complex_pattern(node->value.str, value_str);
 
-                STRV_FOREACH(i, value_strv)
-                        if (path_complex_pattern(node->value.str, *i))
-                                return true;
-
                 return false;
-        }
 
         default:
                 assert_not_reached("Invalid node type");
@@ -249,6 +247,7 @@ static bool value_node_same(
         case BUS_MATCH_MEMBER:
         case BUS_MATCH_PATH:
         case BUS_MATCH_ARG ... BUS_MATCH_ARG_LAST:
+        case BUS_MATCH_ARG_HAS ... BUS_MATCH_ARG_HAS_LAST:
         case BUS_MATCH_ARG_NAMESPACE ... BUS_MATCH_ARG_NAMESPACE_LAST:
         case BUS_MATCH_PATH_NAMESPACE:
         case BUS_MATCH_ARG_PATH ... BUS_MATCH_ARG_PATH_LAST:
@@ -319,7 +318,7 @@ int bus_match_run(
 
                 /* Run the callback. And then invoke siblings. */
                 if (node->leaf.callback->callback) {
-                        _cleanup_bus_error_free_ sd_bus_error error_buffer = SD_BUS_ERROR_NULL;
+                        _cleanup_(sd_bus_error_free) sd_bus_error error_buffer = SD_BUS_ERROR_NULL;
                         sd_bus_slot *slot;
 
                         slot = container_of(node->leaf.callback, sd_bus_slot, match_callback);
@@ -372,15 +371,19 @@ int bus_match_run(
                 break;
 
         case BUS_MATCH_ARG ... BUS_MATCH_ARG_LAST:
-                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG, &test_str, &test_strv);
+                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG, &test_str);
                 break;
 
         case BUS_MATCH_ARG_PATH ... BUS_MATCH_ARG_PATH_LAST:
-                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG_PATH, &test_str, &test_strv);
+                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG_PATH, &test_str);
                 break;
 
         case BUS_MATCH_ARG_NAMESPACE ... BUS_MATCH_ARG_NAMESPACE_LAST:
-                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG_NAMESPACE, &test_str, &test_strv);
+                (void) bus_message_get_arg(m, node->type - BUS_MATCH_ARG_NAMESPACE, &test_str);
+                break;
+
+        case BUS_MATCH_ARG_HAS ... BUS_MATCH_ARG_HAS_LAST:
+                (void) bus_message_get_arg_strv(m, node->type - BUS_MATCH_ARG_HAS, &test_strv);
                 break;
 
         default:
@@ -429,6 +432,9 @@ int bus_match_run(
                         r = bus_match_run(bus, c, m);
                         if (r != 0)
                                 return r;
+
+                        if (bus && bus->match_callbacks_modified)
+                                return 0;
                 }
         }
 
@@ -450,7 +456,7 @@ static int bus_match_add_compare_value(
         int r;
 
         assert(where);
-        assert(where->type == BUS_MATCH_ROOT || where->type == BUS_MATCH_VALUE);
+        assert(IN_SET(where->type, BUS_MATCH_ROOT, BUS_MATCH_VALUE));
         assert(BUS_MATCH_IS_COMPARE(t));
         assert(ret);
 
@@ -564,7 +570,7 @@ static int bus_match_find_compare_value(
         struct bus_match_node *c, *n;
 
         assert(where);
-        assert(where->type == BUS_MATCH_ROOT || where->type == BUS_MATCH_VALUE);
+        assert(IN_SET(where->type, BUS_MATCH_ROOT, BUS_MATCH_VALUE));
         assert(BUS_MATCH_IS_COMPARE(t));
         assert(ret);
 
@@ -598,7 +604,7 @@ static int bus_match_add_leaf(
         struct bus_match_node *n;
 
         assert(where);
-        assert(where->type == BUS_MATCH_ROOT || where->type == BUS_MATCH_VALUE);
+        assert(IN_SET(where->type, BUS_MATCH_ROOT, BUS_MATCH_VALUE));
         assert(callback);
 
         n = new0(struct bus_match_node, 1);
@@ -628,7 +634,7 @@ static int bus_match_find_leaf(
         struct bus_match_node *c;
 
         assert(where);
-        assert(where->type == BUS_MATCH_ROOT || where->type == BUS_MATCH_VALUE);
+        assert(IN_SET(where->type, BUS_MATCH_ROOT, BUS_MATCH_VALUE));
         assert(ret);
 
         for (c = where->child; c; c = c->next) {
@@ -738,6 +744,32 @@ enum bus_match_node_type bus_match_node_type_from_string(const char *k, size_t n
 
                 t = BUS_MATCH_ARG_NAMESPACE + a * 10 + b;
                 if (t > BUS_MATCH_ARG_NAMESPACE_LAST)
+                        return -EINVAL;
+
+                return t;
+        }
+
+        if (n == 7 && startswith(k, "arg") && startswith(k + 4, "has")) {
+                int j;
+
+                j = undecchar(k[3]);
+                if (j < 0)
+                        return -EINVAL;
+
+                return BUS_MATCH_ARG_HAS + j;
+        }
+
+        if (n == 8 && startswith(k, "arg") && startswith(k + 5, "has")) {
+                enum bus_match_node_type t;
+                int a, b;
+
+                a = undecchar(k[3]);
+                b = undecchar(k[4]);
+                if (a <= 0 || b < 0)
+                        return -EINVAL;
+
+                t = BUS_MATCH_ARG_HAS + a * 10 + b;
+                if (t > BUS_MATCH_ARG_HAS_LAST)
                         return -EINVAL;
 
                 return t;
@@ -861,8 +893,7 @@ int bus_match_parse(
                         if (r < 0)
                                 goto fail;
 
-                        free(value);
-                        value = NULL;
+                        value = mfree(value);
                 } else
                         u = 0;
 
@@ -910,10 +941,11 @@ fail:
 }
 
 char *bus_match_to_string(struct bus_match_component *components, unsigned n_components) {
-        _cleanup_free_ FILE *f = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
         char *buffer = NULL;
         size_t size = 0;
         unsigned i;
+        int r;
 
         if (n_components <= 0)
                 return strdup("");
@@ -923,6 +955,8 @@ char *bus_match_to_string(struct bus_match_component *components, unsigned n_com
         f = open_memstream(&buffer, &size);
         if (!f)
                 return NULL;
+
+        __fsetlocking(f, FSETLOCKING_BYCALLER);
 
         for (i = 0; i < n_components; i++) {
                 char buf[32];
@@ -942,8 +976,8 @@ char *bus_match_to_string(struct bus_match_component *components, unsigned n_com
                 fputc('\'', f);
         }
 
-        fflush(f);
-        if (ferror(f))
+        r = fflush_and_check(f);
+        if (r < 0)
                 return NULL;
 
         return buffer;
@@ -1109,6 +1143,10 @@ const char* bus_match_node_type_to_string(enum bus_match_node_type t, char buf[]
 
         case BUS_MATCH_ARG_NAMESPACE ... BUS_MATCH_ARG_NAMESPACE_LAST:
                 snprintf(buf, l, "arg%inamespace", t - BUS_MATCH_ARG_NAMESPACE);
+                return buf;
+
+        case BUS_MATCH_ARG_HAS ... BUS_MATCH_ARG_HAS_LAST:
+                snprintf(buf, l, "arg%ihas", t - BUS_MATCH_ARG_HAS);
                 return buf;
 
         default:

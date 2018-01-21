@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,19 +18,24 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
-#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
 #include <linux/vt.h>
 
-#include "strv.h"
-#include "cgroup-util.h"
-#include "bus-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
-#include "udev-util.h"
+#include "bus-util.h"
+#include "cgroup-util.h"
+#include "fd-util.h"
 #include "logind.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "udev-util.h"
+#include "user-util.h"
 
 int manager_add_device(Manager *m, const char *sysfs, bool master, Device **_device) {
         Device *d;
@@ -95,15 +99,16 @@ int manager_add_session(Manager *m, const char *id, Session **_session) {
 
 int manager_add_user(Manager *m, uid_t uid, gid_t gid, const char *name, User **_user) {
         User *u;
+        int r;
 
         assert(m);
         assert(name);
 
         u = hashmap_get(m->users, UID_TO_PTR(uid));
         if (!u) {
-                u = user_new(m, uid, gid, name);
-                if (!u)
-                        return -ENOMEM;
+                r = user_new(&u, m, uid, gid, name);
+                if (r < 0)
+                        return r;
         }
 
         if (_user)
@@ -135,7 +140,7 @@ int manager_add_user_by_uid(Manager *m, uid_t uid, User **_user) {
         errno = 0;
         p = getpwuid(uid);
         if (!p)
-                return errno ? -errno : -ENOENT;
+                return errno > 0 ? -errno : -ENOENT;
 
         return manager_add_user(m, uid, p->pw_gid, p->pw_name, _user);
 }
@@ -181,44 +186,6 @@ int manager_add_button(Manager *m, const char *name, Button **_button) {
                 *_button = b;
 
         return 0;
-}
-
-int manager_watch_busname(Manager *m, const char *name) {
-        char *n;
-        int r;
-
-        assert(m);
-        assert(name);
-
-        if (set_get(m->busnames, (char*) name))
-                return 0;
-
-        n = strdup(name);
-        if (!n)
-                return -ENOMEM;
-
-        r = set_put(m->busnames, n);
-        if (r < 0) {
-                free(n);
-                return r;
-        }
-
-        return 0;
-}
-
-void manager_drop_busname(Manager *m, const char *name) {
-        Session *session;
-        Iterator i;
-
-        assert(m);
-        assert(name);
-
-        /* keep it if the name still owns a controller */
-        HASHMAP_FOREACH(session, m->sessions, i)
-                if (session_is_controller(session, name))
-                        return;
-
-        free(set_remove(m->busnames, (char*) name));
 }
 
 int manager_process_seat_device(Manager *m, struct udev_device *d) {
@@ -305,7 +272,11 @@ int manager_process_button_device(Manager *m, struct udev_device *d) {
                         sn = "seat0";
 
                 button_set_seat(b, sn);
-                button_open(b);
+
+                r = button_open(b);
+                if (r < 0) /* event device doesn't have any keys or switches relevant to us? (or any other error
+                            * opening the device?) let's close the button again. */
+                        button_free(b);
         }
 
         return 0;
@@ -317,9 +288,8 @@ int manager_get_session_by_pid(Manager *m, pid_t pid, Session **session) {
         int r;
 
         assert(m);
-        assert(session);
 
-        if (pid < 1)
+        if (!pid_is_valid(pid))
                 return -EINVAL;
 
         r = cg_pid_get_unit(pid, &unit);
@@ -330,7 +300,8 @@ int manager_get_session_by_pid(Manager *m, pid_t pid, Session **session) {
         if (!s)
                 return 0;
 
-        *session = s;
+        if (session)
+                *session = s;
         return 1;
 }
 
@@ -342,7 +313,7 @@ int manager_get_user_by_pid(Manager *m, pid_t pid, User **user) {
         assert(m);
         assert(user);
 
-        if (pid < 1)
+        if (!pid_is_valid(pid))
                 return -EINVAL;
 
         r = cg_pid_get_slice(pid, &unit);
@@ -400,16 +371,52 @@ bool manager_shall_kill(Manager *m, const char *user) {
         assert(m);
         assert(user);
 
-        if (!m->kill_user_processes)
+        if (!m->kill_exclude_users && streq(user, "root"))
                 return false;
 
         if (strv_contains(m->kill_exclude_users, user))
                 return false;
 
-        if (strv_isempty(m->kill_only_users))
-                return true;
+        if (!strv_isempty(m->kill_only_users))
+                return strv_contains(m->kill_only_users, user);
 
-        return strv_contains(m->kill_only_users, user);
+        return m->kill_user_processes;
+}
+
+int config_parse_n_autovts(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        unsigned *n = data;
+        unsigned o;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = safe_atou(rvalue, &o);
+        if (r < 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse number of autovts, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        if (o > 15) {
+                log_syntax(unit, LOG_ERR, filename, line, r, "A maximum of 15 autovts are supported, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        *n = o;
+        return 0;
 }
 
 static int vt_is_busy(unsigned int vtnr) {
@@ -418,6 +425,9 @@ static int vt_is_busy(unsigned int vtnr) {
         _cleanup_close_ int fd;
 
         assert(vtnr >= 1);
+
+        /* VT_GETSTATE "cannot return state for more than 16 VTs, since v_state is short" */
+        assert(vtnr <= 15);
 
         /* We explicitly open /dev/tty1 here instead of /dev/tty0. If
          * we'd open the latter we'd open the foreground tty which
@@ -438,7 +448,7 @@ static int vt_is_busy(unsigned int vtnr) {
 }
 
 int manager_spawn_autovt(Manager *m, unsigned int vtnr) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         char name[sizeof("autovt@tty.service") + DECIMAL_STR_MAX(unsigned int)];
         int r;
 
@@ -532,7 +542,7 @@ static int manager_count_external_displays(Manager *m) {
                         continue;
 
                 /* Ignore internal displays: the type is encoded in
-                 * the sysfs name, as the second dash seperated item
+                 * the sysfs name, as the second dash separated item
                  * (the first is the card name, the last the connector
                  * number). We implement a whitelist of external
                  * displays here, rather than a whitelist, to ensure

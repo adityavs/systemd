@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,9 +20,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdbool.h>
+#include <sys/types.h>
+
+#include "time-util.h"
 #include "util.h"
 
-#ifdef HAVE_UTMP
+#if ENABLE_UTMP
 int utmp_get_runlevel(int *runlevel, int *previous);
 
 int utmp_put_shutdown(void);
@@ -31,7 +34,7 @@ int utmp_put_reboot(usec_t timestamp);
 int utmp_put_runlevel(int runlevel, int previous);
 
 int utmp_put_dead_process(const char *id, pid_t pid, int code, int status);
-int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line);
+int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line, int ut_type, const char *user);
 
 int utmp_wall(
         const char *message,
@@ -40,7 +43,7 @@ int utmp_wall(
         bool (*match_tty)(const char *tty, void *userdata),
         void *userdata);
 
-#else /* HAVE_UTMP */
+#else /* ENABLE_UTMP */
 
 static inline int utmp_get_runlevel(int *runlevel, int *previous) {
         return -ESRCH;
@@ -57,7 +60,7 @@ static inline int utmp_put_runlevel(int runlevel, int previous) {
 static inline int utmp_put_dead_process(const char *id, pid_t pid, int code, int status) {
         return 0;
 }
-static inline int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line) {
+static inline int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line, int ut_type, const char *user) {
         return 0;
 }
 static inline int utmp_wall(
@@ -69,4 +72,4 @@ static inline int utmp_wall(
         return 0;
 }
 
-#endif /* HAVE_UTMP */
+#endif /* ENABLE_UTMP */

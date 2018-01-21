@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,14 +19,36 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "label.h"
+#include "macro.h"
 #include "mkdir.h"
+#include "selinux-util.h"
+#include "smack-util.h"
 
-int mkdir_safe_label(const char *path, mode_t mode, uid_t uid, gid_t gid) {
-        return mkdir_safe_internal(path, mode, uid, gid, mkdir_label);
+int mkdir_label(const char *path, mode_t mode) {
+        int r;
+
+        assert(path);
+
+        r = mac_selinux_create_file_prepare(path, S_IFDIR);
+        if (r < 0)
+                return r;
+
+        r = mkdir_errno_wrapper(path, mode);
+        mac_selinux_create_file_clear();
+        if (r < 0)
+                return r;
+
+        return mac_smack_fix(path, false, false);
+}
+
+int mkdir_safe_label(const char *path, mode_t mode, uid_t uid, gid_t gid, bool follow_symlink) {
+        return mkdir_safe_internal(path, mode, uid, gid, follow_symlink, mkdir_label);
 }
 
 int mkdir_parents_label(const char *path, mode_t mode) {

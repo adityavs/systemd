@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,21 +18,22 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdbool.h>
 #include <getopt.h>
 #include <locale.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sd-bus.h"
 #include "sd-id128.h"
-#include "hostname-util.h"
-#include "bus-util.h"
-#include "bus-error.h"
-#include "util.h"
-#include "spawn-polkit-agent.h"
-#include "build.h"
+
+#include "alloc-util.h"
 #include "architecture.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "hostname-util.h"
+#include "spawn-polkit-agent.h"
+#include "util.h"
 
 static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
@@ -41,18 +41,6 @@ static char *arg_host = NULL;
 static bool arg_transient = false;
 static bool arg_pretty = false;
 static bool arg_static = false;
-
-static void polkit_agent_open_if_enabled(void) {
-
-        /* Open the polkit agent as a child process if necessary */
-        if (!arg_ask_password)
-                return;
-
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
-                return;
-
-        polkit_agent_open();
-}
 
 typedef struct StatusInfo {
         char *hostname;
@@ -126,8 +114,8 @@ static void print_status_info(StatusInfo *i) {
 }
 
 static int show_one_name(sd_bus *bus, const char* attr) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *s;
         int r;
 
@@ -138,10 +126,8 @@ static int show_one_name(sd_bus *bus, const char* attr) {
                         "org.freedesktop.hostname1",
                         attr,
                         &error, &reply, "s");
-        if (r < 0) {
-                log_error("Could not get property: %s", bus_error_message(&error, -r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Could not get property: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "s", &s);
         if (r < 0)
@@ -152,7 +138,7 @@ static int show_one_name(sd_bus *bus, const char* attr) {
         return 0;
 }
 
-static int show_all_names(sd_bus *bus) {
+static int show_all_names(sd_bus *bus, sd_bus_error *error) {
         StatusInfo info = {};
 
         static const struct bus_properties_map hostname_map[]  = {
@@ -182,6 +168,7 @@ static int show_all_names(sd_bus *bus) {
                                    "org.freedesktop.hostname1",
                                    "/org/freedesktop/hostname1",
                                    hostname_map,
+                                   error,
                                    &info);
         if (r < 0)
                 goto fail;
@@ -190,6 +177,7 @@ static int show_all_names(sd_bus *bus) {
                                "org.freedesktop.systemd1",
                                "/org/freedesktop/systemd1",
                                manager_map,
+                               error,
                                &info);
 
         print_status_info(&info);
@@ -213,6 +201,8 @@ fail:
 }
 
 static int show_status(sd_bus *bus, char **args, unsigned n) {
+        int r;
+
         assert(args);
 
         if (arg_pretty || arg_static || arg_transient) {
@@ -227,15 +217,22 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
                         arg_static ? "StaticHostname" : "Hostname";
 
                 return show_one_name(bus, attr);
-        } else
-                return show_all_names(bus);
+        } else {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+
+                r = show_all_names(bus, &error);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to query system properties: %s", bus_error_message(&error, r));
+
+                return 0;
+        }
 }
 
 static int set_simple_string(sd_bus *bus, const char *method, const char *value) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r = 0;
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call_method(
                         bus,
@@ -264,28 +261,29 @@ static int set_hostname(sd_bus *bus, char **args, unsigned n) {
         if (arg_pretty) {
                 const char *p;
 
-                /* If the passed hostname is already valid, then
-                 * assume the user doesn't know anything about pretty
-                 * hostnames, so let's unset the pretty hostname, and
-                 * just set the passed hostname as static/dynamic
+                /* If the passed hostname is already valid, then assume the user doesn't know anything about pretty
+                 * hostnames, so let's unset the pretty hostname, and just set the passed hostname as static/dynamic
                  * hostname. */
-
-                h = strdup(hostname);
-                if (!h)
-                        return log_oom();
-
-                hostname_cleanup(h, true);
-
-                if (arg_static && streq(h, hostname))
-                        p = "";
-                else {
-                        p = hostname;
-                        hostname = h;
-                }
+                if (arg_static && hostname_is_valid(hostname, true))
+                        p = ""; /* No pretty hostname (as it is redundant), just a static one */
+                else
+                        p = hostname; /* Use the passed name as pretty hostname */
 
                 r = set_simple_string(bus, "SetPrettyHostname", p);
                 if (r < 0)
                         return r;
+
+                /* Now that we set the pretty hostname, let's clean up the parameter and use that as static
+                 * hostname. If the hostname was already valid as static hostname, this will only chop off the trailing
+                 * dot if there is one. If it was not valid, then it will be made fully valid by truncating, dropping
+                 * multiple dots, and dropping weird chars. Note that we clean the name up only if we also are
+                 * supposed to set the pretty name. If the pretty name is not being set we assume the user knows what
+                 * he does and pass the name as-is. */
+                h = strdup(hostname);
+                if (!h)
+                        return log_oom();
+
+                hostname = hostname_cleanup(h); /* Use the cleaned up name as static hostname */
         }
 
         if (arg_static) {
@@ -388,9 +386,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case 'H':
                         arg_transport = BUS_TRANSPORT_REMOTE;
@@ -509,7 +505,7 @@ static int hostnamectl_main(sd_bus *bus, int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");
@@ -520,7 +516,7 @@ int main(int argc, char *argv[]) {
         if (r <= 0)
                 goto finish;
 
-        r = bus_open_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to create bus connection: %m");
                 goto finish;

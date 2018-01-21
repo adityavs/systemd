@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,13 +20,21 @@
 
 #include <errno.h>
 
-#include "unit.h"
-#include "unit-name.h"
-#include "timer.h"
-#include "dbus-timer.h"
-#include "special.h"
-#include "bus-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-util.h"
+#include "dbus-timer.h"
+#include "fs-util.h"
+#include "parse-util.h"
+#include "random-util.h"
+#include "special.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "timer.h"
+#include "unit-name.h"
+#include "unit.h"
+#include "user-util.h"
+#include "virt.h"
 
 static const UnitActiveState state_translation_table[_TIMER_STATE_MAX] = {
         [TIMER_DEAD] = UNIT_INACTIVE,
@@ -48,6 +55,7 @@ static void timer_init(Unit *u) {
         t->next_elapse_monotonic_or_boottime = USEC_INFINITY;
         t->next_elapse_realtime = USEC_INFINITY;
         t->accuracy_usec = u->manager->default_timer_accuracy_usec;
+        t->remain_after_elapse = true;
 }
 
 void timer_free_values(Timer *t) {
@@ -57,10 +65,7 @@ void timer_free_values(Timer *t) {
 
         while ((v = t->values)) {
                 LIST_REMOVE(value, t->values, v);
-
-                if (v->calendar_spec)
-                        calendar_spec_free(v->calendar_spec);
-
+                calendar_spec_free(v->calendar_spec);
                 free(v);
         }
 }
@@ -98,18 +103,21 @@ static int timer_add_default_dependencies(Timer *t) {
 
         assert(t);
 
-        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, NULL, true);
+        if (!UNIT(t)->default_dependencies)
+                return 0;
+
+        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
 
-        if (UNIT(t)->manager->running_as == MANAGER_SYSTEM) {
-                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, NULL, true);
+        if (MANAGER_IS_SYSTEM(UNIT(t)->manager)) {
+                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
                 if (r < 0)
                         return r;
 
                 LIST_FOREACH(value, v, t->values) {
                         if (v->base == TIMER_CALENDAR) {
-                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, SPECIAL_TIME_SYNC_TARGET, NULL, true);
+                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, SPECIAL_TIME_SYNC_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
                                 if (r < 0)
                                         return r;
                                 break;
@@ -117,7 +125,23 @@ static int timer_add_default_dependencies(Timer *t) {
                 }
         }
 
-        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, NULL, true);
+        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
+}
+
+static int timer_add_trigger_dependencies(Timer *t) {
+        Unit *x;
+        int r;
+
+        assert(t);
+
+        if (!hashmap_isempty(UNIT(t)->dependencies[UNIT_TRIGGERS]))
+                return 0;
+
+        r = unit_load_related_unit(UNIT(t), ".service", &x);
+        if (r < 0)
+                return r;
+
+        return unit_add_two_dependencies(UNIT(t), UNIT_BEFORE, UNIT_TRIGGERS, x, true, UNIT_DEPENDENCY_IMPLICIT);
 }
 
 static int timer_setup_persistent(Timer *t) {
@@ -128,9 +152,9 @@ static int timer_setup_persistent(Timer *t) {
         if (!t->persistent)
                 return 0;
 
-        if (UNIT(t)->manager->running_as == MANAGER_SYSTEM) {
+        if (MANAGER_IS_SYSTEM(UNIT(t)->manager)) {
 
-                r = unit_require_mounts_for(UNIT(t), "/var/lib/systemd/timers");
+                r = unit_require_mounts_for(UNIT(t), "/var/lib/systemd/timers", UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
 
@@ -140,7 +164,7 @@ static int timer_setup_persistent(Timer *t) {
 
                 e = getenv("XDG_DATA_HOME");
                 if (e)
-                        t->stamp_path = strjoin(e, "/systemd/timers/stamp-", UNIT(t)->id, NULL);
+                        t->stamp_path = strjoin(e, "/systemd/timers/stamp-", UNIT(t)->id);
                 else {
 
                         _cleanup_free_ char *h = NULL;
@@ -149,7 +173,7 @@ static int timer_setup_persistent(Timer *t) {
                         if (r < 0)
                                 return log_unit_error_errno(UNIT(t), r, "Failed to determine home directory: %m");
 
-                        t->stamp_path = strjoin(h, "/.local/share/systemd/timers/stamp-", UNIT(t)->id, NULL);
+                        t->stamp_path = strjoin(h, "/.local/share/systemd/timers/stamp-", UNIT(t)->id);
                 }
         }
 
@@ -172,27 +196,17 @@ static int timer_load(Unit *u) {
 
         if (u->load_state == UNIT_LOADED) {
 
-                if (set_isempty(u->dependencies[UNIT_TRIGGERS])) {
-                        Unit *x;
-
-                        r = unit_load_related_unit(u, ".service", &x);
-                        if (r < 0)
-                                return r;
-
-                        r = unit_add_two_dependencies(u, UNIT_BEFORE, UNIT_TRIGGERS, x, true);
-                        if (r < 0)
-                                return r;
-                }
+                r = timer_add_trigger_dependencies(t);
+                if (r < 0)
+                        return r;
 
                 r = timer_setup_persistent(t);
                 if (r < 0)
                         return r;
 
-                if (u->default_dependencies) {
-                        r = timer_add_default_dependencies(t);
-                        if (r < 0)
-                                return r;
-                }
+                r = timer_add_default_dependencies(t);
+                if (r < 0)
+                        return r;
         }
 
         return timer_verify(t);
@@ -212,20 +226,22 @@ static void timer_dump(Unit *u, FILE *f, const char *prefix) {
                 "%sUnit: %s\n"
                 "%sPersistent: %s\n"
                 "%sWakeSystem: %s\n"
-                "%sAccuracy: %s\n",
+                "%sAccuracy: %s\n"
+                "%sRemainAfterElapse: %s\n",
                 prefix, timer_state_to_string(t->state),
                 prefix, timer_result_to_string(t->result),
                 prefix, trigger ? trigger->id : "n/a",
                 prefix, yes_no(t->persistent),
                 prefix, yes_no(t->wake_system),
-                prefix, format_timespan(buf, sizeof(buf), t->accuracy_usec, 1));
+                prefix, format_timespan(buf, sizeof(buf), t->accuracy_usec, 1),
+                prefix, yes_no(t->remain_after_elapse));
 
         LIST_FOREACH(value, v, t->values) {
 
                 if (v->base == TIMER_CALENDAR) {
                         _cleanup_free_ char *p = NULL;
 
-                        calendar_spec_to_string(v->calendar_spec, &p);
+                        (void) calendar_spec_to_string(v->calendar_spec, &p);
 
                         fprintf(f,
                                 "%s%s: %s\n",
@@ -254,6 +270,8 @@ static void timer_set_state(Timer *t, TimerState state) {
         if (state != TIMER_WAITING) {
                 t->monotonic_event_source = sd_event_source_unref(t->monotonic_event_source);
                 t->realtime_event_source = sd_event_source_unref(t->realtime_event_source);
+                t->next_elapse_monotonic_or_boottime = USEC_INFINITY;
+                t->next_elapse_realtime = USEC_INFINITY;
         }
 
         if (state != old_state)
@@ -270,13 +288,13 @@ static int timer_coldplug(Unit *u) {
         assert(t);
         assert(t->state == TIMER_DEAD);
 
-        if (t->deserialized_state != t->state) {
+        if (t->deserialized_state == t->state)
+                return 0;
 
-                if (t->deserialized_state == TIMER_WAITING)
-                        timer_enter_waiting(t, false);
-                else
-                        timer_set_state(t, t->deserialized_state);
-        }
+        if (t->deserialized_state == TIMER_WAITING)
+                timer_enter_waiting(t, false);
+        else
+                timer_set_state(t, t->deserialized_state);
 
         return 0;
 }
@@ -284,39 +302,73 @@ static int timer_coldplug(Unit *u) {
 static void timer_enter_dead(Timer *t, TimerResult f) {
         assert(t);
 
-        if (f != TIMER_SUCCESS)
+        if (t->result == TIMER_SUCCESS)
                 t->result = f;
+
+        if (t->result != TIMER_SUCCESS)
+                log_unit_warning(UNIT(t), "Failed with result '%s'.", timer_result_to_string(t->result));
 
         timer_set_state(t, t->result != TIMER_SUCCESS ? TIMER_FAILED : TIMER_DEAD);
 }
 
-static usec_t monotonic_to_boottime(usec_t t) {
-        usec_t a, b;
+static void timer_enter_elapsed(Timer *t, bool leave_around) {
+        assert(t);
 
-        if (t <= 0)
-                return 0;
+        /* If a unit is marked with RemainAfterElapse=yes we leave it
+         * around even after it elapsed once, so that starting it
+         * later again does not necessarily mean immediate
+         * retriggering. We unconditionally leave units with
+         * TIMER_UNIT_ACTIVE or TIMER_UNIT_INACTIVE triggers around,
+         * since they might be restarted automatically at any time
+         * later on. */
 
-        a = now(CLOCK_BOOTTIME);
-        b = now(CLOCK_MONOTONIC);
-
-        if (t + a > b)
-                return t + a - b;
+        if (t->remain_after_elapse || leave_around)
+                timer_set_state(t, TIMER_ELAPSED);
         else
-                return 0;
+                timer_enter_dead(t, TIMER_SUCCESS);
+}
+
+static void add_random(Timer *t, usec_t *v) {
+        char s[FORMAT_TIMESPAN_MAX];
+        usec_t add;
+
+        assert(t);
+        assert(v);
+
+        if (t->random_usec == 0)
+                return;
+        if (*v == USEC_INFINITY)
+                return;
+
+        add = random_u64() % t->random_usec;
+
+        if (*v + add < *v) /* overflow */
+                *v = (usec_t) -2; /* Highest possible value, that is not USEC_INFINITY */
+        else
+                *v += add;
+
+        log_unit_debug(UNIT(t), "Adding %s random time.", format_timespan(s, sizeof(s), add, 0));
 }
 
 static void timer_enter_waiting(Timer *t, bool initial) {
         bool found_monotonic = false, found_realtime = false;
-        usec_t ts_realtime, ts_monotonic;
+        bool leave_around = false;
+        triple_timestamp ts;
         usec_t base = 0;
         TimerValue *v;
+        Unit *trigger;
         int r;
 
-        /* If we shall wake the system we use the boottime clock
-         * rather than the monotonic clock. */
+        assert(t);
 
-        ts_realtime = now(CLOCK_REALTIME);
-        ts_monotonic = now(t->wake_system ? CLOCK_BOOTTIME : CLOCK_MONOTONIC);
+        trigger = UNIT_TRIGGER(UNIT(t));
+        if (!trigger) {
+                log_unit_error(UNIT(t), "Unit to trigger vanished.");
+                timer_enter_dead(t, TIMER_FAILURE_RESOURCES);
+                return;
+        }
+
+        triple_timestamp_get(&ts);
         t->next_elapse_monotonic_or_boottime = t->next_elapse_realtime = 0;
 
         LIST_FOREACH(value, v, t->values) {
@@ -332,7 +384,7 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                          * to that. If we don't just start from
                          * now. */
 
-                        b = t->last_trigger.realtime > 0 ? t->last_trigger.realtime : ts_realtime;
+                        b = t->last_trigger.realtime > 0 ? t->last_trigger.realtime : ts.realtime;
 
                         r = calendar_spec_next_usec(v->calendar_spec, b, &v->next_elapse);
                         if (r < 0)
@@ -346,27 +398,33 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                         found_realtime = true;
 
                 } else  {
+
                         switch (v->base) {
 
                         case TIMER_ACTIVE:
                                 if (state_translation_table[t->state] == UNIT_ACTIVE)
                                         base = UNIT(t)->inactive_exit_timestamp.monotonic;
                                 else
-                                        base = ts_monotonic;
+                                        base = ts.monotonic;
                                 break;
 
                         case TIMER_BOOT:
-                                /* CLOCK_MONOTONIC equals the uptime on Linux */
-                                base = 0;
-                                break;
-
+                                if (detect_container() <= 0) {
+                                        /* CLOCK_MONOTONIC equals the uptime on Linux */
+                                        base = 0;
+                                        break;
+                                }
+                                /* In a container we don't want to include the time the host
+                                 * was already up when the container started, so count from
+                                 * our own startup. */
+                                _fallthrough_;
                         case TIMER_STARTUP:
-                                base = UNIT(t)->manager->userspace_timestamp.monotonic;
+                                base = UNIT(t)->manager->timestamps[MANAGER_TIMESTAMP_USERSPACE].monotonic;
                                 break;
 
                         case TIMER_UNIT_ACTIVE:
-
-                                base = UNIT_TRIGGER(UNIT(t))->inactive_exit_timestamp.monotonic;
+                                leave_around = true;
+                                base = trigger->inactive_exit_timestamp.monotonic;
 
                                 if (base <= 0)
                                         base = t->last_trigger.monotonic;
@@ -377,8 +435,8 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                                 break;
 
                         case TIMER_UNIT_INACTIVE:
-
-                                base = UNIT_TRIGGER(UNIT(t))->inactive_enter_timestamp.monotonic;
+                                leave_around = true;
+                                base = trigger->inactive_enter_timestamp.monotonic;
 
                                 if (base <= 0)
                                         base = t->last_trigger.monotonic;
@@ -392,12 +450,11 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                                 assert_not_reached("Unknown timer base");
                         }
 
-                        if (t->wake_system)
-                                base = monotonic_to_boottime(base);
+                        v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
 
-                        v->next_elapse = base + v->value;
-
-                        if (!initial && v->next_elapse < ts_monotonic && IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
+                        if (!initial &&
+                            v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
+                            IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
                                 /* This is a one time trigger, disable it now */
                                 v->disabled = true;
                                 continue;
@@ -414,14 +471,18 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
         if (!found_monotonic && !found_realtime) {
                 log_unit_debug(UNIT(t), "Timer is elapsed.");
-                timer_set_state(t, TIMER_ELAPSED);
+                timer_enter_elapsed(t, leave_around);
                 return;
         }
 
         if (found_monotonic) {
                 char buf[FORMAT_TIMESPAN_MAX];
+                usec_t left;
 
-                log_unit_debug(UNIT(t), "Monotonic timer elapses in %s.", format_timespan(buf, sizeof(buf), t->next_elapse_monotonic_or_boottime > ts_monotonic ? t->next_elapse_monotonic_or_boottime - ts_monotonic : 0, 0));
+                add_random(t, &t->next_elapse_monotonic_or_boottime);
+
+                left = usec_sub_unsigned(t->next_elapse_monotonic_or_boottime, triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)));
+                log_unit_debug(UNIT(t), "Monotonic timer elapses in %s.", format_timespan(buf, sizeof(buf), left, 0));
 
                 if (t->monotonic_event_source) {
                         r = sd_event_source_set_time(t->monotonic_event_source, t->next_elapse_monotonic_or_boottime);
@@ -454,6 +515,9 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
         if (found_realtime) {
                 char buf[FORMAT_TIMESTAMP_MAX];
+
+                add_random(t, &t->next_elapse_realtime);
+
                 log_unit_debug(UNIT(t), "Realtime timer elapses at %s.", format_timestamp(buf, sizeof(buf), t->next_elapse_realtime));
 
                 if (t->realtime_event_source) {
@@ -493,7 +557,8 @@ fail:
 }
 
 static void timer_enter_running(Timer *t) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        Unit *trigger;
         int r;
 
         assert(t);
@@ -502,15 +567,21 @@ static void timer_enter_running(Timer *t) {
         if (unit_stop_pending(UNIT(t)))
                 return;
 
-        r = manager_add_job(UNIT(t)->manager, JOB_START, UNIT_TRIGGER(UNIT(t)),
-                            JOB_REPLACE, true, &error, NULL);
+        trigger = UNIT_TRIGGER(UNIT(t));
+        if (!trigger) {
+                log_unit_error(UNIT(t), "Unit to trigger vanished.");
+                timer_enter_dead(t, TIMER_FAILURE_RESOURCES);
+                return;
+        }
+
+        r = manager_add_job(UNIT(t)->manager, JOB_START, trigger, JOB_REPLACE, &error, NULL);
         if (r < 0)
                 goto fail;
 
         dual_timestamp_get(&t->last_trigger);
 
         if (t->stamp_path)
-                touch_file(t->stamp_path, true, t->last_trigger.realtime, UID_INVALID, GID_INVALID, 0);
+                touch_file(t->stamp_path, true, t->last_trigger.realtime, UID_INVALID, GID_INVALID, MODE_INVALID);
 
         timer_set_state(t, TIMER_RUNNING);
         return;
@@ -523,12 +594,27 @@ fail:
 static int timer_start(Unit *u) {
         Timer *t = TIMER(u);
         TimerValue *v;
+        Unit *trigger;
+        int r;
 
         assert(t);
-        assert(t->state == TIMER_DEAD || t->state == TIMER_FAILED);
+        assert(IN_SET(t->state, TIMER_DEAD, TIMER_FAILED));
 
-        if (UNIT_TRIGGER(u)->load_state != UNIT_LOADED)
+        trigger = UNIT_TRIGGER(u);
+        if (!trigger || trigger->load_state != UNIT_LOADED) {
+                log_unit_error(u, "Refusing to start, unit to trigger not loaded.");
                 return -ENOENT;
+        }
+
+        r = unit_start_limit_test(u);
+        if (r < 0) {
+                timer_enter_dead(t, TIMER_FAILURE_START_LIMIT_HIT);
+                return r;
+        }
+
+        r = unit_acquire_invocation_id(u);
+        if (r < 0)
+                return r;
 
         t->last_trigger = DUAL_TIMESTAMP_NULL;
 
@@ -540,13 +626,27 @@ static int timer_start(Unit *u) {
         if (t->stamp_path) {
                 struct stat st;
 
-                if (stat(t->stamp_path, &st) >= 0)
-                        t->last_trigger.realtime = timespec_load(&st.st_atim);
-                else if (errno == ENOENT)
+                if (stat(t->stamp_path, &st) >= 0) {
+                        usec_t ft;
+
+                        /* Load the file timestamp, but only if it is actually in the past. If it is in the future,
+                         * something is wrong with the system clock. */
+
+                        ft = timespec_load(&st.st_mtim);
+                        if (ft < now(CLOCK_REALTIME))
+                                t->last_trigger.realtime = ft;
+                        else {
+                                char z[FORMAT_TIMESTAMP_MAX];
+
+                                log_unit_warning(u, "Not using persistent file timestamp %s as it is in the future.",
+                                                 format_timestamp(z, sizeof(z), ft));
+                        }
+
+                } else if (errno == ENOENT)
                         /* The timer has never run before,
                          * make sure a stamp file exists.
                          */
-                        touch_file(t->stamp_path, true, USEC_INFINITY, UID_INVALID, GID_INVALID, 0);
+                        (void) touch_file(t->stamp_path, true, USEC_INFINITY, UID_INVALID, GID_INVALID, MODE_INVALID);
         }
 
         t->result = TIMER_SUCCESS;
@@ -558,7 +658,7 @@ static int timer_stop(Unit *u) {
         Timer *t = TIMER(u);
 
         assert(t);
-        assert(t->state == TIMER_WAITING || t->state == TIMER_RUNNING || t->state == TIMER_ELAPSED);
+        assert(IN_SET(t->state, TIMER_WAITING, TIMER_RUNNING, TIMER_ELAPSED));
 
         timer_enter_dead(t, TIMER_SUCCESS);
         return 1;
@@ -663,8 +763,7 @@ static void timer_trigger_notify(Unit *u, Unit *other) {
 
         /* Reenable all timers that depend on unit state */
         LIST_FOREACH(value, v, t->values)
-                if (v->base == TIMER_UNIT_ACTIVE ||
-                    v->base == TIMER_UNIT_INACTIVE)
+                if (IN_SET(v->base, TIMER_UNIT_ACTIVE, TIMER_UNIT_INACTIVE))
                         v->disabled = false;
 
         switch (t->state) {
@@ -716,16 +815,6 @@ static void timer_time_change(Unit *u) {
         timer_enter_waiting(t, false);
 }
 
-static const char* const timer_state_table[_TIMER_STATE_MAX] = {
-        [TIMER_DEAD] = "dead",
-        [TIMER_WAITING] = "waiting",
-        [TIMER_RUNNING] = "running",
-        [TIMER_ELAPSED] = "elapsed",
-        [TIMER_FAILED] = "failed"
-};
-
-DEFINE_STRING_TABLE_LOOKUP(timer_state, TimerState);
-
 static const char* const timer_base_table[_TIMER_BASE_MAX] = {
         [TIMER_ACTIVE] = "OnActiveSec",
         [TIMER_BOOT] = "OnBootSec",
@@ -739,7 +828,8 @@ DEFINE_STRING_TABLE_LOOKUP(timer_base, TimerBase);
 
 static const char* const timer_result_table[_TIMER_RESULT_MAX] = {
         [TIMER_SUCCESS] = "success",
-        [TIMER_FAILURE_RESOURCES] = "resources"
+        [TIMER_FAILURE_RESOURCES] = "resources",
+        [TIMER_FAILURE_START_LIMIT_HIT] = "start-limit-hit",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(timer_result, TimerResult);
@@ -775,7 +865,6 @@ const UnitVTable timer_vtable = {
         .reset_failed = timer_reset_failed,
         .time_change = timer_time_change,
 
-        .bus_interface = "org.freedesktop.systemd1.Timer",
         .bus_vtable = bus_timer_vtable,
         .bus_set_property = bus_timer_set_property,
 

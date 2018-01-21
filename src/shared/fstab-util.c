@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,62 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
+#include <mntent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "alloc-util.h"
+#include "device-nodes.h"
 #include "fstab-util.h"
+#include "macro.h"
+#include "mount-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "util.h"
+
+int fstab_has_fstype(const char *fstype) {
+        _cleanup_endmntent_ FILE *f = NULL;
+        struct mntent *m;
+
+        f = setmntent("/etc/fstab", "re");
+        if (!f)
+                return errno == ENOENT ? false : -errno;
+
+        for (;;) {
+                errno = 0;
+                m = getmntent(f);
+                if (!m)
+                        return errno != 0 ? -errno : false;
+
+                if (streq(m->mnt_type, fstype))
+                        return true;
+        }
+        return false;
+}
+
+int fstab_is_mount_point(const char *mount) {
+        _cleanup_endmntent_ FILE *f = NULL;
+        struct mntent *m;
+
+        f = setmntent("/etc/fstab", "re");
+        if (!f)
+                return errno == ENOENT ? false : -errno;
+
+        for (;;) {
+                errno = 0;
+                m = getmntent(f);
+                if (!m)
+                        return errno != 0 ? -errno : false;
+
+                if (path_equal(m->mnt_dir, mount))
+                        return true;
+        }
+        return false;
+}
 
 int fstab_filter_options(const char *opts, const char *names,
                          const char **namefound, char **value, char **filtered) {
@@ -177,4 +229,61 @@ int fstab_find_pri(const char *options, int *ret) {
 
         *ret = (int) pri;
         return 1;
+}
+
+static char *unquote(const char *s, const char* quotes) {
+        size_t l;
+        assert(s);
+
+        /* This is rather stupid, simply removes the heading and
+         * trailing quotes if there is one. Doesn't care about
+         * escaping or anything.
+         *
+         * DON'T USE THIS FOR NEW CODE ANYMORE! */
+
+        l = strlen(s);
+        if (l < 2)
+                return strdup(s);
+
+        if (strchr(quotes, s[0]) && s[l-1] == s[0])
+                return strndup(s+1, l-2);
+
+        return strdup(s);
+}
+
+static char *tag_to_udev_node(const char *tagvalue, const char *by) {
+        _cleanup_free_ char *t = NULL, *u = NULL;
+        size_t enc_len;
+
+        u = unquote(tagvalue, QUOTES);
+        if (!u)
+                return NULL;
+
+        enc_len = strlen(u) * 4 + 1;
+        t = new(char, enc_len);
+        if (!t)
+                return NULL;
+
+        if (encode_devnode_name(u, t, enc_len) < 0)
+                return NULL;
+
+        return strjoin("/dev/disk/by-", by, "/", t);
+}
+
+char *fstab_node_to_udev_node(const char *p) {
+        assert(p);
+
+        if (startswith(p, "LABEL="))
+                return tag_to_udev_node(p+6, "label");
+
+        if (startswith(p, "UUID="))
+                return tag_to_udev_node(p+5, "uuid");
+
+        if (startswith(p, "PARTUUID="))
+                return tag_to_udev_node(p+9, "partuuid");
+
+        if (startswith(p, "PARTLABEL="))
+                return tag_to_udev_node(p+10, "partlabel");
+
+        return strdup(p);
 }

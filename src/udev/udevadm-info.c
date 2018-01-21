@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2004-2009 Kay Sievers <kay@vrfy.org>
  *
@@ -15,19 +16,21 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <string.h>
-#include <stdio.h>
-#include <stddef.h>
 #include <ctype.h>
-#include <unistd.h>
-#include <dirent.h>
 #include <errno.h>
-#include <getopt.h>
 #include <fcntl.h>
+#include <getopt.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-#include "udev.h"
+#include "dirent-util.h"
+#include "fd-util.h"
+#include "string-util.h"
 #include "udev-util.h"
+#include "udev.h"
 #include "udevadm-util.h"
 
 static bool skip_attribute(const char *name) {
@@ -134,14 +137,15 @@ static void print_record(struct udev_device *device) {
 
         str = udev_device_get_devnode(device);
         if (str != NULL)
-                printf("N: %s\n", str + strlen("/dev/"));
+                printf("N: %s\n", str + STRLEN("/dev/"));
 
         i = udev_device_get_devlink_priority(device);
         if (i != 0)
                 printf("L: %i\n", i);
 
         udev_list_entry_foreach(list_entry, udev_device_get_devlinks_list_entry(device))
-                printf("S: %s\n", udev_list_entry_get_name(list_entry) + strlen("/dev/"));
+                printf("S: %s\n",
+                       udev_list_entry_get_name(list_entry) + STRLEN("/dev/"));
 
         udev_list_entry_foreach(list_entry, udev_device_get_properties_list_entry(device))
                 printf("E: %s=%s\n",
@@ -154,7 +158,7 @@ static int stat_device(const char *name, bool export, const char *prefix) {
         struct stat statbuf;
 
         if (stat(name, &statbuf) != 0)
-                return -1;
+                return -errno;
 
         if (export) {
                 if (prefix == NULL)
@@ -169,23 +173,22 @@ static int stat_device(const char *name, bool export, const char *prefix) {
 }
 
 static int export_devices(struct udev *udev) {
-        struct udev_enumerate *udev_enumerate;
+        _cleanup_udev_enumerate_unref_ struct udev_enumerate *udev_enumerate;
         struct udev_list_entry *list_entry;
 
         udev_enumerate = udev_enumerate_new(udev);
         if (udev_enumerate == NULL)
-                return -1;
+                return -ENOMEM;
+
         udev_enumerate_scan_devices(udev_enumerate);
         udev_list_entry_foreach(list_entry, udev_enumerate_get_list_entry(udev_enumerate)) {
-                struct udev_device *device;
+                _cleanup_udev_device_unref_ struct udev_device *device;
 
                 device = udev_device_new_from_syspath(udev, udev_list_entry_get_name(list_entry));
-                if (device != NULL) {
+                if (device != NULL)
                         print_record(device);
-                        udev_device_unref(device);
-                }
         }
-        udev_enumerate_unref(udev_enumerate);
+
         return 0;
 }
 
@@ -195,7 +198,7 @@ static void cleanup_dir(DIR *dir, mode_t mask, int depth) {
         if (depth <= 0)
                 return;
 
-        for (dent = readdir(dir); dent != NULL; dent = readdir(dir)) {
+        FOREACH_DIRENT_ALL(dent, dir, break) {
                 struct stat stats;
 
                 if (dent->d_name[0] == '.')
@@ -218,39 +221,29 @@ static void cleanup_dir(DIR *dir, mode_t mask, int depth) {
 }
 
 static void cleanup_db(struct udev *udev) {
-        DIR *dir;
+        _cleanup_closedir_ DIR *dir1 = NULL, *dir2 = NULL, *dir3 = NULL, *dir4 = NULL, *dir5 = NULL;
 
-        unlink("/run/udev/queue.bin");
+        (void) unlink("/run/udev/queue.bin");
 
-        dir = opendir("/run/udev/data");
-        if (dir != NULL) {
-                cleanup_dir(dir, S_ISVTX, 1);
-                closedir(dir);
-        }
+        dir1 = opendir("/run/udev/data");
+        if (dir1 != NULL)
+                cleanup_dir(dir1, S_ISVTX, 1);
 
-        dir = opendir("/run/udev/links");
-        if (dir != NULL) {
-                cleanup_dir(dir, 0, 2);
-                closedir(dir);
-        }
+        dir2 = opendir("/run/udev/links");
+        if (dir2 != NULL)
+                cleanup_dir(dir2, 0, 2);
 
-        dir = opendir("/run/udev/tags");
-        if (dir != NULL) {
-                cleanup_dir(dir, 0, 2);
-                closedir(dir);
-        }
+        dir3 = opendir("/run/udev/tags");
+        if (dir3 != NULL)
+                cleanup_dir(dir3, 0, 2);
 
-        dir = opendir("/run/udev/static_node-tags");
-        if (dir != NULL) {
-                cleanup_dir(dir, 0, 2);
-                closedir(dir);
-        }
+        dir4 = opendir("/run/udev/static_node-tags");
+        if (dir4 != NULL)
+                cleanup_dir(dir4, 0, 2);
 
-        dir = opendir("/run/udev/watch");
-        if (dir != NULL) {
-                cleanup_dir(dir, 0, 1);
-                closedir(dir);
-        }
+        dir5 = opendir("/run/udev/watch");
+        if (dir5 != NULL)
+                cleanup_dir(dir5, 0, 1);
 }
 
 static void help(void) {
@@ -258,7 +251,7 @@ static void help(void) {
         printf("%s info [OPTIONS] [DEVPATH|FILE]\n\n"
                "Query sysfs or the udev database.\n\n"
                "  -h --help                   Print this message\n"
-               "     --version                Print version of the program\n"
+               "  -V --version                Print version of the program\n"
                "  -q --query=TYPE             Query device information:\n"
                "       name                     Name of device node\n"
                "       symlink                  Pointing to node\n"
@@ -372,7 +365,8 @@ static int uinfo(struct udev *udev, int argc, char *argv[]) {
                         action = ACTION_ATTRIBUTE_WALK;
                         break;
                 case 'e':
-                        export_devices(udev);
+                        if (export_devices(udev) < 0)
+                                return 1;
                         return 0;
                 case 'c':
                         cleanup_db(udev);
@@ -384,7 +378,7 @@ static int uinfo(struct udev *udev, int argc, char *argv[]) {
                         export_prefix = optarg;
                         break;
                 case 'V':
-                        printf("%s\n", VERSION);
+                        print_version();
                         return 0;
                 case 'h':
                         help();
@@ -419,7 +413,8 @@ static int uinfo(struct udev *udev, int argc, char *argv[]) {
                         if (root)
                                 printf("%s\n", udev_device_get_devnode(device));
                         else
-                                printf("%s\n", udev_device_get_devnode(device) + strlen("/dev/"));
+                                printf("%s\n",
+                                       udev_device_get_devnode(device) + STRLEN("/dev/"));
                         break;
                 }
                 case QUERY_SYMLINK:
@@ -428,7 +423,8 @@ static int uinfo(struct udev *udev, int argc, char *argv[]) {
                                 if (root)
                                         printf("%s", udev_list_entry_get_name(list_entry));
                                 else
-                                        printf("%s", udev_list_entry_get_name(list_entry) + strlen("/dev/"));
+                                        printf("%s",
+                                               udev_list_entry_get_name(list_entry) + STRLEN("/dev/"));
                                 list_entry = udev_list_entry_get_next(list_entry);
                                 if (list_entry != NULL)
                                         printf(" ");
@@ -441,17 +437,13 @@ static int uinfo(struct udev *udev, int argc, char *argv[]) {
                 case QUERY_PROPERTY:
                         list_entry = udev_device_get_properties_list_entry(device);
                         while (list_entry != NULL) {
-                                if (export) {
-                                        const char *prefix = export_prefix;
-
-                                        if (prefix == NULL)
-                                                prefix = "";
-                                        printf("%s%s='%s'\n", prefix,
+                                if (export)
+                                        printf("%s%s='%s'\n", strempty(export_prefix),
                                                udev_list_entry_get_name(list_entry),
                                                udev_list_entry_get_value(list_entry));
-                                } else {
+                                else
                                         printf("%s=%s\n", udev_list_entry_get_name(list_entry), udev_list_entry_get_value(list_entry));
-                                }
+
                                 list_entry = udev_list_entry_get_next(list_entry);
                         }
                         break;

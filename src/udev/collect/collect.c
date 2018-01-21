@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Collect variables across events.
  *
@@ -19,13 +20,17 @@
  *
  */
 
-#include <stdio.h>
-#include <stddef.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stddef.h>
+#include <stdio.h>
 
+#include "alloc-util.h"
 #include "libudev-private.h"
 #include "macro.h"
+#include "stdio-util.h"
+#include "string-util.h"
+#include "udev-util.h"
 
 #define BUFSIZE 16
 #define UDEV_ALARM_TIMEOUT 180
@@ -82,23 +87,23 @@ static void usage(void)
  */
 static int prepare(char *dir, char *filename)
 {
-        char buf[512];
+        char buf[PATH_MAX];
         int r, fd;
 
         r = mkdir(dir, 0700);
         if (r < 0 && errno != EEXIST)
                 return -errno;
 
-        snprintf(buf, sizeof(buf), "%s/%s", dir, filename);
+        xsprintf(buf, "%s/%s", dir, filename);
 
-        fd = open(buf,O_RDWR|O_CREAT|O_CLOEXEC, S_IRUSR|S_IWUSR);
+        fd = open(buf, O_RDWR|O_CREAT|O_CLOEXEC, S_IRUSR|S_IWUSR);
         if (fd < 0)
                 fprintf(stderr, "Cannot open %s: %m\n", buf);
 
         if (lockf(fd,F_TLOCK,0) < 0) {
                 if (debug)
                         fprintf(stderr, "Lock taken, wait for %d seconds\n", UDEV_ALARM_TIMEOUT);
-                if (errno == EAGAIN || errno == EACCES) {
+                if (IN_SET(errno, EAGAIN, EACCES)) {
                         alarm(UDEV_ALARM_TIMEOUT);
                         lockf(fd, F_LOCK, 0);
                         if (debug)
@@ -130,7 +135,8 @@ static int prepare(char *dir, char *filename)
 static int checkout(int fd)
 {
         int len;
-        char *buf, *ptr, *word = NULL;
+        _cleanup_free_ char *buf = NULL;
+        char *ptr, *word = NULL;
         struct _mate *him;
 
  restart:
@@ -150,26 +156,22 @@ static int checkout(int fd)
                                 bufsize = bufsize << 1;
                                 if (debug)
                                         fprintf(stderr, "ID overflow, restarting with size %zu\n", bufsize);
-                                free(buf);
                                 lseek(fd, 0, SEEK_SET);
                                 goto restart;
                         }
                         if (ptr) {
                                 *ptr = '\0';
                                 ptr++;
-                                if (!strlen(word))
+                                if (isempty(word))
                                         continue;
 
                                 if (debug)
                                         fprintf(stderr, "Found word %s\n", word);
                                 him = malloc(sizeof (struct _mate));
-                                if (!him) {
-                                        free(buf);
+                                if (!him)
                                         return log_oom();
-                                }
                                 him->name = strdup(word);
                                 if (!him->name) {
-                                        free(buf);
                                         free(him);
                                         return log_oom();
                                 }
@@ -183,12 +185,9 @@ static int checkout(int fd)
 
                 if (!ptr)
                         ptr = word;
-                if (!ptr)
-                        break;
                 ptr -= len;
         }
 
-        free(buf);
         return 0;
 }
 
@@ -340,9 +339,7 @@ static void everybody(void)
         }
 }
 
-int main(int argc, char **argv)
-{
-        struct udev *udev;
+int main(int argc, char **argv) {
         static const struct option options[] = {
                 { "add", no_argument, NULL, 'a' },
                 { "remove", no_argument, NULL, 'r' },
@@ -358,13 +355,12 @@ int main(int argc, char **argv)
         int prune = 0;
         char tmpdir[UTIL_PATH_SIZE];
 
-        udev = udev_new();
-        if (udev == NULL) {
-                ret = EXIT_FAILURE;
-                goto exit;
-        }
+        log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
+        log_parse_environment();
+        log_open();
 
-        while (1) {
+        for (;;) {
                 int option;
 
                 option = getopt_long(argc, argv, "ardh", options, NULL);
@@ -383,26 +379,23 @@ int main(int argc, char **argv)
                         break;
                 case 'h':
                         usage();
-                        goto exit;
+                        return 0;
                 default:
-                        ret = 1;
-                        goto exit;
+                        return 1;
                 }
         }
 
         argi = optind;
         if (argi + 2 > argc) {
                 printf("Missing parameter(s)\n");
-                ret = 1;
-                goto exit;
+                return 1;
         }
         checkpoint = argv[argi++];
         us = argv[argi++];
 
         if (signal(SIGALRM, sig_alrm) == SIG_ERR) {
                 fprintf(stderr, "Cannot set SIGALRM: %m\n");
-                ret = 2;
-                goto exit;
+                return 2;
         }
 
         udev_list_node_init(&bunch);
@@ -482,7 +475,5 @@ out:
                 everybody();
         if (ret >= 0)
                 printf("COLLECT_%s=%d\n", checkpoint, ret);
-exit:
-        udev_unref(udev);
         return ret;
 }

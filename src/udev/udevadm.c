@@ -1,4 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2007-2012 Kay Sievers <kay@vrfy.org>
  *
@@ -16,16 +16,18 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stddef.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stddef.h>
+#include <stdio.h>
 
 #include "selinux-util.h"
+#include "string-util.h"
 #include "udev.h"
+#include "udev-util.h"
 
 static int adm_version(struct udev *udev, int argc, char *argv[]) {
-        printf("%s\n", VERSION);
+        printf("%s\n", PACKAGE_VERSION);
         return 0;
 }
 
@@ -87,13 +89,15 @@ int main(int argc, char *argv[]) {
         unsigned int i;
         int rc = 1, c;
 
+        udev_parse_config();
+        log_parse_environment();
+        log_open();
+
+        mac_selinux_init();
+
         udev = udev_new();
         if (udev == NULL)
                 goto out;
-
-        log_parse_environment();
-        log_open();
-        mac_selinux_init("/dev");
 
         while ((c = getopt_long(argc, argv, "+dhV", options, NULL)) >= 0)
                 switch (c) {

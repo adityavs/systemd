@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2004-2010 Kay Sievers <kay@vrfy.org>
  *
@@ -15,34 +16,36 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stddef.h>
-#include <string.h>
 #include <errno.h>
-#include <signal.h>
 #include <getopt.h>
-#include <time.h>
-#include <sys/time.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/epoll.h>
+#include <sys/time.h>
+#include <time.h>
 
-#include "udev.h"
+#include "fd-util.h"
+#include "format-util.h"
 #include "udev-util.h"
-#include "formats-util.h"
+#include "udev.h"
+#include "udevadm-util.h"
 
 static bool udev_exit;
 
 static void sig_handler(int signum) {
-        if (signum == SIGINT || signum == SIGTERM)
+        if (IN_SET(signum, SIGINT, SIGTERM))
                 udev_exit = true;
 }
 
 static void print_device(struct udev_device *device, const char *source, int prop) {
         struct timespec ts;
 
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        printf("%-6s[%"PRI_TIME".%06ld] %-8s %s (%s)\n",
+        assert_se(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+        printf("%-6s[%"PRI_TIME".%06"PRI_NSEC"] %-8s %s (%s)\n",
                source,
-               ts.tv_sec, ts.tv_nsec/1000,
+               ts.tv_sec, (nsec_t)ts.tv_nsec/1000,
                udev_device_get_action(device),
                udev_device_get_devpath(device),
                udev_device_get_subsystem(device));
@@ -58,10 +61,10 @@ static void print_device(struct udev_device *device, const char *source, int pro
 }
 
 static void help(void) {
-        printf("%s monitor [--property] [--kernel] [--udev] [--help]\n\n"
+        printf("%s monitor [OPTIONS]\n\n"
                "Listen to kernel and udev events.\n\n"
                "  -h --help                                Show this help\n"
-               "     --version                             Show package version\n"
+               "  -V --version                             Show package version\n"
                "  -p --property                            Print the event properties\n"
                "  -k --kernel                              Print kernel uevents\n"
                "  -u --udev                                Print udev events\n"
@@ -92,6 +95,7 @@ static int adm_monitor(struct udev *udev, int argc, char *argv[]) {
                 { "udev",            no_argument,       NULL, 'u' },
                 { "subsystem-match", required_argument, NULL, 's' },
                 { "tag-match",       required_argument, NULL, 't' },
+                { "version",         no_argument,       NULL, 'V' },
                 { "help",            no_argument,       NULL, 'h' },
                 {}
         };
@@ -99,7 +103,7 @@ static int adm_monitor(struct udev *udev, int argc, char *argv[]) {
         udev_list_init(udev, &subsystem_match_list, true);
         udev_list_init(udev, &tag_match_list, true);
 
-        while((c = getopt_long(argc, argv, "pekus:t:h", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "pekus:t:Vh", options, NULL)) >= 0)
                 switch (c) {
                 case 'p':
                 case 'e':
@@ -128,6 +132,9 @@ static int adm_monitor(struct udev *udev, int argc, char *argv[]) {
                 case 't':
                         udev_list_entry_add(&tag_match_list, optarg, NULL);
                         break;
+                case 'V':
+                        print_version();
+                        return 0;
                 case 'h':
                         help();
                         return 0;
@@ -143,12 +150,15 @@ static int adm_monitor(struct udev *udev, int argc, char *argv[]) {
         /* set signal handlers */
         act.sa_handler = sig_handler;
         act.sa_flags = SA_RESTART;
-        sigaction(SIGINT, &act, NULL);
-        sigaction(SIGTERM, &act, NULL);
-        sigemptyset(&mask);
-        sigaddset(&mask, SIGINT);
-        sigaddset(&mask, SIGTERM);
-        sigprocmask(SIG_UNBLOCK, &mask, NULL);
+        assert_se(sigaction(SIGINT, &act, NULL) == 0);
+        assert_se(sigaction(SIGTERM, &act, NULL) == 0);
+        assert_se(sigemptyset(&mask) == 0);
+        assert_se(sigaddset(&mask, SIGINT) == 0);
+        assert_se(sigaddset(&mask, SIGTERM) == 0);
+        assert_se(sigprocmask(SIG_UNBLOCK, &mask, NULL) == 0);
+
+        /* Callers are expecting to see events as they happen: Line buffering */
+        setlinebuf(stdout);
 
         fd_ep = epoll_create1(EPOLL_CLOEXEC);
         if (fd_ep < 0) {

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,12 +20,11 @@
 
 #include <stdio.h>
 #include <linux/audit.h>
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
 #  include <libaudit.h>
 #endif
 
-#include "audit-type.h"
-#include "macro.h"
 #include "missing.h"
-
+#include "audit-type.h"
 #include "audit_type-to-name.h"
+#include "macro.h"

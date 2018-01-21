@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,7 +20,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
 
 int memfd_new(const char *name);
 int memfd_new_and_map(const char *name, size_t sz, void **p);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,11 +21,16 @@
 ***/
 
 #include "sd-bus.h"
+
 #include "job.h"
 
 extern const sd_bus_vtable bus_job_vtable[];
 
 int bus_job_method_cancel(sd_bus_message *message, void *job, sd_bus_error *error);
+int bus_job_method_get_waiting_jobs(sd_bus_message *message, void *userdata, sd_bus_error *error);
 
 void bus_job_send_change_signal(Job *j);
 void bus_job_send_removed_signal(Job *j);
+
+int bus_job_coldplug_bus_track(Job *j);
+int bus_job_track_sender(Job *j, sd_bus_message *m);

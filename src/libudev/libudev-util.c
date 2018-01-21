@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,18 +18,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stddef.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "device-nodes.h"
 #include "libudev.h"
-#include "libudev-private.h"
-#include "utf8.h"
+
 #include "MurmurHash2.h"
+#include "device-nodes.h"
+#include "libudev-private.h"
+#include "syslog-util.h"
+#include "utf8.h"
 
 /**
  * SECTION:libudev-util
@@ -100,52 +103,6 @@ int util_resolve_subsys_kernel(struct udev *udev, const char *string,
         return 0;
 }
 
-ssize_t util_get_sys_core_link_value(struct udev *udev, const char *slink, const char *syspath, char *value, size_t size)
-{
-        char path[UTIL_PATH_SIZE];
-        char target[UTIL_PATH_SIZE];
-        ssize_t len;
-        const char *pos;
-
-        strscpyl(path, sizeof(path), syspath, "/", slink, NULL);
-        len = readlink(path, target, sizeof(target));
-        if (len <= 0 || len == (ssize_t)sizeof(target))
-                return -1;
-        target[len] = '\0';
-        pos = strrchr(target, '/');
-        if (pos == NULL)
-                return -1;
-        pos = &pos[1];
-        return strscpy(value, size, pos);
-}
-
-int util_resolve_sys_link(struct udev *udev, char *syspath, size_t size)
-{
-        char link_target[UTIL_PATH_SIZE];
-
-        ssize_t len;
-        int i;
-        int back;
-        char *base = NULL;
-
-        len = readlink(syspath, link_target, sizeof(link_target));
-        if (len <= 0 || len == (ssize_t)sizeof(link_target))
-                return -1;
-        link_target[len] = '\0';
-
-        for (back = 0; startswith(&link_target[back * 3], "../"); back++)
-                ;
-        for (i = 0; i <= back; i++) {
-                base = strrchr(syspath, '/');
-                if (base == NULL)
-                        return -EINVAL;
-                base[0] = '\0';
-        }
-
-        strscpyl(base, size - (base - syspath), "/", &link_target[back * 3], NULL);
-        return 0;
-}
-
 int util_log_priority(const char *priority)
 {
         char *endptr;
@@ -194,17 +151,20 @@ size_t util_path_encode(const char *src, char *dest, size_t size)
         return j;
 }
 
-void util_remove_trailing_chars(char *path, char c)
-{
-        size_t len;
-
-        if (path == NULL)
-                return;
-        len = strlen(path);
-        while (len > 0 && path[len-1] == c)
-                path[--len] = '\0';
-}
-
+/*
+ * Copy from 'str' to 'to', while removing all leading and trailing whitespace,
+ * and replacing each run of consecutive whitespace with a single underscore.
+ * The chars from 'str' are copied up to the \0 at the end of the string, or
+ * at most 'len' chars.  This appends \0 to 'to', at the end of the copied
+ * characters.
+ *
+ * If 'len' chars are copied into 'to', the final \0 is placed at len+1
+ * (i.e. 'to[len] = \0'), so the 'to' buffer must have at least len+1
+ * chars available.
+ *
+ * Note this may be called with 'str' == 'to', i.e. to replace whitespace
+ * in-place in a buffer.  This function can handle that situation.
+ */
 int util_replace_whitespace(const char *str, char *to, size_t len)
 {
         size_t i, j;
@@ -230,7 +190,7 @@ int util_replace_whitespace(const char *str, char *to, size_t len)
                 to[j++] = str[i++];
         }
         to[j] = '\0';
-        return 0;
+        return j;
 }
 
 /* allow chars in whitelist, plain ascii, hex-escaping and valid utf8 */

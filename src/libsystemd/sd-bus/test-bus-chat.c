@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,21 +18,23 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <fcntl.h>
-
-#include "log.h"
-#include "util.h"
-#include "macro.h"
-#include "formats-util.h"
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
-#include "bus-match.h"
 #include "bus-internal.h"
+#include "bus-match.h"
 #include "bus-util.h"
+#include "fd-util.h"
+#include "format-util.h"
+#include "log.h"
+#include "macro.h"
+#include "util.h"
 
 static int match_callback(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
         log_info("Match triggered! interface=%s member=%s", strna(sd_bus_message_get_interface(m)), strna(sd_bus_message_get_member(m)));
@@ -101,9 +102,9 @@ static int server_init(sd_bus **_bus) {
                 goto fail;
         }
 
-        r = sd_bus_add_match(bus, NULL, "type='signal',interface='foo.bar',member='Notify'", match_callback, NULL);
+        r = sd_bus_match_signal(bus, NULL, NULL, NULL, "foo.bar", "Notify", match_callback, NULL);
         if (r < 0) {
-                log_error_errno(r, "Failed to add match: %m");
+                log_error_errno(r, "Failed to request match: %m");
                 goto fail;
         }
 
@@ -119,9 +120,7 @@ static int server_init(sd_bus **_bus) {
         return 0;
 
 fail:
-        if (bus)
-                sd_bus_unref(bus);
-
+        sd_bus_unref(bus);
         return r;
 }
 
@@ -130,7 +129,7 @@ static int server(sd_bus *bus) {
         bool client1_gone = false, client2_gone = false;
 
         while (!client1_gone || !client2_gone) {
-                _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
                 pid_t pid = 0;
                 const char *label = NULL;
 
@@ -261,9 +260,9 @@ fail:
 }
 
 static void* client1(void*p) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *hello;
         int r;
         _cleanup_close_pair_ int pp[2] = { -1, -1 };
@@ -331,7 +330,7 @@ static void* client1(void*p) {
 
 finish:
         if (bus) {
-                _cleanup_bus_message_unref_ sd_bus_message *q;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *q;
 
                 r = sd_bus_message_new_method_call(
                                 bus,
@@ -353,16 +352,16 @@ finish:
 static int quit_callback(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
         bool *x = userdata;
 
-        log_error("Quit callback: %s", strerror(sd_bus_message_get_errno(m)));
+        log_error_errno(sd_bus_message_get_errno(m), "Quit callback: %m");
 
         *x = 1;
         return 1;
 }
 
 static void* client2(void*p) {
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL, *reply = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         bool quit = false;
         const char *mid;
         int r;
@@ -499,7 +498,7 @@ static void* client2(void*p) {
 
 finish:
         if (bus) {
-                _cleanup_bus_message_unref_ sd_bus_message *q;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *q;
 
                 r = sd_bus_message_new_method_call(
                                 bus,

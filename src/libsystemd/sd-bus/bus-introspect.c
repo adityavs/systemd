@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,11 +18,16 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "bus-introspect.h"
-#include "bus-signature.h"
+#include <stdio_ext.h>
+
 #include "bus-internal.h"
+#include "bus-introspect.h"
 #include "bus-protocol.h"
+#include "bus-signature.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "string-util.h"
+#include "util.h"
 
 int introspect_begin(struct introspect *i, bool trusted) {
         assert(i);
@@ -34,6 +38,8 @@ int introspect_begin(struct introspect *i, bool trusted) {
         i->f = open_memstream(&i->introspection, &i->size);
         if (!i->f)
                 return -ENOMEM;
+
+        (void) __fsetlocking(i->f, FSETLOCKING_BYCALLER);
 
         fputs(BUS_INTROSPECT_DOCTYPE
               "<node>\n", i->f);
@@ -80,7 +86,10 @@ static void introspect_write_flags(struct introspect *i, int type, int flags) {
         if (type == _SD_BUS_VTABLE_METHOD && (flags & SD_BUS_VTABLE_METHOD_NO_REPLY))
                 fputs("   <annotation name=\"org.freedesktop.DBus.Method.NoReply\" value=\"true\"/>\n", i->f);
 
-        if (type == _SD_BUS_VTABLE_PROPERTY || type == _SD_BUS_VTABLE_WRITABLE_PROPERTY) {
+        if (IN_SET(type, _SD_BUS_VTABLE_PROPERTY, _SD_BUS_VTABLE_WRITABLE_PROPERTY)) {
+                if (flags & SD_BUS_VTABLE_PROPERTY_EXPLICIT)
+                        fputs("   <annotation name=\"org.freedesktop.systemd1.Explicit\" value=\"true\"/>\n", i->f);
+
                 if (flags & SD_BUS_VTABLE_PROPERTY_CONST)
                         fputs("   <annotation name=\"org.freedesktop.DBus.Property.EmitsChangedSignal\" value=\"const\"/>\n", i->f);
                 else if (flags & SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION)
@@ -90,7 +99,7 @@ static void introspect_write_flags(struct introspect *i, int type, int flags) {
         }
 
         if (!i->trusted &&
-            (type == _SD_BUS_VTABLE_METHOD || type == _SD_BUS_VTABLE_WRITABLE_PROPERTY) &&
+            IN_SET(type, _SD_BUS_VTABLE_METHOD, _SD_BUS_VTABLE_WRITABLE_PROPERTY) &&
             !(flags & SD_BUS_VTABLE_UNPRIVILEGED))
                 fputs("   <annotation name=\"org.freedesktop.systemd1.Privileged\" value=\"true\"/>\n", i->f);
 }
@@ -179,10 +188,10 @@ int introspect_finish(struct introspect *i, sd_bus *bus, sd_bus_message *m, sd_b
         assert(reply);
 
         fputs("</node>\n", i->f);
-        fflush(i->f);
 
-        if (ferror(i->f))
-                return -ENOMEM;
+        r = fflush_and_check(i->f);
+        if (r < 0)
+                return r;
 
         r = sd_bus_message_new_method_return(m, &q);
         if (r < 0)
@@ -201,11 +210,8 @@ int introspect_finish(struct introspect *i, sd_bus *bus, sd_bus_message *m, sd_b
 void introspect_free(struct introspect *i) {
         assert(i);
 
-        if (i->f)
-                fclose(i->f);
+        safe_fclose(i->f);
 
-        if (i->introspection)
-                free(i->introspection);
-
+        free(i->introspection);
         zero(*i);
 }

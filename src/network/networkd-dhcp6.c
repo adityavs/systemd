@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,17 +20,246 @@
 
 #include <netinet/ether.h>
 #include <linux/if.h>
+#include "sd-radv.h"
 
-#include "networkd-link.h"
-#include "network-internal.h"
-
-#include "sd-icmp6-nd.h"
 #include "sd-dhcp6-client.h"
+
+#include "hashmap.h"
+#include "hostname-util.h"
+#include "network-internal.h"
+#include "networkd-link.h"
+#include "networkd-manager.h"
+#include "siphash24.h"
+#include "string-util.h"
+#include "radv-internal.h"
 
 static int dhcp6_lease_address_acquired(sd_dhcp6_client *client, Link *link);
 
+static bool dhcp6_verify_link(Link *link) {
+        if (!link->network) {
+                log_link_info(link, "Link is not managed by us");
+                return false;
+        }
+
+        if (!IN_SET(link->network->router_prefix_delegation,
+                            RADV_PREFIX_DELEGATION_DHCP6,
+                            RADV_PREFIX_DELEGATION_BOTH)) {
+                log_link_debug(link, "Link does not request DHCPv6 prefix delegation");
+                return false;
+        }
+
+        return true;
+}
+
+static bool dhcp6_enable_prefix_delegation(Link *dhcp6_link) {
+        Manager *manager;
+        Link *l;
+        Iterator i;
+
+        assert(dhcp6_link);
+
+        manager = dhcp6_link->manager;
+        assert(manager);
+
+        HASHMAP_FOREACH(l, manager->links, i) {
+                if (l == dhcp6_link)
+                        continue;
+
+                if (!dhcp6_verify_link(l))
+                        continue;
+
+                return true;
+        }
+
+        return false;
+}
+
 static int dhcp6_lease_information_acquired(sd_dhcp6_client *client,
                                         Link *link) {
+        return 0;
+}
+
+static int dhcp6_pd_prefix_assign(Link *link, struct in6_addr *prefix,
+                                  uint8_t prefix_len,
+                                  uint32_t lifetime_preferred,
+                                  uint32_t lifetime_valid) {
+        sd_radv *radv = link->radv;
+        int r;
+        _cleanup_(sd_radv_prefix_unrefp) sd_radv_prefix *p = NULL;
+
+        r = sd_radv_prefix_new(&p);
+        if (r < 0)
+                return r;
+
+        r = sd_radv_prefix_set_prefix(p, prefix, prefix_len);
+        if (r < 0)
+                return r;
+
+        r = sd_radv_prefix_set_preferred_lifetime(p, lifetime_preferred);
+        if (r < 0)
+                return r;
+
+        r = sd_radv_prefix_set_valid_lifetime(p, lifetime_valid);
+        if (r < 0)
+                return r;
+
+        r = sd_radv_stop(radv);
+        if (r < 0)
+                return r;
+
+        r = sd_radv_add_prefix(radv, p, true);
+        if (r < 0 && r != -EEXIST)
+                return r;
+
+        r = manager_dhcp6_prefix_add(link->manager, &p->opt.in6_addr, link);
+        if (r < 0)
+                return r;
+
+        return sd_radv_start(radv);
+}
+
+static Network *dhcp6_reset_pd_prefix_network(Link *link) {
+        assert(link);
+        assert(link->manager);
+        assert(link->manager->networks);
+
+        return link->manager->networks;
+}
+
+static int dhcp6_pd_prefix_distribute(Link *dhcp6_link, Iterator *i,
+                                      struct in6_addr *pd_prefix,
+                                      uint8_t pd_prefix_len,
+                                      uint32_t lifetime_preferred,
+                                      uint32_t lifetime_valid) {
+        Link *link;
+        Manager *manager = dhcp6_link->manager;
+        union in_addr_union prefix;
+        uint8_t n_prefixes, n_used = 0;
+        _cleanup_free_ char *buf = NULL;
+        int r;
+
+        assert(manager);
+        assert(pd_prefix_len <= 64);
+
+        prefix.in6 = *pd_prefix;
+
+        r = in_addr_mask(AF_INET6, &prefix, pd_prefix_len);
+        if (r < 0)
+                return r;
+
+        n_prefixes = 1 << (64 - pd_prefix_len);
+
+        (void) in_addr_to_string(AF_INET6, &prefix, &buf);
+        log_link_debug(dhcp6_link, "Assigning up to %u prefixes from %s/%u",
+                       n_prefixes, strnull(buf), pd_prefix_len);
+
+        while (hashmap_iterate(manager->links, i, (void **)&link, NULL)) {
+                Link *assigned_link;
+
+                if (n_used == n_prefixes) {
+                        log_link_debug(dhcp6_link, "Assigned %u/%u prefixes from %s/%u",
+                                       n_used, n_prefixes, strnull(buf), pd_prefix_len);
+
+                        return -EAGAIN;
+                }
+
+                if (link == dhcp6_link)
+                        continue;
+
+                if (!dhcp6_verify_link(link))
+                        continue;
+
+                assigned_link = manager_dhcp6_prefix_get(manager, &prefix.in6);
+                if (assigned_link != NULL && assigned_link != link)
+                        continue;
+
+                r = dhcp6_pd_prefix_assign(link, &prefix.in6, 64,
+                                           lifetime_preferred, lifetime_valid);
+                if (r < 0) {
+                        log_link_error_errno(link, r, "Unable to %s prefix %s/%u for link: %m",
+                                             assigned_link ? "update": "assign",
+                                             strnull(buf), pd_prefix_len);
+
+                        if (assigned_link == NULL)
+                                continue;
+
+                } else
+                        log_link_debug(link, "Assigned prefix %u/%u %s/64 to link",
+                                       n_used + 1, n_prefixes, strnull(buf));
+
+                n_used++;
+
+                r = in_addr_prefix_next(AF_INET6, &prefix, pd_prefix_len);
+                if (r < 0 && n_used < n_prefixes)
+                        return r;
+        }
+
+        if (n_used < n_prefixes) {
+                Route *route;
+                int n = n_used;
+
+                r = route_new(&route);
+                if (r < 0)
+                        return r;
+
+                while (n < n_prefixes) {
+                        route_update(route, &prefix, pd_prefix_len, NULL, NULL,
+                                     0, 0, RTN_UNREACHABLE);
+
+                        r = route_configure(route, link, NULL);
+                        if (r < 0) {
+                                route_free(route);
+                                return r;
+                        }
+
+                        r = in_addr_prefix_next(AF_INET6, &prefix, pd_prefix_len);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        return n_used;
+}
+
+static int dhcp6_lease_pd_prefix_acquired(sd_dhcp6_client *client, Link *link) {
+        int r;
+        sd_dhcp6_lease *lease;
+        struct in6_addr pd_prefix;
+        uint8_t pd_prefix_len;
+        uint32_t lifetime_preferred, lifetime_valid;
+        _cleanup_free_ char *buf = NULL;
+        Iterator i = ITERATOR_FIRST;
+
+        r = sd_dhcp6_client_get_lease(client, &lease);
+        if (r < 0)
+                return r;
+
+        (void) in_addr_to_string(AF_INET6, (union in_addr_union*) &pd_prefix, &buf);
+
+        dhcp6_reset_pd_prefix_network(link);
+        sd_dhcp6_lease_reset_pd_prefix_iter(lease);
+
+        while (sd_dhcp6_lease_get_pd(lease, &pd_prefix, &pd_prefix_len,
+                                     &lifetime_preferred,
+                                     &lifetime_valid) >= 0) {
+
+                if (pd_prefix_len > 64) {
+                        log_link_debug(link, "PD Prefix length > 64, ignoring prefix %s/%u",
+                                       strnull(buf), pd_prefix_len);
+                        continue;
+                }
+
+                r = dhcp6_pd_prefix_distribute(link, &i, &pd_prefix,
+                                               pd_prefix_len,
+                                               lifetime_preferred,
+                                               lifetime_valid);
+                if (r < 0 && r != -EAGAIN)
+                        return r;
+
+                if (r >= 0)
+                        i = ITERATOR_FIRST;
+        }
+
         return 0;
 }
 
@@ -53,24 +281,27 @@ static int dhcp6_address_handler(sd_netlink *rtnl, sd_netlink_message *m,
                         return 1;
                 }
 
-                log_link_error(link, "Could not set DHCPv6 address: %s",
-                               strerror(-r));
+                log_link_error_errno(link, r, "Could not set DHCPv6 address: %m");
 
                 link_enter_failed(link);
 
         } else if (r >= 0)
-                link_rtnl_process_address(rtnl, m, link->manager);
+                manager_rtnl_process_address(rtnl, m, link->manager);
 
         return 1;
 }
 
-static int dhcp6_address_update(Link *link, struct in6_addr *ip6_addr,
-                                uint8_t prefixlen, uint32_t lifetime_preferred,
-                                uint32_t lifetime_valid) {
-        int r;
-        _cleanup_address_free_ Address *addr = NULL;
+static int dhcp6_address_change(
+                Link *link,
+                struct in6_addr *ip6_addr,
+                uint32_t lifetime_preferred,
+                uint32_t lifetime_valid) {
 
-        r = address_new_dynamic(&addr);
+        _cleanup_address_free_ Address *addr = NULL;
+        char buffer[INET6_ADDRSTRLEN];
+        int r;
+
+        r = address_new(&addr);
         if (r < 0)
                 return r;
 
@@ -78,17 +309,17 @@ static int dhcp6_address_update(Link *link, struct in6_addr *ip6_addr,
         memcpy(&addr->in_addr.in6, ip6_addr, sizeof(*ip6_addr));
 
         addr->flags = IFA_F_NOPREFIXROUTE;
-        addr->prefixlen = prefixlen;
+        addr->prefixlen = 128;
 
         addr->cinfo.ifa_prefered = lifetime_preferred;
         addr->cinfo.ifa_valid = lifetime_valid;
 
         log_link_info(link,
-                      "DHCPv6 address "SD_ICMP6_ADDRESS_FORMAT_STR"/%d timeout preferred %d valid %d",
-                      SD_ICMP6_ADDRESS_FORMAT_VAL(addr->in_addr.in6),
+                      "DHCPv6 address %s/%d timeout preferred %d valid %d",
+                      inet_ntop(AF_INET6, &addr->in_addr.in6, buffer, sizeof(buffer)),
                       addr->prefixlen, lifetime_preferred, lifetime_valid);
 
-        r = address_update(addr, link, dhcp6_address_handler);
+        r = address_configure(addr, link, dhcp6_address_handler, true);
         if (r < 0)
                 log_link_warning_errno(link, r, "Could not assign DHCPv6 address: %m");
 
@@ -100,7 +331,6 @@ static int dhcp6_lease_address_acquired(sd_dhcp6_client *client, Link *link) {
         sd_dhcp6_lease *lease;
         struct in6_addr ip6_addr;
         uint32_t lifetime_preferred, lifetime_valid;
-        uint8_t prefixlen;
 
         r = sd_dhcp6_client_get_lease(client, &lease);
         if (r < 0)
@@ -109,22 +339,10 @@ static int dhcp6_lease_address_acquired(sd_dhcp6_client *client, Link *link) {
         sd_dhcp6_lease_reset_address_iter(lease);
 
         while (sd_dhcp6_lease_get_address(lease, &ip6_addr,
-                                                &lifetime_preferred,
-                                                &lifetime_valid) >= 0) {
+                                                 &lifetime_preferred,
+                                                 &lifetime_valid) >= 0) {
 
-                r = sd_icmp6_ra_get_prefixlen(link->icmp6_router_discovery,
-                                        &ip6_addr, &prefixlen);
-                if (r < 0 && r != -EADDRNOTAVAIL) {
-                        log_link_warning(link, "Could not get prefix information: %s",
-                                        strerror(-r));
-                        return r;
-                }
-
-                if (r == -EADDRNOTAVAIL)
-                        prefixlen = 128;
-
-                r = dhcp6_address_update(link, &ip6_addr, prefixlen,
-                                        lifetime_preferred, lifetime_valid);
+                r = dhcp6_address_change(link, &ip6_addr, lifetime_preferred, lifetime_valid);
                 if (r < 0)
                         return r;
         }
@@ -138,241 +356,178 @@ static void dhcp6_handler(sd_dhcp6_client *client, int event, void *userdata) {
 
         assert(link);
         assert(link->network);
-        assert(link->manager);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
                 return;
 
         switch(event) {
-        case DHCP6_EVENT_STOP:
-        case DHCP6_EVENT_RESEND_EXPIRE:
-        case DHCP6_EVENT_RETRANS_MAX:
-                log_link_debug(link, "DHCPv6 event %d", event);
+        case SD_DHCP6_CLIENT_EVENT_STOP:
+        case SD_DHCP6_CLIENT_EVENT_RESEND_EXPIRE:
+        case SD_DHCP6_CLIENT_EVENT_RETRANS_MAX:
+                if (sd_dhcp6_client_get_lease(client, NULL) >= 0)
+                        log_link_warning(link, "DHCPv6 lease lost");
+
+                (void) manager_dhcp6_prefix_remove_all(link->manager, link);
+
+                link->dhcp6_configured = false;
                 break;
 
-        case DHCP6_EVENT_IP_ACQUIRE:
+        case SD_DHCP6_CLIENT_EVENT_IP_ACQUIRE:
                 r = dhcp6_lease_address_acquired(client, link);
                 if (r < 0) {
                         link_enter_failed(link);
                         return;
                 }
 
-                /* fall through */
-        case DHCP6_EVENT_INFORMATION_REQUEST:
+                r = dhcp6_lease_pd_prefix_acquired(client, link);
+                if (r < 0)
+                        log_link_debug(link, "DHCPv6 did not receive prefixes to delegate");
+
+                _fallthrough_;
+        case SD_DHCP6_CLIENT_EVENT_INFORMATION_REQUEST:
                 r = dhcp6_lease_information_acquired(client, link);
                 if (r < 0) {
                         link_enter_failed(link);
                         return;
                 }
 
+                link->dhcp6_configured = true;
                 break;
 
         default:
                 if (event < 0)
-                        log_link_warning(link, "DHCPv6 error: %s",
-                                         strerror(-event));
+                        log_link_warning_errno(link, event, "DHCPv6 error: %m");
                 else
-                        log_link_warning(link, "DHCPv6 unknown event: %d",
-                                         event);
+                        log_link_warning(link, "DHCPv6 unknown event: %d", event);
                 return;
         }
+
+        link_check_ready(link);
 }
 
-static int dhcp6_configure(Link *link, int event) {
-        int r;
-        bool information_request;
+int dhcp6_request_address(Link *link, int ir) {
+        int r, inf_req;
+        bool running;
 
-        assert_return(link, -EINVAL);
+        assert(link);
+        assert(link->dhcp6_client);
+        assert(in_addr_is_link_local(AF_INET6, (const union in_addr_union*)&link->ipv6ll_address) > 0);
 
-        if (link->dhcp6_client) {
-                if (event != ICMP6_EVENT_ROUTER_ADVERTISMENT_MANAGED)
-                        return 0;
-
-                r = sd_dhcp6_client_get_information_request(link->dhcp6_client,
-                                                        &information_request);
-                if (r < 0) {
-                        log_link_warning(link, "Could not get DHCPv6 Information request setting: %s",
-                                        strerror(-r));
-                        link->dhcp6_client =
-                                sd_dhcp6_client_unref(link->dhcp6_client);
-                        return r;
-                }
-
-                if (!information_request)
-                        return r;
-
-                r = sd_dhcp6_client_set_information_request(link->dhcp6_client,
-                                                        false);
-                if (r < 0) {
-                        log_link_warning(link, "Could not unset DHCPv6 Information request: %s",
-                                        strerror(-r));
-                        link->dhcp6_client =
-                                sd_dhcp6_client_unref(link->dhcp6_client);
-                        return r;
-                }
-
-                r = sd_dhcp6_client_start(link->dhcp6_client);
-                if (r < 0) {
-                        log_link_warning(link, "Could not restart DHCPv6 after enabling Information request: %s",
-                                        strerror(-r));
-                        link->dhcp6_client =
-                                sd_dhcp6_client_unref(link->dhcp6_client);
-                        return r;
-                }
-
-                return r;
-        }
-
-        r = sd_dhcp6_client_new(&link->dhcp6_client);
+        r = sd_dhcp6_client_is_running(link->dhcp6_client);
         if (r < 0)
                 return r;
+        else
+                running = !!r;
 
-        r = sd_dhcp6_client_attach_event(link->dhcp6_client, NULL, 0);
-        if (r < 0) {
-                link->dhcp6_client = sd_dhcp6_client_unref(link->dhcp6_client);
-                return r;
-        }
-
-        r = sd_dhcp6_client_set_mac(link->dhcp6_client,
-                                    (const uint8_t *) &link->mac,
-                                    sizeof (link->mac), ARPHRD_ETHER);
-        if (r < 0) {
-                link->dhcp6_client = sd_dhcp6_client_unref(link->dhcp6_client);
-                return r;
-        }
-
-        r = sd_dhcp6_client_set_index(link->dhcp6_client, link->ifindex);
-        if (r < 0) {
-                link->dhcp6_client = sd_dhcp6_client_unref(link->dhcp6_client);
-                return r;
-        }
-
-        r = sd_dhcp6_client_set_callback(link->dhcp6_client, dhcp6_handler,
-                                         link);
-        if (r < 0) {
-                link->dhcp6_client = sd_dhcp6_client_unref(link->dhcp6_client);
-                return r;
-        }
-
-        if (event == ICMP6_EVENT_ROUTER_ADVERTISMENT_OTHER) {
-                r = sd_dhcp6_client_set_information_request(link->dhcp6_client,
-                                                        true);
-                if (r < 0) {
-                        link->dhcp6_client =
-                                sd_dhcp6_client_unref(link->dhcp6_client);
+        if (running) {
+                r = sd_dhcp6_client_get_information_request(link->dhcp6_client, &inf_req);
+                if (r < 0)
                         return r;
-                }
+
+                if (inf_req == ir)
+                        return 0;
+
+                r = sd_dhcp6_client_stop(link->dhcp6_client);
+                if (r < 0)
+                        return r;
+        } else {
+                r = sd_dhcp6_client_set_local_address(link->dhcp6_client, &link->ipv6ll_address);
+                if (r < 0)
+                        return r;
         }
+
+        r = sd_dhcp6_client_set_information_request(link->dhcp6_client, ir);
+        if (r < 0)
+                return r;
 
         r = sd_dhcp6_client_start(link->dhcp6_client);
         if (r < 0)
-                link->dhcp6_client = sd_dhcp6_client_unref(link->dhcp6_client);
-
-        return r;
-}
-
-static int dhcp6_prefix_expired(Link *link) {
-        int r;
-        sd_dhcp6_lease *lease;
-        struct in6_addr *expired_prefix, ip6_addr;
-        uint8_t expired_prefixlen;
-        uint32_t lifetime_preferred, lifetime_valid;
-
-        r = sd_icmp6_ra_get_expired_prefix(link->icmp6_router_discovery,
-                                        &expired_prefix, &expired_prefixlen);
-        if (r < 0)
                 return r;
-
-        r = sd_dhcp6_client_get_lease(link->dhcp6_client, &lease);
-        if (r < 0)
-                return r;
-
-        log_link_info(link, "IPv6 prefix "SD_ICMP6_ADDRESS_FORMAT_STR"/%d expired",
-                      SD_ICMP6_ADDRESS_FORMAT_VAL(*expired_prefix),
-                      expired_prefixlen);
-
-        sd_dhcp6_lease_reset_address_iter(lease);
-
-        while (sd_dhcp6_lease_get_address(lease, &ip6_addr,
-                                                &lifetime_preferred,
-                                                &lifetime_valid) >= 0) {
-
-                r = sd_icmp6_prefix_match(expired_prefix, expired_prefixlen,
-                                        &ip6_addr);
-                if (r < 0)
-                        continue;
-
-                log_link_info(link, "IPv6 prefix length updated "SD_ICMP6_ADDRESS_FORMAT_STR"/%d", SD_ICMP6_ADDRESS_FORMAT_VAL(ip6_addr), 128);
-
-                dhcp6_address_update(link, &ip6_addr, 128, lifetime_preferred, lifetime_valid);
-        }
 
         return 0;
 }
 
-static void icmp6_router_handler(sd_icmp6_nd *nd, int event, void *userdata) {
-        Link *link = userdata;
-
-        assert(link);
-        assert(link->network);
-        assert(link->manager);
-
-        if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
-                return;
-
-        switch(event) {
-        case ICMP6_EVENT_ROUTER_ADVERTISMENT_NONE:
-                return;
-
-        case ICMP6_EVENT_ROUTER_ADVERTISMENT_TIMEOUT:
-        case ICMP6_EVENT_ROUTER_ADVERTISMENT_OTHER:
-        case ICMP6_EVENT_ROUTER_ADVERTISMENT_MANAGED:
-                dhcp6_configure(link, event);
-
-                break;
-
-        case ICMP6_EVENT_ROUTER_ADVERTISMENT_PREFIX_EXPIRED:
-                if (!link->rtnl_extended_attrs)
-                        dhcp6_prefix_expired(link);
-
-                break;
-
-        default:
-                if (event < 0)
-                        log_link_warning(link, "ICMPv6 error: %s",
-                                         strerror(-event));
-                else
-                        log_link_warning(link, "ICMPv6 unknown event: %d",
-                                         event);
-
-                break;
-        }
-
-}
-
-int icmp6_configure(Link *link) {
+static int dhcp6_set_hostname(sd_dhcp6_client *client, Link *link) {
+        _cleanup_free_ char *hostname = NULL;
+        const char *hn;
         int r;
 
-        assert_return(link, -EINVAL);
+        assert(link);
 
-        r = sd_icmp6_nd_new(&link->icmp6_router_discovery);
+        if (!link->network->dhcp_send_hostname)
+                hn = NULL;
+        else if (link->network->dhcp_hostname)
+                hn = link->network->dhcp_hostname;
+        else {
+                r = gethostname_strict(&hostname);
+                if (r < 0 && r != -ENXIO) /* ENXIO: no hostname set or hostname is "localhost" */
+                        return r;
+
+                hn = hostname;
+        }
+
+        return sd_dhcp6_client_set_fqdn(client, hn);
+}
+
+int dhcp6_configure(Link *link) {
+        sd_dhcp6_client *client = NULL;
+        int r;
+        const DUID *duid;
+
+        assert(link);
+
+        if (link->dhcp6_client)
+                return 0;
+
+        r = sd_dhcp6_client_new(&client);
         if (r < 0)
                 return r;
 
-        r = sd_icmp6_nd_attach_event(link->icmp6_router_discovery, NULL, 0);
+        r = sd_dhcp6_client_attach_event(client, NULL, 0);
         if (r < 0)
-                return r;
+                goto error;
 
-        r = sd_icmp6_nd_set_mac(link->icmp6_router_discovery, &link->mac);
+        r = sd_dhcp6_client_set_mac(client,
+                                    (const uint8_t *) &link->mac,
+                                    sizeof (link->mac), ARPHRD_ETHER);
         if (r < 0)
-                return r;
+                goto error;
 
-        r = sd_icmp6_nd_set_index(link->icmp6_router_discovery, link->ifindex);
+        r = sd_dhcp6_client_set_iaid(client, link->network->iaid);
         if (r < 0)
-                return r;
+                goto error;
 
-        r = sd_icmp6_nd_set_callback(link->icmp6_router_discovery,
-                                icmp6_router_handler, link);
+        duid = link_duid(link);
+        r = sd_dhcp6_client_set_duid(client,
+                                     duid->type,
+                                     duid->raw_data_len > 0 ? duid->raw_data : NULL,
+                                     duid->raw_data_len);
+        if (r < 0)
+                goto error;
 
+        r = dhcp6_set_hostname(client, link);
+        if (r < 0)
+                goto error;
+
+        r = sd_dhcp6_client_set_ifindex(client, link->ifindex);
+        if (r < 0)
+                goto error;
+
+        r = sd_dhcp6_client_set_callback(client, dhcp6_handler, link);
+        if (r < 0)
+                goto error;
+
+        if (dhcp6_enable_prefix_delegation(link)) {
+                r = sd_dhcp6_client_set_prefix_delegation(client, true);
+                if (r < 0)
+                        goto error;
+        }
+
+        link->dhcp6_client = client;
+
+        return 0;
+
+error:
+        sd_dhcp6_client_unref(client);
         return r;
 }

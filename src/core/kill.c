@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "signal-util.h"
 #include "kill.h"
+#include "signal-util.h"
+#include "string-table.h"
+#include "util.h"
 
 void kill_context_init(KillContext *c) {
         assert(c);
@@ -34,8 +34,7 @@ void kill_context_init(KillContext *c) {
 void kill_context_dump(KillContext *c, FILE *f, const char *prefix) {
         assert(c);
 
-        if (!prefix)
-                prefix = "";
+        prefix = strempty(prefix);
 
         fprintf(f,
                 "%sKillMode: %s\n"
@@ -60,7 +59,10 @@ DEFINE_STRING_TABLE_LOOKUP(kill_mode, KillMode);
 static const char* const kill_who_table[_KILL_WHO_MAX] = {
         [KILL_MAIN] = "main",
         [KILL_CONTROL] = "control",
-        [KILL_ALL] = "all"
+        [KILL_ALL] = "all",
+        [KILL_MAIN_FAIL] = "main-fail",
+        [KILL_CONTROL_FAIL] = "control-fail",
+        [KILL_ALL_FAIL] = "all-fail"
 };
 
 DEFINE_STRING_TABLE_LOOKUP(kill_who, KillWho);

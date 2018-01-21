@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,18 +18,25 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <string.h>
-#include <unistd.h>
 #include <errno.h>
-#include <sys/stat.h>
+#include <netinet/in.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "log.h"
 #include "macro.h"
-#include "util.h"
-#include "mkdir.h"
 #include "missing.h"
+#include "mkdir.h"
 #include "selinux-util.h"
 #include "socket-util.h"
+#include "umask-util.h"
 
 int socket_address_listen(
                 const SocketAddress *a,
@@ -38,6 +44,7 @@ int socket_address_listen(
                 int backlog,
                 SocketAddressBindIPv6Only only,
                 const char *bind_to_device,
+                bool reuse_port,
                 bool free_bind,
                 bool transparent,
                 mode_t directory_mode,
@@ -45,6 +52,7 @@ int socket_address_listen(
                 const char *label) {
 
         _cleanup_close_ int fd = -1;
+        const char *p;
         int r, one;
 
         assert(a);
@@ -78,10 +86,16 @@ int socket_address_listen(
                         return -errno;
         }
 
-        if (socket_address_family(a) == AF_INET || socket_address_family(a) == AF_INET6) {
+        if (IN_SET(socket_address_family(a), AF_INET, AF_INET6)) {
                 if (bind_to_device)
                         if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, bind_to_device, strlen(bind_to_device)+1) < 0)
                                 return -errno;
+
+                if (reuse_port) {
+                        one = 1;
+                        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0)
+                                log_warning_errno(errno, "SO_REUSEPORT failed: %m");
+                }
 
                 if (free_bind) {
                         one = 1;
@@ -100,33 +114,38 @@ int socket_address_listen(
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0)
                 return -errno;
 
-        if (socket_address_family(a) == AF_UNIX && a->sockaddr.un.sun_path[0] != 0) {
-                mode_t old_mask;
-
+        p = socket_address_get_path(a);
+        if (p) {
                 /* Create parents */
-                mkdir_parents_label(a->sockaddr.un.sun_path, directory_mode);
+                (void) mkdir_parents_label(p, directory_mode);
 
                 /* Enforce the right access mode for the socket */
-                old_mask = umask(~ socket_mode);
+                RUN_WITH_UMASK(~socket_mode) {
+                        r = mac_selinux_bind(fd, &a->sockaddr.sa, a->size);
+                        if (r == -EADDRINUSE) {
+                                /* Unlink and try again */
 
-                r = mac_selinux_bind(fd, &a->sockaddr.sa, a->size);
+                                if (unlink(p) < 0)
+                                        return r; /* didn't work, return original error */
 
-                if (r < 0 && errno == EADDRINUSE) {
-                        /* Unlink and try again */
-                        unlink(a->sockaddr.un.sun_path);
-                        r = bind(fd, &a->sockaddr.sa, a->size);
+                                r = mac_selinux_bind(fd, &a->sockaddr.sa, a->size);
+                        }
+                        if (r < 0)
+                                return r;
                 }
-
-                umask(old_mask);
-        } else
-                r = bind(fd, &a->sockaddr.sa, a->size);
-
-        if (r < 0)
-                return -errno;
+        } else {
+                if (bind(fd, &a->sockaddr.sa, a->size) < 0)
+                        return -errno;
+        }
 
         if (socket_address_can_accept(a))
                 if (listen(fd, backlog) < 0)
                         return -errno;
+
+        /* Let's trigger an inotify event on the socket node, so that anyone waiting for this socket to be connectable
+         * gets notified */
+        if (p)
+                (void) touch(p);
 
         r = fd;
         fd = -1;
@@ -134,19 +153,18 @@ int socket_address_listen(
         return r;
 }
 
-int make_socket_fd(int log_level, const char* address, int flags) {
+int make_socket_fd(int log_level, const char* address, int type, int flags) {
         SocketAddress a;
         int fd, r;
 
         r = socket_address_parse(&a, address);
-        if (r < 0) {
-                log_error("Failed to parse socket address \"%s\": %s",
-                          address, strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse socket address \"%s\": %m", address);
 
-        fd = socket_address_listen(&a, flags, SOMAXCONN, SOCKET_ADDRESS_DEFAULT,
-                                   NULL, false, false, 0755, 0644, NULL);
+        a.type = type;
+
+        fd = socket_address_listen(&a, type | flags, SOMAXCONN, SOCKET_ADDRESS_DEFAULT,
+                                   NULL, false, false, false, 0755, 0644, NULL);
         if (fd < 0 || log_get_max_level() >= log_level) {
                 _cleanup_free_ char *p = NULL;
 

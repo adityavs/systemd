@@ -2,7 +2,30 @@
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
-<refentry id="udevadm">
+<!--
+  SPDX-License-Identifier: LGPL-2.1+
+
+  This file is part of systemd.
+
+  Copyright 2010-2013 Kay Sievers
+
+  systemd is free software; you can redistribute it and/or modify it
+  under the terms of the GNU Lesser General Public License as published by
+  the Free Software Foundation; either version 2.1 of the License, or
+  (at your option) any later version.
+
+  systemd is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+  Lesser General Public License for more details.
+
+  You should have received a copy of the GNU Lesser General Public License
+  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<refentry id="udevadm"
+          xmlns:xi="http://www.w3.org/2001/XInclude">
+
   <refentryinfo>
     <title>udevadm</title>
     <productname>systemd</productname>
@@ -33,16 +56,16 @@
         <arg><option>--help</option></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>udevadm info <replaceable>options</replaceable></command>
+      <command>udevadm info <optional>options</optional> <optional>devpath</optional></command>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>udevadm trigger <optional>options</optional></command>
+      <command>udevadm trigger <optional>options</optional> <optional>devpath</optional></command>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>udevadm settle <optional>options</optional></command>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>udevadm control <replaceable>command</replaceable></command>
+      <command>udevadm control <replaceable>option</replaceable></command>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>udevadm monitor <optional>options</optional></command>
@@ -65,24 +88,15 @@
   <refsect1><title>Options</title>
     <variablelist>
       <varlistentry>
+        <term><option>-d</option></term>
         <term><option>--debug</option></term>
         <listitem>
           <para>Print debug messages to standard error.</para>
         </listitem>
       </varlistentry>
-      <varlistentry>
-        <term><option>--version</option></term>
-        <listitem>
-          <para>Print version number.</para>
-        </listitem>
-      </varlistentry>
-      <varlistentry>
-        <term><option>-h</option></term>
-        <term><option>--help</option></term>
-        <listitem>
-          <para>Print help text.</para>
-        </listitem>
-      </varlistentry>
+
+      <xi:include href="standard-options.xml" xpointer="version" />
+      <xi:include href="standard-options.xml" xpointer="help" />
     </variablelist>
 
     <refsect2><title>udevadm info
@@ -187,22 +201,12 @@
             <para>Cleanup the udev database.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>--version</option></term>
-          <listitem>
-            <para>Print version.</para>
-          </listitem>
-        </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
 
-      <para>In addition an optional positional argument can be used
+      <para>In addition, an optional positional argument can be used
       to specify a device name or a sys path. It must start with
       <filename>/dev</filename> or <filename>/sys</filename>
       respectively.</para>
@@ -308,16 +312,18 @@
           <term><option>-y</option></term>
           <term><option>--sysname-match=<replaceable>PATH</replaceable></option></term>
           <listitem>
-            <para>Trigger events for devices with a matching sys
-            device path. This option can be specified multiple times
-            and supports shell style pattern matching.</para>
+	    <para>Trigger events for devices for which the last component
+	    (i.e. the filename) of the <filename>/sys</filename> path matches
+	    the specified <replaceable>PATH</replaceable>. This option can be
+	    specified multiple times and also supports shell style pattern
+	    matching.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><option>--name-match=<replaceable>NAME</replaceable></option></term>
           <listitem>
             <para>Trigger events for devices with a matching
-            device path. This options can be specified multiple
+            device path. This option can be specified multiple
             times.</para>
           </listitem>
         </varlistentry>
@@ -329,16 +335,12 @@
             device.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
 
-      <para>In addition optional positional arguments can be used
+      <para>In addition, optional positional arguments can be used
       to specify device names or sys paths. They must start with
       <filename>/dev</filename> or <filename>/sys</filename>
       respectively.</para>
@@ -366,21 +368,17 @@
             <para>Stop waiting if file exists.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
     </refsect2>
 
-    <refsect2><title>udevadm control <replaceable>command</replaceable></title>
+    <refsect2><title>udevadm control <replaceable>option</replaceable></title>
       <para>Modify the internal state of the running udev daemon.</para>
       <variablelist>
         <varlistentry>
-          <term><option>-x</option></term>
+          <term><option>-e</option></term>
           <term><option>--exit</option></term>
           <listitem>
             <para>Signal and wait for systemd-udevd to exit.</para>
@@ -440,18 +438,15 @@
           </listitem>
         </varlistentry>
         <varlistentry>
+          <term><option>-t</option></term>
           <term><option>--timeout=</option><replaceable>seconds</replaceable></term>
           <listitem>
             <para>The maximum number of seconds to wait for a reply from systemd-udevd.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
     </refsect2>
 
@@ -488,23 +483,19 @@
           <term><option>-s</option></term>
           <term><option>--subsystem-match=<replaceable>string[/string]</replaceable></option></term>
           <listitem>
-            <para>Filter events by subsystem[/devtype]. Only udev events with a matching subsystem value will pass.</para>
+            <para>Filter kernel uevents and udev events by subsystem[/devtype]. Only events with a matching subsystem value will pass.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><option>-t</option></term>
           <term><option>--tag-match=<replaceable>string</replaceable></option></term>
           <listitem>
-            <para>Filter events by property. Only udev events with a given tag attached will pass.</para>
+            <para>Filter udev events by tag. Only udev events with a given tag attached will pass.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
     </refsect2>
 
@@ -534,13 +525,9 @@
             and all devices will be owned by root.</para>
           </listitem>
         </varlistentry>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
     </refsect2>
 
@@ -553,13 +540,8 @@
       for device <replaceable>DEVPATH</replaceable>, and print debug
       output.</para>
       <variablelist>
-        <varlistentry>
-          <term><option>-h</option></term>
-          <term><option>--help</option></term>
-          <listitem>
-            <para>Print help text.</para>
-          </listitem>
-        </varlistentry>
+        <xi:include href="standard-options.xml" xpointer="version" />
+        <xi:include href="standard-options.xml" xpointer="help" />
       </variablelist>
     </refsect2>
   </refsect1>

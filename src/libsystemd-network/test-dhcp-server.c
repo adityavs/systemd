@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,14 +21,21 @@
 
 #include <errno.h>
 
-#include "sd-event.h"
-#include "event-util.h"
-
 #include "sd-dhcp-server.h"
+#include "sd-event.h"
+
 #include "dhcp-server-internal.h"
 
+static void test_pool(struct in_addr *address, unsigned size, int ret) {
+        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
+
+        assert_se(sd_dhcp_server_new(&server, 1) >= 0);
+
+        assert_se(sd_dhcp_server_configure_pool(server, address, 8, 0, size) == ret);
+}
+
 static int test_basic(sd_event *event) {
-        _cleanup_dhcp_server_unref_ sd_dhcp_server *server = NULL;
+        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
         struct in_addr address_lo = {
                 .s_addr = htonl(INADDR_LOOPBACK),
         };
@@ -54,15 +60,14 @@ static int test_basic(sd_event *event) {
         assert_se(!sd_dhcp_server_unref(server));
 
         assert_se(sd_dhcp_server_start(server) == -EUNATCH);
-        assert_se(sd_dhcp_server_set_address(server, &address_any, 28) == -EINVAL);
-        assert_se(sd_dhcp_server_set_address(server, &address_lo, 38) == -ERANGE);
-        assert_se(sd_dhcp_server_set_address(server, &address_lo, 8) >= 0);
-        assert_se(sd_dhcp_server_set_address(server, &address_lo, 8) == -EBUSY);
 
-        assert_se(sd_dhcp_server_set_lease_pool(server, &address_any, 1) == -EINVAL);
-        assert_se(sd_dhcp_server_set_lease_pool(server, &address_lo, 0) == -EINVAL);
-        assert_se(sd_dhcp_server_set_lease_pool(server, &address_lo, 1) >= 0);
-        assert_se(sd_dhcp_server_set_lease_pool(server, &address_lo, 1) == -EBUSY);
+        assert_se(sd_dhcp_server_configure_pool(server, &address_any, 28, 0, 0) == -EINVAL);
+        assert_se(sd_dhcp_server_configure_pool(server, &address_lo, 38, 0, 0) == -ERANGE);
+        assert_se(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0) >= 0);
+        assert_se(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0) >= 0);
+
+        test_pool(&address_any, 1, -EINVAL);
+        test_pool(&address_lo, 1, 0);
 
         r = sd_dhcp_server_start(server);
 
@@ -79,7 +84,7 @@ static int test_basic(sd_event *event) {
 }
 
 static void test_message_handler(void) {
-        _cleanup_dhcp_server_unref_ sd_dhcp_server *server = NULL;
+        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
         struct {
                 DHCPMessage message;
                 struct {
@@ -109,35 +114,33 @@ static void test_message_handler(void) {
                 .message.hlen = ETHER_ADDR_LEN,
                 .message.xid = htobe32(0x12345678),
                 .message.chaddr = { 'A', 'B', 'C', 'D', 'E', 'F' },
-                .option_type.code = DHCP_OPTION_MESSAGE_TYPE,
+                .option_type.code = SD_DHCP_OPTION_MESSAGE_TYPE,
                 .option_type.length = 1,
                 .option_type.type = DHCP_DISCOVER,
-                .end = DHCP_OPTION_END,
+                .end = SD_DHCP_OPTION_END,
         };
         struct in_addr address_lo = {
                 .s_addr = htonl(INADDR_LOOPBACK),
         };
 
         assert_se(sd_dhcp_server_new(&server, 1) >= 0);
-        assert_se(sd_dhcp_server_set_address(server, &address_lo, 8) >= 0);
+        assert_se(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0) >= 0);
         assert_se(sd_dhcp_server_attach_event(server, NULL, 0) >= 0);
         assert_se(sd_dhcp_server_start(server) >= 0);
 
-        assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == 0);
-        assert_se(sd_dhcp_server_set_lease_pool(server, &address_lo, 10) >= 0);
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_OFFER);
 
         test.end = 0;
         /* TODO, shouldn't this fail? */
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_OFFER);
-        test.end = DHCP_OPTION_END;
+        test.end = SD_DHCP_OPTION_END;
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_OFFER);
 
         test.option_type.code = 0;
         test.option_type.length = 0;
         test.option_type.type = 0;
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == 0);
-        test.option_type.code = DHCP_OPTION_MESSAGE_TYPE;
+        test.option_type.code = SD_DHCP_OPTION_MESSAGE_TYPE;
         test.option_type.length = 1;
         test.option_type.type = DHCP_DISCOVER;
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_OFFER);
@@ -159,11 +162,11 @@ static void test_message_handler(void) {
 
         test.option_type.type = DHCP_REQUEST;
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == 0);
-        test.option_requested_ip.code = DHCP_OPTION_REQUESTED_IP_ADDRESS;
+        test.option_requested_ip.code = SD_DHCP_OPTION_REQUESTED_IP_ADDRESS;
         test.option_requested_ip.length = 4;
         test.option_requested_ip.address = htobe32(0x12345678);
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_NAK);
-        test.option_server_id.code = DHCP_OPTION_SERVER_IDENTIFIER;
+        test.option_server_id.code = SD_DHCP_OPTION_SERVER_IDENTIFIER;
         test.option_server_id.length = 4;
         test.option_server_id.address = htobe32(INADDR_LOOPBACK);
         test.option_requested_ip.address = htobe32(INADDR_LOOPBACK + 3);
@@ -178,7 +181,7 @@ static void test_message_handler(void) {
         test.option_requested_ip.address = htobe32(INADDR_LOOPBACK + 3);
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == DHCP_ACK);
 
-        test.option_client_id.code = DHCP_OPTION_CLIENT_IDENTIFIER;
+        test.option_client_id.code = SD_DHCP_OPTION_CLIENT_IDENTIFIER;
         test.option_client_id.length = 7;
         test.option_client_id.id[0] = 0x01;
         test.option_client_id.id[1] = 'A';
@@ -191,6 +194,15 @@ static void test_message_handler(void) {
 
         test.option_requested_ip.address = htobe32(INADDR_LOOPBACK + 30);
         assert_se(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test)) == 0);
+}
+
+static uint64_t client_id_hash_helper(DHCPClientId *id, uint8_t key[HASH_KEY_SIZE]) {
+        struct siphash state;
+
+        siphash24_init(&state, key);
+        client_id_hash_func(id, &state);
+
+        return htole64(siphash24_finalize(&state));
 }
 
 static void test_client_id_hash(void) {
@@ -208,18 +220,18 @@ static void test_client_id_hash(void) {
         b.data = (uint8_t*)strdup("abcd");
 
         assert_se(client_id_compare_func(&a, &b) == 0);
-        assert_se(client_id_hash_func(&a, hash_key) == client_id_hash_func(&b, hash_key));
+        assert_se(client_id_hash_helper(&a, hash_key) == client_id_hash_helper(&b, hash_key));
         a.length = 3;
         assert_se(client_id_compare_func(&a, &b) != 0);
         a.length = 4;
         assert_se(client_id_compare_func(&a, &b) == 0);
-        assert_se(client_id_hash_func(&a, hash_key) == client_id_hash_func(&b, hash_key));
+        assert_se(client_id_hash_helper(&a, hash_key) == client_id_hash_helper(&b, hash_key));
 
         b.length = 3;
         assert_se(client_id_compare_func(&a, &b) != 0);
         b.length = 4;
         assert_se(client_id_compare_func(&a, &b) == 0);
-        assert_se(client_id_hash_func(&a, hash_key) == client_id_hash_func(&b, hash_key));
+        assert_se(client_id_hash_helper(&a, hash_key) == client_id_hash_helper(&b, hash_key));
 
         free(b.data);
         b.data = (uint8_t*)strdup("abce");
@@ -230,7 +242,7 @@ static void test_client_id_hash(void) {
 }
 
 int main(int argc, char *argv[]) {
-        _cleanup_event_unref_ sd_event *e;
+        _cleanup_(sd_event_unrefp) sd_event *e;
         int r;
 
         log_set_max_level(LOG_DEBUG);

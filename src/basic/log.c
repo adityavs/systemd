@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,31 +18,50 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdarg.h>
-#include <stdio.h>
 #include <errno.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
-#include <printf.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "sd-messages.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "format-util.h"
+#include "io-util.h"
 #include "log.h"
-#include "util.h"
-#include "missing.h"
 #include "macro.h"
-#include "socket-util.h"
-#include "formats-util.h"
+#include "missing.h"
+#include "parse-util.h"
+#include "proc-cmdline.h"
 #include "process-util.h"
-#include "terminal-util.h"
 #include "signal-util.h"
+#include "socket-util.h"
+#include "stdio-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "syslog-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
+#include "utf8.h"
+#include "util.h"
 
 #define SNDBUF_SIZE (8*1024*1024)
 
 static LogTarget log_target = LOG_TARGET_CONSOLE;
-static int log_max_level = LOG_INFO;
+static int log_max_level[] = {LOG_INFO, LOG_INFO};
+assert_cc(ELEMENTSOF(log_max_level) == _LOG_REALM_MAX);
 static int log_facility = LOG_DAEMON;
 
 static int console_fd = STDERR_FILENO;
@@ -57,6 +75,8 @@ static bool show_color = false;
 static bool show_location = false;
 
 static bool upgrade_syslog_to_journal = false;
+static bool always_reopen_console = false;
+static bool open_when_needed = false;
 
 /* Akin to glibc's __abort_msg; which is private and we hence cannot
  * use here. */
@@ -67,7 +87,7 @@ void log_close_console(void) {
         if (console_fd < 0)
                 return;
 
-        if (getpid() == 1) {
+        if (getpid_cached() == 1) {
                 if (console_fd >= 3)
                         safe_close(console_fd);
 
@@ -80,7 +100,7 @@ static int log_open_console(void) {
         if (console_fd >= 0)
                 return 0;
 
-        if (getpid() == 1) {
+        if (always_reopen_console) {
                 console_fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
                 if (console_fd < 0)
                         return console_fd;
@@ -118,12 +138,12 @@ static int create_log_socket(int type) {
         if (fd < 0)
                 return -errno;
 
-        fd_inc_sndbuf(fd, SNDBUF_SIZE);
+        (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         /* We need a blocking fd here since we'd otherwise lose
         messages way too early. However, let's not hang forever in the
         unlikely case of a deadlock. */
-        if (getpid() == 1)
+        if (getpid_cached() == 1)
                 timeval_store(&tv, 10 * USEC_PER_MSEC);
         else
                 timeval_store(&tv, 10 * USEC_PER_SEC);
@@ -150,7 +170,7 @@ static int log_open_syslog(void) {
                 goto fail;
         }
 
-        if (connect(syslog_fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sa.un.sun_path)) < 0) {
+        if (connect(syslog_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0) {
                 safe_close(syslog_fd);
 
                 /* Some legacy syslog systems still use stream
@@ -162,7 +182,7 @@ static int log_open_syslog(void) {
                         goto fail;
                 }
 
-                if (connect(syslog_fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sa.un.sun_path)) < 0) {
+                if (connect(syslog_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0) {
                         r = -errno;
                         goto fail;
                 }
@@ -200,7 +220,7 @@ static int log_open_journal(void) {
                 goto fail;
         }
 
-        if (connect(journal_fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sa.un.sun_path)) < 0) {
+        if (connect(journal_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0) {
                 r = -errno;
                 goto fail;
         }
@@ -215,6 +235,8 @@ fail:
 int log_open(void) {
         int r;
 
+        /* Do not call from library code. */
+
         /* If we don't use the console we close it here, to not get
          * killed by SAK. If we don't use syslog we close it here so
          * that we are not confused by somebody deleting the socket in
@@ -228,13 +250,13 @@ int log_open(void) {
                 return 0;
         }
 
-        if ((log_target != LOG_TARGET_AUTO && log_target != LOG_TARGET_SAFE) ||
-            getpid() == 1 ||
+        if (!IN_SET(log_target, LOG_TARGET_AUTO, LOG_TARGET_SAFE) ||
+            getpid_cached() == 1 ||
             isatty(STDERR_FILENO) <= 0) {
 
-                if (log_target == LOG_TARGET_AUTO ||
-                    log_target == LOG_TARGET_JOURNAL_OR_KMSG ||
-                    log_target == LOG_TARGET_JOURNAL) {
+                if (IN_SET(log_target, LOG_TARGET_AUTO,
+                                       LOG_TARGET_JOURNAL_OR_KMSG,
+                                       LOG_TARGET_JOURNAL)) {
                         r = log_open_journal();
                         if (r >= 0) {
                                 log_close_syslog();
@@ -243,8 +265,8 @@ int log_open(void) {
                         }
                 }
 
-                if (log_target == LOG_TARGET_SYSLOG_OR_KMSG ||
-                    log_target == LOG_TARGET_SYSLOG) {
+                if (IN_SET(log_target, LOG_TARGET_SYSLOG_OR_KMSG,
+                                       LOG_TARGET_SYSLOG)) {
                         r = log_open_syslog();
                         if (r >= 0) {
                                 log_close_journal();
@@ -253,11 +275,11 @@ int log_open(void) {
                         }
                 }
 
-                if (log_target == LOG_TARGET_AUTO ||
-                    log_target == LOG_TARGET_SAFE ||
-                    log_target == LOG_TARGET_JOURNAL_OR_KMSG ||
-                    log_target == LOG_TARGET_SYSLOG_OR_KMSG ||
-                    log_target == LOG_TARGET_KMSG) {
+                if (IN_SET(log_target, LOG_TARGET_AUTO,
+                                       LOG_TARGET_SAFE,
+                                       LOG_TARGET_JOURNAL_OR_KMSG,
+                                       LOG_TARGET_SYSLOG_OR_KMSG,
+                                       LOG_TARGET_KMSG)) {
                         r = log_open_kmsg();
                         if (r >= 0) {
                                 log_close_journal();
@@ -289,6 +311,8 @@ void log_set_target(LogTarget target) {
 }
 
 void log_close(void) {
+        /* Do not call from library code. */
+
         log_close_journal();
         log_close_syslog();
         log_close_kmsg();
@@ -296,13 +320,16 @@ void log_close(void) {
 }
 
 void log_forget_fds(void) {
+        /* Do not call from library code. */
+
         console_fd = kmsg_fd = syslog_fd = journal_fd = -1;
 }
 
-void log_set_max_level(int level) {
+void log_set_max_level_realm(LogRealm realm, int level) {
         assert((level & LOG_PRIMASK) == level);
+        assert(realm < ELEMENTSOF(log_max_level));
 
-        log_max_level = level;
+        log_max_level[realm] = level;
 }
 
 void log_set_facility(int facility) {
@@ -315,11 +342,9 @@ static int write_to_console(
                 const char *file,
                 int line,
                 const char *func,
-                const char *object_field,
-                const char *object,
                 const char *buffer) {
 
-        char location[64], prefix[1 + DECIMAL_STR_MAX(int) + 2];
+        char location[256], prefix[1 + DECIMAL_STR_MAX(int) + 2];
         struct iovec iovec[6] = {};
         unsigned n = 0;
         bool highlight;
@@ -328,27 +353,27 @@ static int write_to_console(
                 return 0;
 
         if (log_target == LOG_TARGET_CONSOLE_PREFIXED) {
-                sprintf(prefix, "<%i>", level);
-                IOVEC_SET_STRING(iovec[n++], prefix);
+                xsprintf(prefix, "<%i>", level);
+                iovec[n++] = IOVEC_MAKE_STRING(prefix);
         }
 
         highlight = LOG_PRI(level) <= LOG_ERR && show_color;
 
         if (show_location) {
-                snprintf(location, sizeof(location), "(%s:%i) ", file, line);
-                IOVEC_SET_STRING(iovec[n++], location);
+                xsprintf(location, "(%s:%i) ", file, line);
+                iovec[n++] = IOVEC_MAKE_STRING(location);
         }
 
         if (highlight)
-                IOVEC_SET_STRING(iovec[n++], ANSI_HIGHLIGHT_RED_ON);
-        IOVEC_SET_STRING(iovec[n++], buffer);
+                iovec[n++] = IOVEC_MAKE_STRING(ANSI_HIGHLIGHT_RED);
+        iovec[n++] = IOVEC_MAKE_STRING(buffer);
         if (highlight)
-                IOVEC_SET_STRING(iovec[n++], ANSI_HIGHLIGHT_OFF);
-        IOVEC_SET_STRING(iovec[n++], "\n");
+                iovec[n++] = IOVEC_MAKE_STRING(ANSI_NORMAL);
+        iovec[n++] = IOVEC_MAKE_STRING("\n");
 
         if (writev(console_fd, iovec, n) < 0) {
 
-                if (errno == EIO && getpid() == 1) {
+                if (errno == EIO && getpid_cached() == 1) {
 
                         /* If somebody tried to kick us from our
                          * console tty (via vhangup() or suchlike),
@@ -375,8 +400,6 @@ static int write_to_syslog(
                 const char *file,
                 int line,
                 const char *func,
-                const char *object_field,
-                const char *object,
                 const char *buffer) {
 
         char header_priority[2 + DECIMAL_STR_MAX(int) + 1],
@@ -403,13 +426,13 @@ static int write_to_syslog(
         if (strftime(header_time, sizeof(header_time), "%h %e %T ", tm) <= 0)
                 return -EINVAL;
 
-        xsprintf(header_pid, "["PID_FMT"]: ", getpid());
+        xsprintf(header_pid, "["PID_FMT"]: ", getpid_cached());
 
-        IOVEC_SET_STRING(iovec[0], header_priority);
-        IOVEC_SET_STRING(iovec[1], header_time);
-        IOVEC_SET_STRING(iovec[2], program_invocation_short_name);
-        IOVEC_SET_STRING(iovec[3], header_pid);
-        IOVEC_SET_STRING(iovec[4], buffer);
+        iovec[0] = IOVEC_MAKE_STRING(header_priority);
+        iovec[1] = IOVEC_MAKE_STRING(header_time);
+        iovec[2] = IOVEC_MAKE_STRING(program_invocation_short_name);
+        iovec[3] = IOVEC_MAKE_STRING(header_pid);
+        iovec[4] = IOVEC_MAKE_STRING(buffer);
 
         /* When using syslog via SOCK_STREAM separate the messages by NUL chars */
         if (syslog_is_stream)
@@ -435,11 +458,9 @@ static int write_to_syslog(
 static int write_to_kmsg(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
-                const char *object_field,
-                const char *object,
                 const char *buffer) {
 
         char header_priority[2 + DECIMAL_STR_MAX(int) + 1],
@@ -450,13 +471,13 @@ static int write_to_kmsg(
                 return 0;
 
         xsprintf(header_priority, "<%i>", level);
-        xsprintf(header_pid, "["PID_FMT"]: ", getpid());
+        xsprintf(header_pid, "["PID_FMT"]: ", getpid_cached());
 
-        IOVEC_SET_STRING(iovec[0], header_priority);
-        IOVEC_SET_STRING(iovec[1], program_invocation_short_name);
-        IOVEC_SET_STRING(iovec[2], header_pid);
-        IOVEC_SET_STRING(iovec[3], buffer);
-        IOVEC_SET_STRING(iovec[4], "\n");
+        iovec[0] = IOVEC_MAKE_STRING(header_priority);
+        iovec[1] = IOVEC_MAKE_STRING(program_invocation_short_name);
+        iovec[2] = IOVEC_MAKE_STRING(header_pid);
+        iovec[3] = IOVEC_MAKE_STRING(buffer);
+        iovec[4] = IOVEC_MAKE_STRING("\n");
 
         if (writev(kmsg_fd, iovec, ELEMENTSOF(iovec)) < 0)
                 return -errno;
@@ -470,7 +491,8 @@ static int log_do_header(
                 int level,
                 int error,
                 const char *file, int line, const char *func,
-                const char *object_field, const char *object) {
+                const char *object_field, const char *object,
+                const char *extra_field, const char *extra) {
 
         snprintf(header, size,
                  "PRIORITY=%i\n"
@@ -479,6 +501,7 @@ static int log_do_header(
                  "%s%.*i%s"
                  "%s%s%s"
                  "%s%.*i%s"
+                 "%s%s%s"
                  "%s%s%s"
                  "SYSLOG_IDENTIFIER=%s\n",
                  LOG_PRI(level),
@@ -489,7 +512,7 @@ static int log_do_header(
                  line ? "CODE_LINE=" : "",
                  line ? 1 : 0, line, /* %.0d means no output too, special case for 0 */
                  line ? "\n" : "",
-                 isempty(func) ? "" : "CODE_FUNCTION=",
+                 isempty(func) ? "" : "CODE_FUNC=",
                  isempty(func) ? "" : func,
                  isempty(func) ? "" : "\n",
                  error ? "ERRNO=" : "",
@@ -498,6 +521,9 @@ static int log_do_header(
                  isempty(object) ? "" : object_field,
                  isempty(object) ? "" : object,
                  isempty(object) ? "" : "\n",
+                 isempty(extra) ? "" : extra_field,
+                 isempty(extra) ? "" : extra,
+                 isempty(extra) ? "" : "\n",
                  program_invocation_short_name);
 
         return 0;
@@ -506,11 +532,13 @@ static int log_do_header(
 static int write_to_journal(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
                 const char *object_field,
                 const char *object,
+                const char *extra_field,
+                const char *extra,
                 const char *buffer) {
 
         char header[LINE_MAX];
@@ -520,12 +548,12 @@ static int write_to_journal(
         if (journal_fd < 0)
                 return 0;
 
-        log_do_header(header, sizeof(header), level, error, file, line, func, object_field, object);
+        log_do_header(header, sizeof(header), level, error, file, line, func, object_field, object, extra_field, extra);
 
-        IOVEC_SET_STRING(iovec[0], header);
-        IOVEC_SET_STRING(iovec[1], "MESSAGE=");
-        IOVEC_SET_STRING(iovec[2], buffer);
-        IOVEC_SET_STRING(iovec[3], "\n");
+        iovec[0] = IOVEC_MAKE_STRING(header);
+        iovec[1] = IOVEC_MAKE_STRING("MESSAGE=");
+        iovec[2] = IOVEC_MAKE_STRING(buffer);
+        iovec[3] = IOVEC_MAKE_STRING("\n");
 
         mh.msg_iov = iovec;
         mh.msg_iovlen = ELEMENTSOF(iovec);
@@ -536,7 +564,7 @@ static int write_to_journal(
         return 1;
 }
 
-static int log_dispatch(
+int log_dispatch_internal(
                 int level,
                 int error,
                 const char *file,
@@ -544,9 +572,14 @@ static int log_dispatch(
                 const char *func,
                 const char *object_field,
                 const char *object,
+                const char *extra,
+                const char *extra_field,
                 char *buffer) {
 
         assert(buffer);
+
+        if (error < 0)
+                error = -error;
 
         if (log_target == LOG_TARGET_NULL)
                 return -error;
@@ -555,8 +588,8 @@ static int log_dispatch(
         if ((level & LOG_FACMASK) == 0)
                 level = log_facility | LOG_PRI(level);
 
-        if (error < 0)
-                error = -error;
+        if (open_when_needed)
+                log_open();
 
         do {
                 char *e;
@@ -570,11 +603,11 @@ static int log_dispatch(
                 if ((e = strpbrk(buffer, NEWLINE)))
                         *(e++) = 0;
 
-                if (log_target == LOG_TARGET_AUTO ||
-                    log_target == LOG_TARGET_JOURNAL_OR_KMSG ||
-                    log_target == LOG_TARGET_JOURNAL) {
+                if (IN_SET(log_target, LOG_TARGET_AUTO,
+                                       LOG_TARGET_JOURNAL_OR_KMSG,
+                                       LOG_TARGET_JOURNAL)) {
 
-                        k = write_to_journal(level, error, file, line, func, object_field, object, buffer);
+                        k = write_to_journal(level, error, file, line, func, object_field, object, extra_field, extra, buffer);
                         if (k < 0) {
                                 if (k != -EAGAIN)
                                         log_close_journal();
@@ -582,10 +615,10 @@ static int log_dispatch(
                         }
                 }
 
-                if (log_target == LOG_TARGET_SYSLOG_OR_KMSG ||
-                    log_target == LOG_TARGET_SYSLOG) {
+                if (IN_SET(log_target, LOG_TARGET_SYSLOG_OR_KMSG,
+                                       LOG_TARGET_SYSLOG)) {
 
-                        k = write_to_syslog(level, error, file, line, func, object_field, object, buffer);
+                        k = write_to_syslog(level, error, file, line, func, buffer);
                         if (k < 0) {
                                 if (k != -EAGAIN)
                                         log_close_syslog();
@@ -594,13 +627,13 @@ static int log_dispatch(
                 }
 
                 if (k <= 0 &&
-                    (log_target == LOG_TARGET_AUTO ||
-                     log_target == LOG_TARGET_SAFE ||
-                     log_target == LOG_TARGET_SYSLOG_OR_KMSG ||
-                     log_target == LOG_TARGET_JOURNAL_OR_KMSG ||
-                     log_target == LOG_TARGET_KMSG)) {
+                    IN_SET(log_target, LOG_TARGET_AUTO,
+                                       LOG_TARGET_SAFE,
+                                       LOG_TARGET_SYSLOG_OR_KMSG,
+                                       LOG_TARGET_JOURNAL_OR_KMSG,
+                                       LOG_TARGET_KMSG)) {
 
-                        k = write_to_kmsg(level, error, file, line, func, object_field, object, buffer);
+                        k = write_to_kmsg(level, error, file, line, func, buffer);
                         if (k < 0) {
                                 log_close_kmsg();
                                 log_open_console();
@@ -608,22 +641,26 @@ static int log_dispatch(
                 }
 
                 if (k <= 0)
-                        (void) write_to_console(level, error, file, line, func, object_field, object, buffer);
+                        (void) write_to_console(level, error, file, line, func, buffer);
 
                 buffer = e;
         } while (buffer);
+
+        if (open_when_needed)
+                log_close();
 
         return -error;
 }
 
 int log_dump_internal(
-        int level,
-        int error,
-        const char *file,
-        int line,
-        const char *func,
-        char *buffer) {
+                int level,
+                int error,
+                const char *file,
+                int line,
+                const char *func,
+                char *buffer) {
 
+        LogRealm realm = LOG_REALM_REMOVE_LEVEL(level);
         PROTECT_ERRNO;
 
         /* This modifies the buffer... */
@@ -631,28 +668,29 @@ int log_dump_internal(
         if (error < 0)
                 error = -error;
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[realm]))
                 return -error;
 
-        return log_dispatch(level, error, file, line, func, NULL, NULL, buffer);
+        return log_dispatch_internal(level, error, file, line, func, NULL, NULL, NULL, NULL, buffer);
 }
 
-int log_internalv(
+int log_internalv_realm(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
                 const char *format,
                 va_list ap) {
 
-        PROTECT_ERRNO;
+        LogRealm realm = LOG_REALM_REMOVE_LEVEL(level);
         char buffer[LINE_MAX];
+        PROTECT_ERRNO;
 
         if (error < 0)
                 error = -error;
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[realm]))
                 return -error;
 
         /* Make sure that %m maps to the specified error */
@@ -661,13 +699,13 @@ int log_internalv(
 
         vsnprintf(buffer, sizeof(buffer), format, ap);
 
-        return log_dispatch(level, error, file, line, func, NULL, NULL, buffer);
+        return log_dispatch_internal(level, error, file, line, func, NULL, NULL, NULL, NULL, buffer);
 }
 
-int log_internal(
+int log_internal_realm(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
                 const char *format, ...) {
@@ -676,7 +714,7 @@ int log_internal(
         int r;
 
         va_start(ap, format);
-        r = log_internalv(level, error, file, line, func, format, ap);
+        r = log_internalv_realm(level, error, file, line, func, format, ap);
         va_end(ap);
 
         return r;
@@ -685,22 +723,23 @@ int log_internal(
 int log_object_internalv(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
                 const char *object_field,
                 const char *object,
+                const char *extra_field,
+                const char *extra,
                 const char *format,
                 va_list ap) {
 
         PROTECT_ERRNO;
         char *buffer, *b;
-        size_t l;
 
         if (error < 0)
                 error = -error;
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[LOG_REALM_SYSTEMD]))
                 return -error;
 
         /* Make sure that %m maps to the specified error */
@@ -712,35 +751,34 @@ int log_object_internalv(
                 size_t n;
 
                 n = strlen(object);
-                l = n + 2 + LINE_MAX;
-
-                buffer = newa(char, l);
+                buffer = newa(char, n + 2 + LINE_MAX);
                 b = stpcpy(stpcpy(buffer, object), ": ");
-        } else {
-                l = LINE_MAX;
-                b = buffer = newa(char, l);
-        }
+        } else
+                b = buffer = newa(char, LINE_MAX);
 
-        vsnprintf(b, l, format, ap);
+        vsnprintf(b, LINE_MAX, format, ap);
 
-        return log_dispatch(level, error, file, line, func, object_field, object, buffer);
+        return log_dispatch_internal(level, error, file, line, func,
+                                     object_field, object, extra_field, extra, buffer);
 }
 
 int log_object_internal(
                 int level,
                 int error,
-                const char*file,
+                const char *file,
                 int line,
                 const char *func,
                 const char *object_field,
                 const char *object,
+                const char *extra_field,
+                const char *extra,
                 const char *format, ...) {
 
         va_list ap;
         int r;
 
         va_start(ap, format);
-        r = log_object_internalv(level, error, file, line, func, object_field, object, format, ap);
+        r = log_object_internalv(level, error, file, line, func, object_field, object, extra_field, extra, format, ap);
         va_end(ap);
 
         return r;
@@ -755,37 +793,104 @@ static void log_assert(
                 const char *format) {
 
         static char buffer[LINE_MAX];
+        LogRealm realm = LOG_REALM_REMOVE_LEVEL(level);
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[realm]))
                 return;
 
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        snprintf(buffer, sizeof(buffer), format, text, file, line, func);
+        xsprintf(buffer, format, text, file, line, func);
         REENABLE_WARNING;
 
         log_abort_msg = buffer;
 
-        log_dispatch(level, 0, file, line, func, NULL, NULL, buffer);
+        log_dispatch_internal(level, 0, file, line, func, NULL, NULL, NULL, NULL, buffer);
 }
 
-noreturn void log_assert_failed(const char *text, const char *file, int line, const char *func) {
-        log_assert(LOG_CRIT, text, file, line, func, "Assertion '%s' failed at %s:%u, function %s(). Aborting.");
+noreturn void log_assert_failed_realm(
+                LogRealm realm,
+                const char *text,
+                const char *file,
+                int line,
+                const char *func) {
+        log_open();
+        log_assert(LOG_REALM_PLUS_LEVEL(realm, LOG_CRIT), text, file, line, func,
+                   "Assertion '%s' failed at %s:%u, function %s(). Aborting.");
         abort();
 }
 
-noreturn void log_assert_failed_unreachable(const char *text, const char *file, int line, const char *func) {
-        log_assert(LOG_CRIT, text, file, line, func, "Code should not be reached '%s' at %s:%u, function %s(). Aborting.");
+noreturn void log_assert_failed_unreachable_realm(
+                LogRealm realm,
+                const char *text,
+                const char *file,
+                int line,
+                const char *func) {
+        log_open();
+        log_assert(LOG_REALM_PLUS_LEVEL(realm, LOG_CRIT), text, file, line, func,
+                   "Code should not be reached '%s' at %s:%u, function %s(). Aborting.");
         abort();
 }
 
-void log_assert_failed_return(const char *text, const char *file, int line, const char *func) {
+void log_assert_failed_return_realm(
+                LogRealm realm,
+                const char *text,
+                const char *file,
+                int line,
+                const char *func) {
         PROTECT_ERRNO;
-        log_assert(LOG_DEBUG, text, file, line, func, "Assertion '%s' failed at %s:%u, function %s(). Ignoring.");
+        log_assert(LOG_REALM_PLUS_LEVEL(realm, LOG_DEBUG), text, file, line, func,
+                   "Assertion '%s' failed at %s:%u, function %s(). Ignoring.");
 }
 
-int log_oom_internal(const char *file, int line, const char *func) {
-        log_internal(LOG_ERR, ENOMEM, file, line, func, "Out of memory.");
-        return -ENOMEM;
+int log_oom_internal(LogRealm realm, const char *file, int line, const char *func) {
+        return log_internal_realm(LOG_REALM_PLUS_LEVEL(realm, LOG_ERR),
+                                  ENOMEM, file, line, func, "Out of memory.");
+}
+
+int log_format_iovec(
+                struct iovec *iovec,
+                size_t iovec_len,
+                size_t *n,
+                bool newline_separator,
+                int error,
+                const char *format,
+                va_list ap) {
+
+        static const char nl = '\n';
+
+        while (format && *n + 1 < iovec_len) {
+                va_list aq;
+                char *m;
+                int r;
+
+                /* We need to copy the va_list structure,
+                 * since vasprintf() leaves it afterwards at
+                 * an undefined location */
+
+                if (error != 0)
+                        errno = error;
+
+                va_copy(aq, ap);
+                r = vasprintf(&m, format, aq);
+                va_end(aq);
+                if (r < 0)
+                        return -EINVAL;
+
+                /* Now, jump enough ahead, so that we point to
+                 * the next format string */
+                VA_FORMAT_ADVANCE(format, ap);
+
+                iovec[(*n)++] = IOVEC_MAKE_STRING(m);
+
+                if (newline_separator) {
+                        iovec[*n].iov_base = (char*) &nl;
+                        iovec[*n].iov_len = 1;
+                        (*n)++;
+                }
+
+                format = va_arg(ap, char *);
+        }
+        return 0;
 }
 
 int log_struct_internal(
@@ -796,6 +901,7 @@ int log_struct_internal(
                 const char *func,
                 const char *format, ...) {
 
+        LogRealm realm = LOG_REALM_REMOVE_LEVEL(level);
         char buf[LINE_MAX];
         bool found = false;
         PROTECT_ERRNO;
@@ -804,7 +910,7 @@ int log_struct_internal(
         if (error < 0)
                 error = -error;
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[realm]))
                 return -error;
 
         if (log_target == LOG_TARGET_NULL)
@@ -813,67 +919,48 @@ int log_struct_internal(
         if ((level & LOG_FACMASK) == 0)
                 level = log_facility | LOG_PRI(level);
 
-        if ((log_target == LOG_TARGET_AUTO ||
-             log_target == LOG_TARGET_JOURNAL_OR_KMSG ||
-             log_target == LOG_TARGET_JOURNAL) &&
-            journal_fd >= 0) {
-                char header[LINE_MAX];
-                struct iovec iovec[17] = {};
-                unsigned n = 0, i;
-                struct msghdr mh = {
-                        .msg_iov = iovec,
-                };
-                static const char nl = '\n';
-                bool fallback = false;
+        if (IN_SET(log_target,
+                   LOG_TARGET_AUTO,
+                   LOG_TARGET_JOURNAL_OR_KMSG,
+                   LOG_TARGET_JOURNAL)) {
 
-                /* If the journal is available do structured logging */
-                log_do_header(header, sizeof(header), level, error, file, line, func, NULL, NULL);
-                IOVEC_SET_STRING(iovec[n++], header);
+                if (open_when_needed)
+                        log_open_journal();
 
-                va_start(ap, format);
-                while (format && n + 1 < ELEMENTSOF(iovec)) {
-                        va_list aq;
-                        char *m;
+                if (journal_fd >= 0) {
+                        char header[LINE_MAX];
+                        struct iovec iovec[17] = {};
+                        size_t n = 0, i;
+                        int r;
+                        struct msghdr mh = {
+                                .msg_iov = iovec,
+                        };
+                        bool fallback = false;
 
-                        /* We need to copy the va_list structure,
-                         * since vasprintf() leaves it afterwards at
-                         * an undefined location */
+                        /* If the journal is available do structured logging */
+                        log_do_header(header, sizeof(header), level, error, file, line, func, NULL, NULL, NULL, NULL);
+                        iovec[n++] = IOVEC_MAKE_STRING(header);
 
-                        if (error != 0)
-                                errno = error;
-
-                        va_copy(aq, ap);
-                        if (vasprintf(&m, format, aq) < 0) {
-                                va_end(aq);
+                        va_start(ap, format);
+                        r = log_format_iovec(iovec, ELEMENTSOF(iovec), &n, true, error, format, ap);
+                        if (r < 0)
                                 fallback = true;
-                                goto finish;
+                        else {
+                                mh.msg_iovlen = n;
+                                (void) sendmsg(journal_fd, &mh, MSG_NOSIGNAL);
                         }
-                        va_end(aq);
 
-                        /* Now, jump enough ahead, so that we point to
-                         * the next format string */
-                        VA_FORMAT_ADVANCE(format, ap);
+                        va_end(ap);
+                        for (i = 1; i < n; i += 2)
+                                free(iovec[i].iov_base);
 
-                        IOVEC_SET_STRING(iovec[n++], m);
+                        if (!fallback) {
+                                if (open_when_needed)
+                                        log_close();
 
-                        iovec[n].iov_base = (char*) &nl;
-                        iovec[n].iov_len = 1;
-                        n++;
-
-                        format = va_arg(ap, char *);
+                                return -error;
+                        }
                 }
-
-                mh.msg_iovlen = n;
-
-                (void) sendmsg(journal_fd, &mh, MSG_NOSIGNAL);
-
-        finish:
-                va_end(ap);
-                for (i = 1; i < n; i += 2)
-                        free(iovec[i].iov_base);
-
-                if (!fallback)
-                        return -error;
         }
 
         /* Fallback if journal logging is not available or didn't work. */
@@ -900,10 +987,81 @@ int log_struct_internal(
         }
         va_end(ap);
 
-        if (!found)
+        if (!found) {
+                if (open_when_needed)
+                        log_close();
+
+                return -error;
+        }
+
+        return log_dispatch_internal(level, error, file, line, func, NULL, NULL, NULL, NULL, buf + 8);
+}
+
+int log_struct_iovec_internal(
+                int level,
+                int error,
+                const char *file,
+                int line,
+                const char *func,
+                const struct iovec input_iovec[],
+                size_t n_input_iovec) {
+
+        LogRealm realm = LOG_REALM_REMOVE_LEVEL(level);
+        PROTECT_ERRNO;
+        size_t i;
+        char *m;
+
+        if (error < 0)
+                error = -error;
+
+        if (_likely_(LOG_PRI(level) > log_max_level[realm]))
                 return -error;
 
-        return log_dispatch(level, error, file, line, func, NULL, NULL, buf + 8);
+        if (log_target == LOG_TARGET_NULL)
+                return -error;
+
+        if ((level & LOG_FACMASK) == 0)
+                level = log_facility | LOG_PRI(level);
+
+        if (IN_SET(log_target, LOG_TARGET_AUTO,
+                               LOG_TARGET_JOURNAL_OR_KMSG,
+                               LOG_TARGET_JOURNAL) &&
+            journal_fd >= 0) {
+
+                struct iovec iovec[1 + n_input_iovec*2];
+                char header[LINE_MAX];
+                struct msghdr mh = {
+                        .msg_iov = iovec,
+                        .msg_iovlen = 1 + n_input_iovec*2,
+                };
+
+                log_do_header(header, sizeof(header), level, error, file, line, func, NULL, NULL, NULL, NULL);
+                iovec[0] = IOVEC_MAKE_STRING(header);
+
+                for (i = 0; i < n_input_iovec; i++) {
+                        iovec[1+i*2] = input_iovec[i];
+                        iovec[1+i*2+1] = IOVEC_MAKE_STRING("\n");
+                }
+
+                if (sendmsg(journal_fd, &mh, MSG_NOSIGNAL) >= 0)
+                        return -error;
+        }
+
+        for (i = 0; i < n_input_iovec; i++) {
+                if (input_iovec[i].iov_len < STRLEN("MESSAGE="))
+                        continue;
+
+                if (memcmp(input_iovec[i].iov_base, "MESSAGE=", STRLEN("MESSAGE=")) == 0)
+                        break;
+        }
+
+        if (_unlikely_(i >= n_input_iovec)) /* Couldn't find MESSAGE=? */
+                return -error;
+
+        m = strndupa(input_iovec[i].iov_base + STRLEN("MESSAGE="),
+                     input_iovec[i].iov_len - STRLEN("MESSAGE="));
+
+        return log_dispatch_internal(level, error, file, line, func, NULL, NULL, NULL, NULL, m);
 }
 
 int log_set_target_from_string(const char *e) {
@@ -917,18 +1075,18 @@ int log_set_target_from_string(const char *e) {
         return 0;
 }
 
-int log_set_max_level_from_string(const char *e) {
+int log_set_max_level_from_string_realm(LogRealm realm, const char *e) {
         int t;
 
         t = log_level_from_string(e);
         if (t < 0)
-                return t;
+                return -EINVAL;
 
-        log_set_max_level(t);
+        log_set_max_level_realm(realm, t);
         return 0;
 }
 
-static int parse_proc_cmdline_item(const char *key, const char *value) {
+static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
 
         /*
          * The systemd.log_xyz= settings are parsed by all tools, and
@@ -942,52 +1100,59 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
         if (streq(key, "debug") && !value)
                 log_set_max_level(LOG_DEBUG);
 
-        else if (streq(key, "systemd.log_target") && value) {
+        else if (proc_cmdline_key_streq(key, "systemd.log_target")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
                 if (log_set_target_from_string(value) < 0)
                         log_warning("Failed to parse log target '%s'. Ignoring.", value);
 
-        } else if (streq(key, "systemd.log_level") && value) {
+        } else if (proc_cmdline_key_streq(key, "systemd.log_level")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
                 if (log_set_max_level_from_string(value) < 0)
                         log_warning("Failed to parse log level '%s'. Ignoring.", value);
 
-        } else if (streq(key, "systemd.log_color") && value) {
+        } else if (proc_cmdline_key_streq(key, "systemd.log_color")) {
 
-                if (log_show_color_from_string(value) < 0)
+                if (log_show_color_from_string(value ?: "1") < 0)
                         log_warning("Failed to parse log color setting '%s'. Ignoring.", value);
 
-        } else if (streq(key, "systemd.log_location") && value) {
+        } else if (proc_cmdline_key_streq(key, "systemd.log_location")) {
 
-                if (log_show_location_from_string(value) < 0)
+                if (log_show_location_from_string(value ?: "1") < 0)
                         log_warning("Failed to parse log location setting '%s'. Ignoring.", value);
         }
 
         return 0;
 }
 
-void log_parse_environment(void) {
+void log_parse_environment_realm(LogRealm realm) {
+        /* Do not call from library code. */
+
         const char *e;
 
         if (get_ctty_devnr(0, NULL) < 0)
-                /* Only try to read the command line in daemons.
-                   We assume that anything that has a controlling
-                   tty is user stuff. */
-                (void) parse_proc_cmdline(parse_proc_cmdline_item);
+                /* Only try to read the command line in daemons.  We assume that anything that has a controlling tty is
+                   user stuff. */
+                (void) proc_cmdline_parse(parse_proc_cmdline_item, NULL, PROC_CMDLINE_STRIP_RD_PREFIX);
 
-        e = secure_getenv("SYSTEMD_LOG_TARGET");
+        e = getenv("SYSTEMD_LOG_TARGET");
         if (e && log_set_target_from_string(e) < 0)
                 log_warning("Failed to parse log target '%s'. Ignoring.", e);
 
-        e = secure_getenv("SYSTEMD_LOG_LEVEL");
-        if (e && log_set_max_level_from_string(e) < 0)
+        e = getenv("SYSTEMD_LOG_LEVEL");
+        if (e && log_set_max_level_from_string_realm(realm, e) < 0)
                 log_warning("Failed to parse log level '%s'. Ignoring.", e);
 
-        e = secure_getenv("SYSTEMD_LOG_COLOR");
+        e = getenv("SYSTEMD_LOG_COLOR");
         if (e && log_show_color_from_string(e) < 0)
                 log_warning("Failed to parse bool '%s'. Ignoring.", e);
 
-        e = secure_getenv("SYSTEMD_LOG_LOCATION");
+        e = getenv("SYSTEMD_LOG_LOCATION");
         if (e && log_show_location_from_string(e) < 0)
                 log_warning("Failed to parse bool '%s'. Ignoring.", e);
 }
@@ -996,8 +1161,8 @@ LogTarget log_get_target(void) {
         return log_target;
 }
 
-int log_get_max_level(void) {
-        return log_max_level;
+int log_get_max_level_realm(LogRealm realm) {
+        return log_max_level[realm];
 }
 
 void log_show_color(bool b) {
@@ -1039,8 +1204,8 @@ int log_show_location_from_string(const char *e) {
 }
 
 bool log_on_console(void) {
-        if (log_target == LOG_TARGET_CONSOLE ||
-            log_target == LOG_TARGET_CONSOLE_PREFIXED)
+        if (IN_SET(log_target, LOG_TARGET_CONSOLE,
+                               LOG_TARGET_CONSOLE_PREFIXED))
                 return true;
 
         return syslog_fd < 0 && kmsg_fd < 0 && journal_fd < 0;
@@ -1062,10 +1227,12 @@ static const char *const log_target_table[_LOG_TARGET_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(log_target, LogTarget);
 
 void log_received_signal(int level, const struct signalfd_siginfo *si) {
-        if (si->ssi_pid > 0) {
+        assert(si);
+
+        if (pid_is_valid(si->ssi_pid)) {
                 _cleanup_free_ char *p = NULL;
 
-                get_process_comm(si->ssi_pid, &p);
+                (void) get_process_comm(si->ssi_pid, &p);
 
                 log_full(level,
                          "Received SIG%s from PID %"PRIu32" (%s).",
@@ -1075,11 +1242,6 @@ void log_received_signal(int level, const struct signalfd_siginfo *si) {
                 log_full(level,
                          "Received SIG%s.",
                          signal_to_string(si->ssi_signo));
-
-}
-
-void log_set_upgrade_syslog_to_journal(bool b) {
-        upgrade_syslog_to_journal = b;
 }
 
 int log_syntax_internal(
@@ -1095,13 +1257,13 @@ int log_syntax_internal(
 
         PROTECT_ERRNO;
         char buffer[LINE_MAX];
-        int r;
         va_list ap;
+        const char *unit_fmt = NULL;
 
         if (error < 0)
                 error = -error;
 
-        if (_likely_(LOG_PRI(level) > log_max_level))
+        if (_likely_(LOG_PRI(level) > log_max_level[LOG_REALM_SYSTEMD]))
                 return -error;
 
         if (log_target == LOG_TARGET_NULL)
@@ -1115,24 +1277,56 @@ int log_syntax_internal(
         va_end(ap);
 
         if (unit)
-                r = log_struct_internal(
-                                level, error,
-                                file, line, func,
-                                getpid() == 1 ? "UNIT=%s" : "USER_UNIT=%s", unit,
-                                LOG_MESSAGE_ID(SD_MESSAGE_INVALID_CONFIGURATION),
-                                "CONFIG_FILE=%s", config_file,
-                                "CONFIG_LINE=%u", config_line,
-                                LOG_MESSAGE("[%s:%u] %s", config_file, config_line, buffer),
-                                NULL);
-        else
-                r = log_struct_internal(
-                                level, error,
-                                file, line, func,
-                                LOG_MESSAGE_ID(SD_MESSAGE_INVALID_CONFIGURATION),
-                                "CONFIG_FILE=%s", config_file,
-                                "CONFIG_LINE=%u", config_line,
-                                LOG_MESSAGE("[%s:%u] %s", config_file, config_line, buffer),
-                                NULL);
+                unit_fmt = getpid_cached() == 1 ? "UNIT=%s" : "USER_UNIT=%s";
 
-        return r;
+        return log_struct_internal(
+                        LOG_REALM_PLUS_LEVEL(LOG_REALM_SYSTEMD, level),
+                        error,
+                        file, line, func,
+                        "MESSAGE_ID=" SD_MESSAGE_INVALID_CONFIGURATION_STR,
+                        "CONFIG_FILE=%s", config_file,
+                        "CONFIG_LINE=%u", config_line,
+                        LOG_MESSAGE("%s:%u: %s", config_file, config_line, buffer),
+                        unit_fmt, unit,
+                        NULL);
+}
+
+int log_syntax_invalid_utf8_internal(
+                const char *unit,
+                int level,
+                const char *config_file,
+                unsigned config_line,
+                const char *file,
+                int line,
+                const char *func,
+                const char *rvalue) {
+
+        _cleanup_free_ char *p = NULL;
+
+        if (rvalue)
+                p = utf8_escape_invalid(rvalue);
+
+        log_syntax_internal(unit, level, config_file, config_line, 0, file, line, func,
+                            "String is not UTF-8 clean, ignoring assignment: %s", strna(p));
+
+        return -EINVAL;
+}
+
+void log_set_upgrade_syslog_to_journal(bool b) {
+        upgrade_syslog_to_journal = b;
+}
+
+void log_set_always_reopen_console(bool b) {
+        always_reopen_console = b;
+}
+
+void log_set_open_when_needed(bool b) {
+        open_when_needed = b;
+}
+
+int log_emergency_level(void) {
+        /* Returns the log level to use for log_emergency() logging. We use LOG_EMERG only when we are PID 1, as only
+         * then the system of the whole system is obviously affected. */
+
+        return getpid_cached() == 1 ? LOG_EMERG : LOG_ERR;
 }

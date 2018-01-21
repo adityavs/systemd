@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd
 
@@ -20,16 +21,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "fd-util.h"
 #include "fdset.h"
-#include "util.h"
+#include "fileio.h"
 #include "macro.h"
+#include "util.h"
 
 static void test_fdset_new_fill(void) {
         int fd = -1;
         _cleanup_fdset_free_ FDSet *fdset = NULL;
         char name[] = "/tmp/test-fdset_new_fill.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
         assert_se(fdset_new_fill(&fdset) >= 0);
         assert_se(fdset_contains(fdset, fd));
@@ -43,7 +46,7 @@ static void test_fdset_put_dup(void) {
         _cleanup_fdset_free_ FDSet *fdset = NULL;
         char name[] = "/tmp/test-fdset_put_dup.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -62,7 +65,7 @@ static void test_fdset_cloexec(void) {
         int flags = -1;
         char name[] = "/tmp/test-fdset_cloexec.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -89,7 +92,7 @@ static void test_fdset_close_others(void) {
         int flags = -1;
         char name[] = "/tmp/test-fdset_close_others.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -111,7 +114,7 @@ static void test_fdset_remove(void) {
         FDSet *fdset = NULL;
         char name[] = "/tmp/test-fdset_remove.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -134,7 +137,7 @@ static void test_fdset_iterate(void) {
         int c = 0;
         int a;
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -159,7 +162,7 @@ static void test_fdset_isempty(void) {
         _cleanup_fdset_free_ FDSet *fdset = NULL;
         char name[] = "/tmp/test-fdset_isempty.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();
@@ -177,7 +180,7 @@ static void test_fdset_steal_first(void) {
         _cleanup_fdset_free_ FDSet *fdset = NULL;
         char name[] = "/tmp/test-fdset_steal_first.XXXXXX";
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
 
         fdset = fdset_new();

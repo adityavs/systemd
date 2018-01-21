@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -19,9 +20,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
-int dev_urandom(void *p, size_t n);
+int acquire_random_bytes(void *p, size_t n, bool high_quality_required);
+void pseudorandom_bytes(void *p, size_t n);
 void random_bytes(void *p, size_t n);
 void initialize_srand(void);
 

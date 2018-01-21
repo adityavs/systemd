@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,16 +19,21 @@
 ***/
 
 #include <fcntl.h>
-#include <libudev.h>
 #include <linux/input.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 
-#include "util.h"
-#include "missing.h"
+#include "libudev.h"
+
+#include "alloc-util.h"
 #include "bus-util.h"
+#include "fd-util.h"
 #include "logind-session-device.h"
+#include "missing.h"
+#include "parse-util.h"
+#include "sd-daemon.h"
+#include "util.h"
 
 enum SessionDeviceNotifications {
         SESSION_DEVICE_RESUME,
@@ -39,7 +43,7 @@ enum SessionDeviceNotifications {
 };
 
 static int session_device_notify(SessionDevice *sd, enum SessionDeviceNotifications type) {
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ char *path = NULL;
         const char *t = NULL;
         uint32_t major, minor;
@@ -205,7 +209,10 @@ static int session_device_start(SessionDevice *sd) {
                 r = session_device_open(sd, true);
                 if (r < 0)
                         return r;
-                close_nointr(sd->fd);
+                /* For evdev devices, the file descriptor might be left
+                 * uninitialized. This might happen while resuming into a
+                 * session and logind has been restarted right before. */
+                safe_close(sd->fd);
                 sd->fd = r;
                 break;
         case DEVICE_TYPE_UNKNOWN:
@@ -340,7 +347,7 @@ err_dev:
         return r;
 }
 
-int session_device_new(Session *s, dev_t dev, SessionDevice **out) {
+int session_device_new(Session *s, dev_t dev, bool open_device, SessionDevice **out) {
         SessionDevice *sd;
         int r;
 
@@ -369,22 +376,24 @@ int session_device_new(Session *s, dev_t dev, SessionDevice **out) {
                 goto error;
         }
 
-        /* Open the device for the first time. We need a valid fd to pass back
-         * to the caller. If the session is not active, this _might_ immediately
-         * revoke access and thus invalidate the fd. But this is still needed
-         * to pass a valid fd back. */
-        sd->active = session_is_active(s);
-        r = session_device_open(sd, sd->active);
-        if (r < 0) {
-                /* EINVAL _may_ mean a master is active; retry inactive */
-                if (sd->active && r == -EINVAL) {
-                        sd->active = false;
-                        r = session_device_open(sd, false);
+        if (open_device) {
+                /* Open the device for the first time. We need a valid fd to pass back
+                 * to the caller. If the session is not active, this _might_ immediately
+                 * revoke access and thus invalidate the fd. But this is still needed
+                 * to pass a valid fd back. */
+                sd->active = session_is_active(s);
+                r = session_device_open(sd, sd->active);
+                if (r < 0) {
+                        /* EINVAL _may_ mean a master is active; retry inactive */
+                        if (sd->active && r == -EINVAL) {
+                                sd->active = false;
+                                r = session_device_open(sd, false);
+                        }
+                        if (r < 0)
+                                goto error;
                 }
-                if (r < 0)
-                        goto error;
+                sd->fd = r;
         }
-        sd->fd = r;
 
         LIST_PREPEND(sd_by_device, sd->device->session_devices, sd);
 
@@ -400,6 +409,17 @@ error:
 
 void session_device_free(SessionDevice *sd) {
         assert(sd);
+
+        if (sd->pushed_fd) {
+                const char *m;
+
+                /* Remove the pushed fd again, just in case. */
+
+                m = strjoina("FDSTOREREMOVE=1\n"
+                             "FDNAME=session-", sd->session->id);
+
+                (void) sd_notify(false, m);
+        }
 
         session_device_stop(sd);
         session_device_notify(sd, SESSION_DEVICE_RELEASE);
@@ -434,15 +454,16 @@ void session_device_complete_pause(SessionDevice *sd) {
 void session_device_resume_all(Session *s) {
         SessionDevice *sd;
         Iterator i;
-        int r;
 
         assert(s);
 
         HASHMAP_FOREACH(sd, s->devices, i) {
                 if (!sd->active) {
-                        r = session_device_start(sd);
-                        if (!r)
-                                session_device_notify(sd, SESSION_DEVICE_RESUME);
+                        if (session_device_start(sd) < 0)
+                                continue;
+                        if (session_device_save(sd) < 0)
+                                continue;
+                        session_device_notify(sd, SESSION_DEVICE_RESUME);
                 }
         }
 }
@@ -476,4 +497,41 @@ unsigned int session_device_try_pause_all(Session *s) {
         }
 
         return num_pending;
+}
+
+int session_device_save(SessionDevice *sd) {
+        const char *m;
+        int r;
+
+        assert(sd);
+
+        /* Store device fd in PID1. It will send it back to us on restart so revocation will continue to work. To make
+         * things simple, send fds for all type of devices even if they don't support the revocation mechanism so we
+         * don't have to handle them differently later.
+         *
+         * Note: for device supporting revocation, PID1 will drop a stored fd automatically if the corresponding device
+         * is revoked. */
+
+        if (sd->pushed_fd)
+                return 0;
+
+        m = strjoina("FDSTORE=1\n"
+                     "FDNAME=session", sd->session->id);
+
+        r = sd_pid_notify_with_fds(0, false, m, &sd->fd, 1);
+        if (r < 0)
+                return r;
+
+        sd->pushed_fd = true;
+        return 1;
+}
+
+void session_device_attach_fd(SessionDevice *sd, int fd, bool active) {
+        assert(fd > 0);
+        assert(sd);
+        assert(sd->fd < 0);
+        assert(!sd->active);
+
+        sd->fd = fd;
+        sd->active = active;
 }

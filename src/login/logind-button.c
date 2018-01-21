@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,32 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <linux/input.h>
 
 #include "sd-messages.h"
-#include "util.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "logind-button.h"
+#include "string-util.h"
+#include "util.h"
+
+#define CONST_MAX4(a, b, c, d) CONST_MAX(CONST_MAX(a, b), CONST_MAX(c, d))
+
+#define ULONG_BITS (sizeof(unsigned long)*8)
+
+static bool bitset_get(const unsigned long *bits, unsigned i) {
+        return (bits[i / ULONG_BITS] >> (i % ULONG_BITS)) & 1UL;
+}
+
+static void bitset_put(unsigned long *bits, unsigned i) {
+        bits[i / ULONG_BITS] |= (unsigned long) 1 << (i % ULONG_BITS);
+}
 
 Button* button_new(Manager *m, const char *name) {
         Button *b;
@@ -41,15 +56,12 @@ Button* button_new(Manager *m, const char *name) {
                 return NULL;
 
         b->name = strdup(name);
-        if (!b->name) {
-                free(b);
-                return NULL;
-        }
+        if (!b->name)
+                return mfree(b);
 
         if (hashmap_put(m->buttons, b->name, b) < 0) {
                 free(b->name);
-                free(b);
-                return NULL;
+                return mfree(b);
         }
 
         b->manager = m;
@@ -66,12 +78,11 @@ void button_free(Button *b) {
         sd_event_source_unref(b->io_event_source);
         sd_event_source_unref(b->check_event_source);
 
-        if (b->fd >= 0) {
+        if (b->fd >= 0)
                 /* If the device has been unplugged close() returns
                  * ENODEV, let's ignore this, hence we don't use
                  * safe_close() */
                 (void) close(b->fd);
-        }
 
         free(b->name);
         free(b->seat);
@@ -157,7 +168,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 case KEY_POWER2:
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("Power key pressed."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_POWER_KEY),
+                                   "MESSAGE_ID=" SD_MESSAGE_POWER_KEY_STR,
                                    NULL);
 
                         manager_handle_action(b->manager, INHIBIT_HANDLE_POWER_KEY, b->manager->handle_power_key, b->manager->power_key_ignore_inhibited, true);
@@ -172,7 +183,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 case KEY_SLEEP:
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("Suspend key pressed."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_SUSPEND_KEY),
+                                   "MESSAGE_ID=" SD_MESSAGE_SUSPEND_KEY_STR,
                                    NULL);
 
                         manager_handle_action(b->manager, INHIBIT_HANDLE_SUSPEND_KEY, b->manager->handle_suspend_key, b->manager->suspend_key_ignore_inhibited, true);
@@ -181,7 +192,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 case KEY_SUSPEND:
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("Hibernate key pressed."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_HIBERNATE_KEY),
+                                   "MESSAGE_ID=" SD_MESSAGE_HIBERNATE_KEY_STR,
                                    NULL);
 
                         manager_handle_action(b->manager, INHIBIT_HANDLE_HIBERNATE_KEY, b->manager->handle_hibernate_key, b->manager->hibernate_key_ignore_inhibited, true);
@@ -193,7 +204,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 if (ev.code == SW_LID) {
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("Lid closed."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_LID_CLOSED),
+                                   "MESSAGE_ID=" SD_MESSAGE_LID_CLOSED_STR,
                                    NULL);
 
                         b->lid_closed = true;
@@ -203,7 +214,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 } else if (ev.code == SW_DOCK) {
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("System docked."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_SYSTEM_DOCKED),
+                                   "MESSAGE_ID=" SD_MESSAGE_SYSTEM_DOCKED_STR,
                                    NULL);
 
                         b->docked = true;
@@ -214,7 +225,7 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 if (ev.code == SW_LID) {
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("Lid opened."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_LID_OPENED),
+                                   "MESSAGE_ID=" SD_MESSAGE_LID_OPENED_STR,
                                    NULL);
 
                         b->lid_closed = false;
@@ -223,12 +234,101 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
                 } else if (ev.code == SW_DOCK) {
                         log_struct(LOG_INFO,
                                    LOG_MESSAGE("System undocked."),
-                                   LOG_MESSAGE_ID(SD_MESSAGE_SYSTEM_UNDOCKED),
+                                   "MESSAGE_ID=" SD_MESSAGE_SYSTEM_UNDOCKED_STR,
                                    NULL);
 
                         b->docked = false;
                 }
         }
+
+        return 0;
+}
+
+static int button_suitable(Button *b) {
+        unsigned long types[CONST_MAX(EV_KEY, EV_SW)/ULONG_BITS+1];
+
+        assert(b);
+        assert(b->fd);
+
+        if (ioctl(b->fd, EVIOCGBIT(EV_SYN, sizeof(types)), types) < 0)
+                return -errno;
+
+        if (bitset_get(types, EV_KEY)) {
+                unsigned long keys[CONST_MAX4(KEY_POWER, KEY_POWER2, KEY_SLEEP, KEY_SUSPEND)/ULONG_BITS+1];
+
+                if (ioctl(b->fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) < 0)
+                        return -errno;
+
+                if (bitset_get(keys, KEY_POWER) ||
+                    bitset_get(keys, KEY_POWER2) ||
+                    bitset_get(keys, KEY_SLEEP) ||
+                    bitset_get(keys, KEY_SUSPEND))
+                        return true;
+        }
+
+        if (bitset_get(types, EV_SW)) {
+                unsigned long switches[CONST_MAX(SW_LID, SW_DOCK)/ULONG_BITS+1];
+
+                if (ioctl(b->fd, EVIOCGBIT(EV_SW, sizeof(switches)), switches) < 0)
+                        return -errno;
+
+                if (bitset_get(switches, SW_LID) ||
+                    bitset_get(switches, SW_DOCK))
+                        return true;
+        }
+
+        return false;
+}
+
+static int button_set_mask(Button *b) {
+        unsigned long
+                types[CONST_MAX(EV_KEY, EV_SW)/ULONG_BITS+1] = {},
+                keys[CONST_MAX4(KEY_POWER, KEY_POWER2, KEY_SLEEP, KEY_SUSPEND)/ULONG_BITS+1] = {},
+                switches[CONST_MAX(SW_LID, SW_DOCK)/ULONG_BITS+1] = {};
+        struct input_mask mask;
+
+        assert(b);
+        assert(b->fd >= 0);
+
+        bitset_put(types, EV_KEY);
+        bitset_put(types, EV_SW);
+
+        mask = (struct input_mask) {
+                .type = EV_SYN,
+                .codes_size = sizeof(types),
+                .codes_ptr = PTR_TO_UINT64(types),
+        };
+
+        if (ioctl(b->fd, EVIOCSMASK, &mask) < 0)
+                /* Log only at debug level if the kernel doesn't do EVIOCSMASK yet */
+                return log_full_errno(IN_SET(errno, ENOTTY, EOPNOTSUPP, EINVAL) ? LOG_DEBUG : LOG_WARNING,
+                                      errno, "Failed to set EV_SYN event mask on /dev/input/%s: %m", b->name);
+
+        bitset_put(keys, KEY_POWER);
+        bitset_put(keys, KEY_POWER2);
+        bitset_put(keys, KEY_SLEEP);
+        bitset_put(keys, KEY_SUSPEND);
+
+        mask = (struct input_mask) {
+                .type = EV_KEY,
+                .codes_size = sizeof(keys),
+                .codes_ptr = PTR_TO_UINT64(keys),
+        };
+
+        if (ioctl(b->fd, EVIOCSMASK, &mask) < 0)
+                return log_warning_errno(errno, "Failed to set EV_KEY event mask on /dev/input/%s: %m", b->name);
+
+        bitset_put(switches, SW_LID);
+        bitset_put(switches, SW_DOCK);
+
+        mask = (struct input_mask) {
+                .type = EV_SW,
+                .codes_size = sizeof(switches),
+                .codes_ptr = PTR_TO_UINT64(switches),
+        };
+
+        if (ioctl(b->fd, EVIOCSMASK, &mask) < 0)
+                return log_warning_errno(errno, "Failed to set EV_SW event mask on /dev/input/%s: %m", b->name);
 
         return 0;
 }
@@ -239,22 +339,28 @@ int button_open(Button *b) {
 
         assert(b);
 
-        if (b->fd >= 0) {
-                close(b->fd);
-                b->fd = -1;
-        }
+        b->fd = safe_close(b->fd);
 
         p = strjoina("/dev/input/", b->name);
 
         b->fd = open(p, O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
         if (b->fd < 0)
-                return log_warning_errno(errno, "Failed to open %s: %m", b->name);
+                return log_warning_errno(errno, "Failed to open %s: %m", p);
+
+        r = button_suitable(b);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to determine whether input device is relevant to us: %m");
+        if (r == 0) {
+                log_debug("Device %s does not expose keys or switches relevant to us, ignoring.", p);
+                return -EADDRNOTAVAIL;
+        }
 
         if (ioctl(b->fd, EVIOCGNAME(sizeof(name)), name) < 0) {
-                log_error_errno(errno, "Failed to get input name: %m");
-                r = -errno;
+                r = log_error_errno(errno, "Failed to get input name: %m");
                 goto fail;
         }
+
+        (void) button_set_mask(b);
 
         r = sd_event_add_io(b->manager->event, &b->io_event_source, b->fd, EPOLLIN, button_dispatch, b);
         if (r < 0) {
@@ -267,13 +373,12 @@ int button_open(Button *b) {
         return 0;
 
 fail:
-        close(b->fd);
-        b->fd = -1;
+        b->fd = safe_close(b->fd);
         return r;
 }
 
 int button_check_switches(Button *b) {
-        uint8_t switches[SW_MAX/8+1] = {};
+        unsigned long switches[CONST_MAX(SW_LID, SW_DOCK)/ULONG_BITS+1] = {};
         assert(b);
 
         if (b->fd < 0)
@@ -282,8 +387,8 @@ int button_check_switches(Button *b) {
         if (ioctl(b->fd, EVIOCGSW(sizeof(switches)), switches) < 0)
                 return -errno;
 
-        b->lid_closed = (switches[SW_LID/8] >> (SW_LID % 8)) & 1;
-        b->docked = (switches[SW_DOCK/8] >> (SW_DOCK % 8)) & 1;
+        b->lid_closed = bitset_get(switches, SW_LID);
+        b->docked = bitset_get(switches, SW_DOCK);
 
         if (b->lid_closed)
                 button_install_check_event_source(b);

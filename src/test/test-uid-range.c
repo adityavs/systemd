@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,8 +20,10 @@
 
 #include <stddef.h>
 
-#include "util.h"
+#include "alloc-util.h"
 #include "uid-range.h"
+#include "user-util.h"
+#include "util.h"
 
 int main(int argc, char *argv[]) {
         _cleanup_free_ UidRange *p = NULL;

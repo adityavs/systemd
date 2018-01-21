@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,15 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 
-#ifdef HAVE_LINUX_BTRFS_H
+#if HAVE_LINUX_BTRFS_H
 #include <linux/btrfs.h>
 #endif
 
+#include "fd-util.h"
 #include "missing.h"
+#include "string-util.h"
 #include "udev.h"
 
 static int builtin_btrfs(struct udev_device *dev, int argc, char *argv[], bool test) {

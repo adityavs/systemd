@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,19 +22,27 @@
 
 #include "sd-daemon.h"
 #include "sd-event.h"
-#include "util.h"
-#include "path-util.h"
+
+#include "alloc-util.h"
 #include "btrfs-util.h"
 #include "copy.h"
-#include "mkdir.h"
-#include "rm-rf.h"
-#include "ratelimit.h"
-#include "machine-pool.h"
-#include "qcow2-util.h"
-#include "import-compress.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
+#include "hostname-util.h"
 #include "import-common.h"
+#include "import-compress.h"
 #include "import-tar.h"
+#include "io-util.h"
+#include "machine-pool.h"
+#include "mkdir.h"
+#include "path-util.h"
 #include "process-util.h"
+#include "qcow2-util.h"
+#include "ratelimit.h"
+#include "rm-rf.h"
+#include "string-util.h"
+#include "util.h"
 
 struct TarImport {
         sd_event *event;
@@ -101,9 +108,7 @@ TarImport* tar_import_unref(TarImport *i) {
         free(i->final_path);
         free(i->image_root);
         free(i->local);
-        free(i);
-
-        return NULL;
+        return mfree(i);
 }
 
 int tar_import_new(
@@ -185,7 +190,7 @@ static int tar_import_finish(TarImport *i) {
         i->tar_fd = safe_close(i->tar_fd);
 
         if (i->tar_pid > 0) {
-                r = wait_for_terminate_and_warn("tar", i->tar_pid, true);
+                r = wait_for_terminate_and_check("tar", i->tar_pid, WAIT_LOG);
                 i->tar_pid = 0;
                 if (r < 0)
                         return r;
@@ -204,8 +209,7 @@ static int tar_import_finish(TarImport *i) {
         if (r < 0)
                 return log_error_errno(r, "Failed to move image into place: %m");
 
-        free(i->temp_path);
-        i->temp_path = NULL;
+        i->temp_path = mfree(i->temp_path);
 
         return 0;
 }
@@ -219,7 +223,7 @@ static int tar_import_fork_tar(TarImport *i) {
         assert(!i->temp_path);
         assert(i->tar_fd < 0);
 
-        i->final_path = strjoin(i->image_root, "/", i->local, NULL);
+        i->final_path = strjoin(i->image_root, "/", i->local);
         if (!i->final_path)
                 return log_oom();
 
@@ -234,7 +238,9 @@ static int tar_import_fork_tar(TarImport *i) {
                 if (mkdir(i->temp_path, 0755) < 0)
                         return log_error_errno(errno, "Failed to create directory %s: %m", i->temp_path);
         } else if (r < 0)
-                return log_error_errno(errno, "Failed to create subvolume %s: %m", i->temp_path);
+                return log_error_errno(r, "Failed to create subvolume %s: %m", i->temp_path);
+        else
+                (void) import_assign_pool_quota_and_warn(i->temp_path);
 
         i->tar_fd = import_fork_tar_x(i->temp_path, &i->tar_pid);
         if (i->tar_fd < 0)
@@ -279,7 +285,7 @@ static int tar_import_process(TarImport *i) {
         }
         if (l == 0) {
                 if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
-                        log_error("Premature end of file: %m");
+                        log_error("Premature end of file.");
                         r = -EIO;
                         goto finish;
                 }
@@ -293,7 +299,7 @@ static int tar_import_process(TarImport *i) {
         if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
                 r = import_uncompress_detect(&i->compress, i->buffer, i->buffer_size);
                 if (r < 0) {
-                        log_error("Failed to detect file compression: %m");
+                        log_error_errno(r, "Failed to detect file compression: %m");
                         goto finish;
                 }
                 if (r == 0) /* Need more data */

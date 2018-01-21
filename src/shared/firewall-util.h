@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,9 +20,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "in-addr-util.h"
 
-#ifdef HAVE_LIBIPTC
+#if HAVE_LIBIPTC
 
 int fw_add_masquerade(
                 bool add,

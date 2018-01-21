@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,24 +18,26 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 
-#include "macro.h"
-#include "util.h"
-#include "log.h"
+#include "alloc-util.h"
 #include "fileio.h"
-#include "hostname-util.h"
 #include "hostname-setup.h"
+#include "hostname-util.h"
+#include "log.h"
+#include "macro.h"
+#include "string-util.h"
+#include "util.h"
 
 int hostname_setup(void) {
-        int r;
         _cleanup_free_ char *b = NULL;
-        const char *hn;
         bool enoent = false;
+        const char *hn;
+        int r;
 
-        r = read_hostname_config("/etc/hostname", &b);
+        r = read_etc_hostname(NULL, &b);
         if (r < 0) {
                 if (r == -ENOENT)
                         enoent = true;
@@ -56,11 +57,12 @@ int hostname_setup(void) {
                 if (enoent)
                         log_info("No hostname configured.");
 
-                hn = "localhost";
+                hn = FALLBACK_HOSTNAME;
         }
 
-        if (sethostname_idempotent(hn) < 0)
-                return log_warning_errno(errno, "Failed to set hostname to <%s>: %m", hn);
+        r = sethostname_idempotent(hn);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to set hostname to <%s>: %m", hn);
 
         log_info("Set hostname to <%s>.", hn);
         return 0;

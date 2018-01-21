@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -28,17 +27,20 @@
 const char* object_compressed_to_string(int compression);
 int object_compressed_from_string(const char *compression);
 
-int compress_blob_xz(const void *src, uint64_t src_size, void *dst, size_t *dst_size);
-int compress_blob_lz4(const void *src, uint64_t src_size, void *dst, size_t *dst_size);
+int compress_blob_xz(const void *src, uint64_t src_size,
+                     void *dst, size_t dst_alloc_size, size_t *dst_size);
+int compress_blob_lz4(const void *src, uint64_t src_size,
+                      void *dst, size_t dst_alloc_size, size_t *dst_size);
 
-static inline int compress_blob(const void *src, uint64_t src_size, void *dst, size_t *dst_size) {
+static inline int compress_blob(const void *src, uint64_t src_size,
+                                void *dst, size_t dst_alloc_size, size_t *dst_size) {
         int r;
-#ifdef HAVE_LZ4
-        r = compress_blob_lz4(src, src_size, dst, dst_size);
+#if HAVE_LZ4
+        r = compress_blob_lz4(src, src_size, dst, dst_alloc_size, dst_size);
         if (r == 0)
                 return OBJECT_COMPRESSED_LZ4;
 #else
-        r = compress_blob_xz(src, src_size, dst, dst_size);
+        r = compress_blob_xz(src, src_size, dst, dst_alloc_size, dst_size);
         if (r == 0)
                 return OBJECT_COMPRESSED_XZ;
 #endif
@@ -67,13 +69,13 @@ int decompress_startswith(int compression,
                           const void *prefix, size_t prefix_len,
                           uint8_t extra);
 
-int compress_stream_xz(int fdf, int fdt, off_t max_bytes);
-int compress_stream_lz4(int fdf, int fdt, off_t max_bytes);
+int compress_stream_xz(int fdf, int fdt, uint64_t max_bytes);
+int compress_stream_lz4(int fdf, int fdt, uint64_t max_bytes);
 
-int decompress_stream_xz(int fdf, int fdt, off_t max_size);
-int decompress_stream_lz4(int fdf, int fdt, off_t max_size);
+int decompress_stream_xz(int fdf, int fdt, uint64_t max_size);
+int decompress_stream_lz4(int fdf, int fdt, uint64_t max_size);
 
-#ifdef HAVE_LZ4
+#if HAVE_LZ4
 #  define compress_stream compress_stream_lz4
 #  define COMPRESSED_EXT ".lz4"
 #else
@@ -81,4 +83,4 @@ int decompress_stream_lz4(int fdf, int fdt, off_t max_size);
 #  define COMPRESSED_EXT ".xz"
 #endif
 
-int decompress_stream(const char *filename, int fdf, int fdt, off_t max_bytes);
+int decompress_stream(const char *filename, int fdf, int fdt, uint64_t max_bytes);

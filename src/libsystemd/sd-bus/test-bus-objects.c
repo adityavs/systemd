@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,19 +18,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
 #include <pthread.h>
-
-#include "log.h"
-#include "util.h"
-#include "macro.h"
-#include "strv.h"
+#include <stdlib.h>
 
 #include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "bus-dump.h"
 #include "bus-internal.h"
 #include "bus-message.h"
 #include "bus-util.h"
-#include "bus-dump.h"
+#include "log.h"
+#include "macro.h"
+#include "strv.h"
+#include "util.h"
 
 struct context {
         int fds[2];
@@ -50,7 +50,7 @@ static int something_handler(sd_bus_message *m, void *userdata, sd_bus_error *er
         r = sd_bus_message_read(m, "s", &s);
         assert_se(r > 0);
 
-        n = strjoin("<<<", s, ">>>", NULL);
+        n = strjoin("<<<", s, ">>>");
         assert_se(n);
 
         free(c->something);
@@ -154,7 +154,7 @@ static int notify_test2(sd_bus_message *m, void *userdata, sd_bus_error *error) 
 static int emit_interfaces_added(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         int r;
 
-        assert_se(sd_bus_emit_interfaces_added(sd_bus_message_get_bus(m), m->path, "org.freedesktop.systemd.test", NULL) >= 0);
+        assert_se(sd_bus_emit_interfaces_added(sd_bus_message_get_bus(m), "/value/a/x", "org.freedesktop.systemd.ValueTest", NULL) >= 0);
 
         r = sd_bus_reply_method_return(m, NULL);
         assert_se(r >= 0);
@@ -165,7 +165,7 @@ static int emit_interfaces_added(sd_bus_message *m, void *userdata, sd_bus_error
 static int emit_interfaces_removed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         int r;
 
-        assert_se(sd_bus_emit_interfaces_removed(sd_bus_message_get_bus(m), m->path, "org.freedesktop.systemd.test", NULL) >= 0);
+        assert_se(sd_bus_emit_interfaces_removed(sd_bus_message_get_bus(m), "/value/a/x", "org.freedesktop.systemd.ValueTest", NULL) >= 0);
 
         r = sd_bus_reply_method_return(m, NULL);
         assert_se(r >= 0);
@@ -176,7 +176,7 @@ static int emit_interfaces_removed(sd_bus_message *m, void *userdata, sd_bus_err
 static int emit_object_added(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         int r;
 
-        assert_se(sd_bus_emit_object_added(sd_bus_message_get_bus(m), m->path) >= 0);
+        assert_se(sd_bus_emit_object_added(sd_bus_message_get_bus(m), "/value/a/x") >= 0);
 
         r = sd_bus_reply_method_return(m, NULL);
         assert_se(r >= 0);
@@ -187,7 +187,7 @@ static int emit_object_added(sd_bus_message *m, void *userdata, sd_bus_error *er
 static int emit_object_removed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         int r;
 
-        assert_se(sd_bus_emit_object_removed(sd_bus_message_get_bus(m), m->path) >= 0);
+        assert_se(sd_bus_emit_object_removed(sd_bus_message_get_bus(m), "/value/a/x") >= 0);
 
         r = sd_bus_reply_method_return(m, NULL);
         assert_se(r >= 0);
@@ -218,6 +218,7 @@ static const sd_bus_vtable vtable2[] = {
         SD_BUS_PROPERTY("Value2", "s", value_handler, 10, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         SD_BUS_PROPERTY("Value3", "s", value_handler, 10, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Value4", "s", value_handler, 10, 0),
+        SD_BUS_PROPERTY("AnExplicitProperty", "s", NULL, offsetof(struct context, something), SD_BUS_VTABLE_PROPERTY_EXPLICIT|SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         SD_BUS_VTABLE_END
 };
 
@@ -225,6 +226,14 @@ static int enumerator_callback(sd_bus *bus, const char *path, void *userdata, ch
 
         if (object_path_startswith("/value", path))
                 assert_se(*nodes = strv_new("/value/a", "/value/b", "/value/c", NULL));
+
+        return 1;
+}
+
+static int enumerator2_callback(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
+
+        if (object_path_startswith("/value/a", path))
+                assert_se(*nodes = strv_new("/value/a/x", "/value/a/y", "/value/a/z", NULL));
 
         return 1;
 }
@@ -247,7 +256,9 @@ static void *server(void *p) {
         assert_se(sd_bus_add_object_vtable(bus, NULL, "/foo", "org.freedesktop.systemd.test2", vtable, c) >= 0);
         assert_se(sd_bus_add_fallback_vtable(bus, NULL, "/value", "org.freedesktop.systemd.ValueTest", vtable2, NULL, UINT_TO_PTR(20)) >= 0);
         assert_se(sd_bus_add_node_enumerator(bus, NULL, "/value", enumerator_callback, NULL) >= 0);
+        assert_se(sd_bus_add_node_enumerator(bus, NULL, "/value/a", enumerator2_callback, NULL) >= 0);
         assert_se(sd_bus_add_object_manager(bus, NULL, "/value") >= 0);
+        assert_se(sd_bus_add_object_manager(bus, NULL, "/value/a") >= 0);
 
         assert_se(sd_bus_start(bus) >= 0);
 
@@ -285,9 +296,9 @@ fail:
 }
 
 static int client(struct context *c) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *s;
         int r;
 
@@ -514,8 +525,6 @@ int main(int argc, char *argv[]) {
         pthread_t s;
         void *p;
         int r, q;
-
-        zero(c);
 
         c.automatic_integer_property = 4711;
         assert_se(c.automatic_string_property = strdup("dudeldu"));

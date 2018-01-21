@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
+#pragma once
+
 /*
  * Copyright (C) 2010 - Maxim Levitsky
  *
@@ -16,8 +19,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor,
  * Boston, MA  02110-1301  USA
  */
-
-#pragma once
 
 #include <mtd/mtd-user.h>
 

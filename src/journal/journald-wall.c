@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,11 +18,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "utmp-wtmp.h"
+#include "alloc-util.h"
+#include "format-util.h"
 #include "journald-server.h"
 #include "journald-wall.h"
-#include "formats-util.h"
 #include "process-util.h"
+#include "string-util.h"
+#include "utmp-wtmp.h"
 
 void server_forward_wall(
                 Server *s,
@@ -57,7 +58,7 @@ void server_forward_wall(
 
         } else if (identifier) {
 
-                l = l_buf = strjoin(identifier, ": ", message, NULL);
+                l = l_buf = strjoin(identifier, ": ", message);
                 if (!l_buf) {
                         log_oom();
                         return;

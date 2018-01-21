@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,17 +20,27 @@
 
 #include <netinet/tcp.h>
 
-#include "missing.h"
-#include "strv.h"
-#include "socket-util.h"
 #include "af-list.h"
-#include "random-util.h"
-#include "hostname-util.h"
+#include "alloc-util.h"
 #include "dns-domain.h"
+#include "fd-util.h"
+#include "hostname-util.h"
+#include "missing.h"
+#include "random-util.h"
+#include "resolved-dnssd.h"
 #include "resolved-dns-scope.h"
+#include "resolved-dns-zone.h"
+#include "resolved-llmnr.h"
+#include "resolved-mdns.h"
+#include "socket-util.h"
+#include "strv.h"
 
 #define MULTICAST_RATELIMIT_INTERVAL_USEC (1*USEC_PER_SEC)
 #define MULTICAST_RATELIMIT_BURST 1000
+
+/* After how much time to repeat LLMNR requests, see RFC 4795 Section 7 */
+#define MULTICAST_RESEND_TIMEOUT_MIN_USEC (100 * USEC_PER_MSEC)
+#define MULTICAST_RESEND_TIMEOUT_MAX_USEC (1 * USEC_PER_SEC)
 
 int dns_scope_new(Manager *m, DnsScope **ret, Link *l, DnsProtocol protocol, int family) {
         DnsScope *s;
@@ -47,10 +56,26 @@ int dns_scope_new(Manager *m, DnsScope **ret, Link *l, DnsProtocol protocol, int
         s->link = l;
         s->protocol = protocol;
         s->family = family;
+        s->resend_timeout = MULTICAST_RESEND_TIMEOUT_MIN_USEC;
+
+        if (protocol == DNS_PROTOCOL_DNS) {
+                /* Copy DNSSEC mode from the link if it is set there,
+                 * otherwise take the manager's DNSSEC mode. Note that
+                 * we copy this only at scope creation time, and do
+                 * not update it from the on, even if the setting
+                 * changes. */
+
+                if (l)
+                        s->dnssec_mode = link_get_dnssec_mode(l);
+                else
+                        s->dnssec_mode = manager_get_dnssec_mode(m);
+        } else
+                s->dnssec_mode = DNSSEC_NO;
 
         LIST_PREPEND(scopes, m->dns_scopes, s);
 
         dns_scope_llmnr_membership(s, true);
+        dns_scope_mdns_membership(s, true);
 
         log_debug("New scope on link %s, protocol %s, family %s", l ? l->name : "*", dns_protocol_to_string(protocol), family == AF_UNSPEC ? "*" : af_to_name(family));
 
@@ -61,43 +86,49 @@ int dns_scope_new(Manager *m, DnsScope **ret, Link *l, DnsProtocol protocol, int
         return 0;
 }
 
-DnsScope* dns_scope_free(DnsScope *s) {
-        DnsTransaction *t;
-        DnsResourceRecord *rr;
+static void dns_scope_abort_transactions(DnsScope *s) {
+        assert(s);
 
+        while (s->transactions) {
+                DnsTransaction *t = s->transactions;
+
+                /* Abort the transaction, but make sure it is not
+                 * freed while we still look at it */
+
+                t->block_gc++;
+                if (DNS_TRANSACTION_IS_LIVE(t->state))
+                        dns_transaction_complete(t, DNS_TRANSACTION_ABORTED);
+                t->block_gc--;
+
+                dns_transaction_free(t);
+        }
+}
+
+DnsScope* dns_scope_free(DnsScope *s) {
         if (!s)
                 return NULL;
 
         log_debug("Removing scope on link %s, protocol %s, family %s", s->link ? s->link->name : "*", dns_protocol_to_string(s->protocol), s->family == AF_UNSPEC ? "*" : af_to_name(s->family));
 
         dns_scope_llmnr_membership(s, false);
+        dns_scope_mdns_membership(s, false);
+        dns_scope_abort_transactions(s);
 
-        while ((t = s->transactions)) {
+        while (s->query_candidates)
+                dns_query_candidate_free(s->query_candidates);
 
-                /* Abort the transaction, but make sure it is not
-                 * freed while we still look at it */
+        hashmap_free(s->transactions_by_key);
 
-                t->block_gc++;
-                dns_transaction_complete(t, DNS_TRANSACTION_ABORTED);
-                t->block_gc--;
-
-                dns_transaction_free(t);
-        }
-
-        while ((rr = ordered_hashmap_steal_first(s->conflict_queue)))
-                dns_resource_record_unref(rr);
-
-        ordered_hashmap_free(s->conflict_queue);
+        ordered_hashmap_free_with_destructor(s->conflict_queue, dns_resource_record_unref);
         sd_event_source_unref(s->conflict_event_source);
+
+        sd_event_source_unref(s->announce_event_source);
 
         dns_cache_flush(&s->cache);
         dns_zone_flush(&s->zone);
 
         LIST_REMOVE(scopes, s->manager->dns_scopes, s);
-        strv_free(s->domains);
-        free(s);
-
-        return NULL;
+        return mfree(s);
 }
 
 DnsServer *dns_scope_get_dns_server(DnsScope *s) {
@@ -112,6 +143,26 @@ DnsServer *dns_scope_get_dns_server(DnsScope *s) {
                 return manager_get_dns_server(s->manager);
 }
 
+unsigned dns_scope_get_n_dns_servers(DnsScope *s) {
+        unsigned n = 0;
+        DnsServer *i;
+
+        assert(s);
+
+        if (s->protocol != DNS_PROTOCOL_DNS)
+                return 0;
+
+        if (s->link)
+                i = s->link->dns_servers;
+        else
+                i = s->manager->dns_servers;
+
+        for (; i; i = i->servers_next)
+                n++;
+
+        return n;
+}
+
 void dns_scope_next_dns_server(DnsScope *s) {
         assert(s);
 
@@ -124,13 +175,28 @@ void dns_scope_next_dns_server(DnsScope *s) {
                 manager_next_dns_server(s->manager);
 }
 
-int dns_scope_emit(DnsScope *s, DnsPacket *p) {
+void dns_scope_packet_received(DnsScope *s, usec_t rtt) {
+        assert(s);
+
+        if (rtt <= s->max_rtt)
+                return;
+
+        s->max_rtt = rtt;
+        s->resend_timeout = MIN(MAX(MULTICAST_RESEND_TIMEOUT_MIN_USEC, s->max_rtt * 2), MULTICAST_RESEND_TIMEOUT_MAX_USEC);
+}
+
+void dns_scope_packet_lost(DnsScope *s, usec_t usec) {
+        assert(s);
+
+        if (s->resend_timeout <= usec)
+                s->resend_timeout = MIN(s->resend_timeout * 2, MULTICAST_RESEND_TIMEOUT_MAX_USEC);
+}
+
+static int dns_scope_emit_one(DnsScope *s, int fd, DnsPacket *p) {
         union in_addr_union addr;
         int ifindex = 0, r;
         int family;
-        uint16_t port;
         uint32_t mtu;
-        int fd;
 
         assert(s);
         assert(p);
@@ -142,36 +208,28 @@ int dns_scope_emit(DnsScope *s, DnsPacket *p) {
         } else
                 mtu = manager_find_mtu(s->manager);
 
-        if (s->protocol == DNS_PROTOCOL_DNS) {
-                DnsServer *srv;
+        switch (s->protocol) {
+
+        case DNS_PROTOCOL_DNS:
+                assert(fd >= 0);
 
                 if (DNS_PACKET_QDCOUNT(p) > 1)
                         return -EOPNOTSUPP;
 
-                srv = dns_scope_get_dns_server(s);
-                if (!srv)
-                        return -ESRCH;
-
-                family = srv->family;
-                addr = srv->address;
-                port = 53;
-
                 if (p->size > DNS_PACKET_UNICAST_SIZE_MAX)
                         return -EMSGSIZE;
 
-                if (p->size > mtu)
+                if (p->size + UDP_PACKET_HEADER_SIZE > mtu)
                         return -EMSGSIZE;
 
-                if (family == AF_INET)
-                        fd = manager_dns_ipv4_fd(s->manager);
-                else if (family == AF_INET6)
-                        fd = manager_dns_ipv6_fd(s->manager);
-                else
-                        return -EAFNOSUPPORT;
-                if (fd < 0)
-                        return fd;
+                r = manager_write(s->manager, fd, p);
+                if (r < 0)
+                        return r;
 
-        } else if (s->protocol == DNS_PROTOCOL_LLMNR) {
+                break;
+
+        case DNS_PROTOCOL_LLMNR:
+                assert(fd < 0);
 
                 if (DNS_PACKET_QDCOUNT(p) > 1)
                         return -EOPNOTSUPP;
@@ -180,7 +238,6 @@ int dns_scope_emit(DnsScope *s, DnsPacket *p) {
                         return -EBUSY;
 
                 family = s->family;
-                port = 5355;
 
                 if (family == AF_INET) {
                         addr.in = LLMNR_MULTICAST_IPV4_ADDRESS;
@@ -192,47 +249,110 @@ int dns_scope_emit(DnsScope *s, DnsPacket *p) {
                         return -EAFNOSUPPORT;
                 if (fd < 0)
                         return fd;
-        } else
-                return -EAFNOSUPPORT;
 
-        r = manager_send(s->manager, fd, ifindex, family, &addr, port, p);
-        if (r < 0)
-                return r;
+                r = manager_send(s->manager, fd, ifindex, family, &addr, LLMNR_PORT, NULL, p);
+                if (r < 0)
+                        return r;
+
+                break;
+
+        case DNS_PROTOCOL_MDNS:
+                assert(fd < 0);
+
+                if (!ratelimit_test(&s->ratelimit))
+                        return -EBUSY;
+
+                family = s->family;
+
+                if (family == AF_INET) {
+                        addr.in = MDNS_MULTICAST_IPV4_ADDRESS;
+                        fd = manager_mdns_ipv4_fd(s->manager);
+                } else if (family == AF_INET6) {
+                        addr.in6 = MDNS_MULTICAST_IPV6_ADDRESS;
+                        fd = manager_mdns_ipv6_fd(s->manager);
+                } else
+                        return -EAFNOSUPPORT;
+                if (fd < 0)
+                        return fd;
+
+                r = manager_send(s->manager, fd, ifindex, family, &addr, MDNS_PORT, NULL, p);
+                if (r < 0)
+                        return r;
+
+                break;
+
+        default:
+                return -EAFNOSUPPORT;
+        }
 
         return 1;
 }
 
-int dns_scope_tcp_socket(DnsScope *s, int family, const union in_addr_union *address, uint16_t port) {
+int dns_scope_emit_udp(DnsScope *s, int fd, DnsPacket *p) {
+        int r;
+
+        assert(s);
+        assert(p);
+        assert(p->protocol == s->protocol);
+        assert((s->protocol == DNS_PROTOCOL_DNS) == (fd >= 0));
+
+        do {
+                /* If there are multiple linked packets, set the TC bit in all but the last of them */
+                if (p->more) {
+                        assert(p->protocol == DNS_PROTOCOL_MDNS);
+                        dns_packet_set_flags(p, true, true);
+                }
+
+                r = dns_scope_emit_one(s, fd, p);
+                if (r < 0)
+                        return r;
+
+                p = p->more;
+        } while (p);
+
+        return 0;
+}
+
+static int dns_scope_socket(
+                DnsScope *s,
+                int type,
+                int family,
+                const union in_addr_union *address,
+                DnsServer *server,
+                uint16_t port) {
+
         _cleanup_close_ int fd = -1;
         union sockaddr_union sa = {};
         socklen_t salen;
         static const int one = 1;
-        int ret, r;
+        int ret, r, ifindex;
 
         assert(s);
-        assert((family == AF_UNSPEC) == !address);
 
-        if (family == AF_UNSPEC) {
-                DnsServer *srv;
+        if (server) {
+                assert(family == AF_UNSPEC);
+                assert(!address);
 
-                srv = dns_scope_get_dns_server(s);
-                if (!srv)
-                        return -ESRCH;
+                ifindex = dns_server_ifindex(server);
 
-                sa.sa.sa_family = srv->family;
-                if (srv->family == AF_INET) {
+                sa.sa.sa_family = server->family;
+                if (server->family == AF_INET) {
                         sa.in.sin_port = htobe16(port);
-                        sa.in.sin_addr = srv->address.in;
+                        sa.in.sin_addr = server->address.in;
                         salen = sizeof(sa.in);
-                } else if (srv->family == AF_INET6) {
+                } else if (server->family == AF_INET6) {
                         sa.in6.sin6_port = htobe16(port);
-                        sa.in6.sin6_addr = srv->address.in6;
-                        sa.in6.sin6_scope_id = s->link ? s->link->ifindex : 0;
+                        sa.in6.sin6_addr = server->address.in6;
+                        sa.in6.sin6_scope_id = ifindex;
                         salen = sizeof(sa.in6);
                 } else
                         return -EAFNOSUPPORT;
         } else {
+                assert(family != AF_UNSPEC);
+                assert(address);
+
                 sa.sa.sa_family = family;
+                ifindex = s->link ? s->link->ifindex : 0;
 
                 if (family == AF_INET) {
                         sa.in.sin_port = htobe16(port);
@@ -241,29 +361,31 @@ int dns_scope_tcp_socket(DnsScope *s, int family, const union in_addr_union *add
                 } else if (family == AF_INET6) {
                         sa.in6.sin6_port = htobe16(port);
                         sa.in6.sin6_addr = address->in6;
-                        sa.in6.sin6_scope_id = s->link ? s->link->ifindex : 0;
+                        sa.in6.sin6_scope_id = ifindex;
                         salen = sizeof(sa.in6);
                 } else
                         return -EAFNOSUPPORT;
         }
 
-        fd = socket(sa.sa.sa_family, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+        fd = socket(sa.sa.sa_family, type|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (fd < 0)
                 return -errno;
 
-        r = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (r < 0)
-                return -errno;
+        if (type == SOCK_STREAM) {
+                r = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                if (r < 0)
+                        return -errno;
+        }
 
         if (s->link) {
-                uint32_t ifindex = htobe32(s->link->ifindex);
+                be32_t ifindex_be = htobe32(ifindex);
 
                 if (sa.sa.sa_family == AF_INET) {
-                        r = setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex, sizeof(ifindex));
+                        r = setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex_be, sizeof(ifindex_be));
                         if (r < 0)
                                 return -errno;
                 } else if (sa.sa.sa_family == AF_INET6) {
-                        r = setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifindex, sizeof(ifindex));
+                        r = setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifindex_be, sizeof(ifindex_be));
                         if (r < 0)
                                 return -errno;
                 }
@@ -293,95 +415,168 @@ int dns_scope_tcp_socket(DnsScope *s, int family, const union in_addr_union *add
         return ret;
 }
 
+int dns_scope_socket_udp(DnsScope *s, DnsServer *server, uint16_t port) {
+        return dns_scope_socket(s, SOCK_DGRAM, AF_UNSPEC, NULL, server, port);
+}
+
+int dns_scope_socket_tcp(DnsScope *s, int family, const union in_addr_union *address, DnsServer *server, uint16_t port) {
+        return dns_scope_socket(s, SOCK_STREAM, family, address, server, port);
+}
+
 DnsScopeMatch dns_scope_good_domain(DnsScope *s, int ifindex, uint64_t flags, const char *domain) {
-        char **i;
+        DnsSearchDomain *d;
 
         assert(s);
         assert(domain);
 
+        /* Checks if the specified domain is something to look up on
+         * this scope. Note that this accepts non-qualified hostnames,
+         * i.e. those without any search path prefixed yet. */
+
         if (ifindex != 0 && (!s->link || s->link->ifindex != ifindex))
                 return DNS_SCOPE_NO;
 
-        if ((SD_RESOLVED_FLAGS_MAKE(s->protocol, s->family) & flags) == 0)
+        if ((SD_RESOLVED_FLAGS_MAKE(s->protocol, s->family, 0) & flags) == 0)
                 return DNS_SCOPE_NO;
 
-        STRV_FOREACH(i, s->domains)
-                if (dns_name_endswith(domain, *i) > 0)
-                        return DNS_SCOPE_YES;
-
-        if (dns_name_root(domain) != 0)
+        /* Never resolve any loopback hostname or IP address via DNS,
+         * LLMNR or mDNS. Instead, always rely on synthesized RRs for
+         * these. */
+        if (is_localhost(domain) ||
+            dns_name_endswith(domain, "127.in-addr.arpa") > 0 ||
+            dns_name_equal(domain, "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa") > 0)
                 return DNS_SCOPE_NO;
 
-        if (is_localhost(domain))
+        /* Never respond to some of the domains listed in RFC6303 */
+        if (dns_name_endswith(domain, "0.in-addr.arpa") > 0 ||
+            dns_name_equal(domain, "255.255.255.255.in-addr.arpa") > 0 ||
+            dns_name_equal(domain, "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa") > 0)
                 return DNS_SCOPE_NO;
 
-        if (s->protocol == DNS_PROTOCOL_DNS) {
+        /* Never respond to some of the domains listed in RFC6761 */
+        if (dns_name_endswith(domain, "invalid") > 0)
+                return DNS_SCOPE_NO;
+
+        switch (s->protocol) {
+
+        case DNS_PROTOCOL_DNS: {
+                DnsServer *dns_server;
+
+                /* Never route things to scopes that lack DNS servers */
+                dns_server = dns_scope_get_dns_server(s);
+                if (!dns_server)
+                        return DNS_SCOPE_NO;
+
+                /* Always honour search domains for routing queries, except if this scope lacks DNS servers. Note that
+                 * we return DNS_SCOPE_YES here, rather than just DNS_SCOPE_MAYBE, which means other wildcard scopes
+                 * won't be considered anymore. */
+                LIST_FOREACH(domains, d, dns_scope_get_search_domains(s))
+                        if (dns_name_endswith(domain, d->name) > 0)
+                                return DNS_SCOPE_YES;
+
+                /* If the DNS server has route-only domains, don't send other requests to it. This would be a privacy
+                 * violation, will most probably fail anyway, and adds unnecessary load. */
+                if (dns_server_limited_domains(dns_server))
+                        return DNS_SCOPE_NO;
+
+                /* Exclude link-local IP ranges */
                 if (dns_name_endswith(domain, "254.169.in-addr.arpa") == 0 &&
-                    dns_name_endswith(domain, "0.8.e.f.ip6.arpa") == 0 &&
-                    dns_name_single_label(domain) == 0)
+                    dns_name_endswith(domain, "8.e.f.ip6.arpa") == 0 &&
+                    dns_name_endswith(domain, "9.e.f.ip6.arpa") == 0 &&
+                    dns_name_endswith(domain, "a.e.f.ip6.arpa") == 0 &&
+                    dns_name_endswith(domain, "b.e.f.ip6.arpa") == 0 &&
+                    /* If networks use .local in their private setups, they are supposed to also add .local to their search
+                     * domains, which we already checked above. Otherwise, we consider .local specific to mDNS and won't
+                     * send such queries ordinary DNS servers. */
+                    dns_name_endswith(domain, "local") == 0)
                         return DNS_SCOPE_MAYBE;
 
                 return DNS_SCOPE_NO;
         }
 
-        if (s->protocol == DNS_PROTOCOL_MDNS) {
-                if (dns_name_endswith(domain, "254.169.in-addr.arpa") > 0 ||
-                    dns_name_endswith(domain, "0.8.e.f.ip6.arpa") > 0 ||
-                    (dns_name_endswith(domain, "local") > 0 && dns_name_equal(domain, "local") == 0))
+        case DNS_PROTOCOL_MDNS:
+                if ((s->family == AF_INET && dns_name_endswith(domain, "in-addr.arpa") > 0) ||
+                    (s->family == AF_INET6 && dns_name_endswith(domain, "ip6.arpa") > 0) ||
+                    (dns_name_endswith(domain, "local") > 0 && /* only resolve names ending in .local via mDNS */
+                     dns_name_equal(domain, "local") == 0 &&   /* but not the single-label "local" name itself */
+                     manager_is_own_hostname(s->manager, domain) <= 0)) /* never resolve the local hostname via mDNS */
                         return DNS_SCOPE_MAYBE;
 
                 return DNS_SCOPE_NO;
-        }
 
-        if (s->protocol == DNS_PROTOCOL_LLMNR) {
-                if (dns_name_endswith(domain, "in-addr.arpa") > 0 ||
-                    dns_name_endswith(domain, "ip6.arpa") > 0 ||
-                    (dns_name_single_label(domain) > 0 &&
-                     dns_name_equal(domain, "gateway") <= 0))  /* don't resolve "gateway" with LLMNR, let nss-myhostname handle this */
+        case DNS_PROTOCOL_LLMNR:
+                if ((s->family == AF_INET && dns_name_endswith(domain, "in-addr.arpa") > 0) ||
+                    (s->family == AF_INET6 && dns_name_endswith(domain, "ip6.arpa") > 0) ||
+                    (dns_name_is_single_label(domain) && /* only resolve single label names via LLMNR */
+                     !is_gateway_hostname(domain) && /* don't resolve "gateway" with LLMNR, let nss-myhostname handle this */
+                     manager_is_own_hostname(s->manager, domain) <= 0))  /* never resolve the local hostname via LLMNR */
                         return DNS_SCOPE_MAYBE;
 
                 return DNS_SCOPE_NO;
-        }
 
-        assert_not_reached("Unknown scope protocol");
+        default:
+                assert_not_reached("Unknown scope protocol");
+        }
 }
 
-int dns_scope_good_key(DnsScope *s, DnsResourceKey *key) {
+bool dns_scope_good_key(DnsScope *s, const DnsResourceKey *key) {
+        int key_family;
+
         assert(s);
         assert(key);
 
-        if (s->protocol == DNS_PROTOCOL_DNS)
-                return true;
+        /* Check if it makes sense to resolve the specified key on
+         * this scope. Note that this call assumes as fully qualified
+         * name, i.e. the search suffixes already appended. */
+
+        if (key->class != DNS_CLASS_IN)
+                return false;
+
+        if (s->protocol == DNS_PROTOCOL_DNS) {
+
+                /* On classic DNS, looking up non-address RRs is always
+                 * fine. (Specifically, we want to permit looking up
+                 * DNSKEY and DS records on the root and top-level
+                 * domains.) */
+                if (!dns_resource_key_is_address(key))
+                        return true;
+
+                /* However, we refuse to look up A and AAAA RRs on the
+                 * root and single-label domains, under the assumption
+                 * that those should be resolved via LLMNR or search
+                 * path only, and should not be leaked onto the
+                 * internet. */
+                return !(dns_name_is_single_label(dns_resource_key_name(key)) ||
+                         dns_name_is_root(dns_resource_key_name(key)));
+        }
 
         /* On mDNS and LLMNR, send A and AAAA queries only on the
          * respective scopes */
 
-        if (s->family == AF_INET && key->class == DNS_CLASS_IN && key->type == DNS_TYPE_AAAA)
-                return false;
+        key_family = dns_type_to_af(key->type);
+        if (key_family < 0)
+                return true;
 
-        if (s->family == AF_INET6 && key->class == DNS_CLASS_IN && key->type == DNS_TYPE_A)
-                return false;
-
-        return true;
+        return key_family == s->family;
 }
 
-int dns_scope_llmnr_membership(DnsScope *s, bool b) {
+static int dns_scope_multicast_membership(DnsScope *s, bool b, struct in_addr in, struct in6_addr in6) {
         int fd;
 
         assert(s);
-
-        if (s->protocol != DNS_PROTOCOL_LLMNR)
-                return 0;
-
         assert(s->link);
 
         if (s->family == AF_INET) {
                 struct ip_mreqn mreqn = {
-                        .imr_multiaddr = LLMNR_MULTICAST_IPV4_ADDRESS,
+                        .imr_multiaddr = in,
                         .imr_ifindex = s->link->ifindex,
                 };
 
-                fd = manager_llmnr_ipv4_udp_fd(s->manager);
+                if (s->protocol == DNS_PROTOCOL_LLMNR)
+                        fd = manager_llmnr_ipv4_udp_fd(s->manager);
+                else
+                        fd = manager_mdns_ipv4_fd(s->manager);
+
                 if (fd < 0)
                         return fd;
 
@@ -396,11 +591,15 @@ int dns_scope_llmnr_membership(DnsScope *s, bool b) {
 
         } else if (s->family == AF_INET6) {
                 struct ipv6_mreq mreq = {
-                        .ipv6mr_multiaddr = LLMNR_MULTICAST_IPV6_ADDRESS,
+                        .ipv6mr_multiaddr = in6,
                         .ipv6mr_interface = s->link->ifindex,
                 };
 
-                fd = manager_llmnr_ipv6_udp_fd(s->manager);
+                if (s->protocol == DNS_PROTOCOL_LLMNR)
+                        fd = manager_llmnr_ipv6_udp_fd(s->manager);
+                else
+                        fd = manager_mdns_ipv6_fd(s->manager);
+
                 if (fd < 0)
                         return fd;
 
@@ -415,20 +614,25 @@ int dns_scope_llmnr_membership(DnsScope *s, bool b) {
         return 0;
 }
 
-int dns_scope_good_dns_server(DnsScope *s, int family, const union in_addr_union *address) {
+int dns_scope_llmnr_membership(DnsScope *s, bool b) {
         assert(s);
-        assert(address);
 
-        if (s->protocol != DNS_PROTOCOL_DNS)
-                return 1;
+        if (s->protocol != DNS_PROTOCOL_LLMNR)
+                return 0;
 
-        if (s->link)
-                return !!link_find_dns_server(s->link,  family, address);
-        else
-                return !!manager_find_dns_server(s->manager, family, address);
+        return dns_scope_multicast_membership(s, b, LLMNR_MULTICAST_IPV4_ADDRESS, LLMNR_MULTICAST_IPV6_ADDRESS);
 }
 
-static int dns_scope_make_reply_packet(
+int dns_scope_mdns_membership(DnsScope *s, bool b) {
+        assert(s);
+
+        if (s->protocol != DNS_PROTOCOL_MDNS)
+                return 0;
+
+        return dns_scope_multicast_membership(s, b, MDNS_MULTICAST_IPV4_ADDRESS, MDNS_MULTICAST_IPV6_ADDRESS);
+}
+
+int dns_scope_make_reply_packet(
                 DnsScope *s,
                 uint16_t id,
                 int rcode,
@@ -439,18 +643,17 @@ static int dns_scope_make_reply_packet(
                 DnsPacket **ret) {
 
         _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
-        unsigned i;
         int r;
 
         assert(s);
         assert(ret);
 
-        if ((!q || q->n_keys <= 0)
-            && (!answer || answer->n_rrs <= 0)
-            && (!soa || soa->n_rrs <= 0))
+        if (dns_question_isempty(q) &&
+            dns_answer_isempty(answer) &&
+            dns_answer_isempty(soa))
                 return -EINVAL;
 
-        r = dns_packet_new(&p, s->protocol, 0);
+        r = dns_packet_new(&p, s->protocol, 0, DNS_PACKET_SIZE_MAX);
         if (r < 0)
                 return r;
 
@@ -466,35 +669,20 @@ static int dns_scope_make_reply_packet(
                                                               0 /* (cd) */,
                                                               rcode));
 
-        if (q) {
-                for (i = 0; i < q->n_keys; i++) {
-                        r = dns_packet_append_key(p, q->keys[i], NULL);
-                        if (r < 0)
-                                return r;
-                }
+        r = dns_packet_append_question(p, q);
+        if (r < 0)
+                return r;
+        DNS_PACKET_HEADER(p)->qdcount = htobe16(dns_question_size(q));
 
-                DNS_PACKET_HEADER(p)->qdcount = htobe16(q->n_keys);
-        }
+        r = dns_packet_append_answer(p, answer);
+        if (r < 0)
+                return r;
+        DNS_PACKET_HEADER(p)->ancount = htobe16(dns_answer_size(answer));
 
-        if (answer) {
-                for (i = 0; i < answer->n_rrs; i++) {
-                        r = dns_packet_append_rr(p, answer->rrs[i], NULL);
-                        if (r < 0)
-                                return r;
-                }
-
-                DNS_PACKET_HEADER(p)->ancount = htobe16(answer->n_rrs);
-        }
-
-        if (soa) {
-                for (i = 0; i < soa->n_rrs; i++) {
-                        r = dns_packet_append_rr(p, soa->rrs[i], NULL);
-                        if (r < 0)
-                                return r;
-                }
-
-                DNS_PACKET_HEADER(p)->arcount = htobe16(soa->n_rrs);
-        }
+        r = dns_packet_append_answer(p, soa);
+        if (r < 0)
+                return r;
+        DNS_PACKET_HEADER(p)->arcount = htobe16(dns_answer_size(soa));
 
         *ret = p;
         p = NULL;
@@ -503,24 +691,25 @@ static int dns_scope_make_reply_packet(
 }
 
 static void dns_scope_verify_conflicts(DnsScope *s, DnsPacket *p) {
-        unsigned n;
+        DnsResourceRecord *rr;
+        DnsResourceKey *key;
 
         assert(s);
         assert(p);
 
-        if (p->question)
-                for (n = 0; n < p->question->n_keys; n++)
-                        dns_zone_verify_conflicts(&s->zone, p->question->keys[n]);
-        if (p->answer)
-                for (n = 0; n < p->answer->n_rrs; n++)
-                        dns_zone_verify_conflicts(&s->zone, p->answer->rrs[n]->key);
+        DNS_QUESTION_FOREACH(key, p->question)
+                dns_zone_verify_conflicts(&s->zone, key);
+
+        DNS_ANSWER_FOREACH(rr, p->answer)
+                dns_zone_verify_conflicts(&s->zone, rr->key);
 }
 
 void dns_scope_process_query(DnsScope *s, DnsStream *stream, DnsPacket *p) {
-        _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
         _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL, *soa = NULL;
+        _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
+        DnsResourceKey *key = NULL;
         bool tentative = false;
-        int r, fd;
+        int r;
 
         assert(s);
         assert(p);
@@ -542,17 +731,20 @@ void dns_scope_process_query(DnsScope *s, DnsStream *stream, DnsPacket *p) {
 
         r = dns_packet_extract(p);
         if (r < 0) {
-                log_debug_errno(r, "Failed to extract resources from incoming packet: %m");
+                log_debug_errno(r, "Failed to extract resource records from incoming packet: %m");
                 return;
         }
 
-        if (DNS_PACKET_C(p)) {
+        if (DNS_PACKET_LLMNR_C(p)) {
                 /* Somebody notified us about a possible conflict */
                 dns_scope_verify_conflicts(s, p);
                 return;
         }
 
-        r = dns_zone_lookup(&s->zone, p->question, &answer, &soa, &tentative);
+        assert(dns_question_size(p->question) == 1);
+        key = p->question->keys[0];
+
+        r = dns_zone_lookup(&s->zone, key, 0, &answer, &soa, &tentative);
         if (r < 0) {
                 log_debug_errno(r, "Failed to lookup key: %m");
                 return;
@@ -569,9 +761,21 @@ void dns_scope_process_query(DnsScope *s, DnsStream *stream, DnsPacket *p) {
                 return;
         }
 
-        if (stream)
+        if (stream) {
                 r = dns_stream_write_packet(stream, reply);
-        else {
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to enqueue reply packet: %m");
+                        return;
+                }
+
+                /* Let's take an extra reference on this stream, so that it stays around after returning. The reference
+                 * will be dangling until the stream is disconnected, and the default completion handler of the stream
+                 * will then unref the stream and destroy it */
+                if (DNS_STREAM_QUEUED(stream))
+                        dns_stream_ref(stream);
+        } else {
+                int fd;
+
                 if (!ratelimit_test(&s->ratelimit))
                         return;
 
@@ -593,39 +797,34 @@ void dns_scope_process_query(DnsScope *s, DnsStream *stream, DnsPacket *p) {
                  * verified uniqueness for all records. Also see RFC
                  * 4795, Section 2.7 */
 
-                r = manager_send(s->manager, fd, p->ifindex, p->family, &p->sender, p->sender_port, reply);
-        }
-
-        if (r < 0) {
-                log_debug_errno(r, "Failed to send reply packet: %m");
-                return;
+                r = manager_send(s->manager, fd, p->ifindex, p->family, &p->sender, p->sender_port, NULL, reply);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to send reply packet: %m");
+                        return;
+                }
         }
 }
 
-DnsTransaction *dns_scope_find_transaction(DnsScope *scope, DnsQuestion *question, bool cache_ok) {
+DnsTransaction *dns_scope_find_transaction(DnsScope *scope, DnsResourceKey *key, bool cache_ok) {
         DnsTransaction *t;
 
         assert(scope);
-        assert(question);
+        assert(key);
 
-        /* Try to find an ongoing transaction that is a equal or a
-         * superset of the specified question */
+        /* Try to find an ongoing transaction that is a equal to the
+         * specified question */
+        t = hashmap_get(scope->transactions_by_key, key);
+        if (!t)
+                return NULL;
 
-        LIST_FOREACH(transactions_by_scope, t, scope->transactions) {
+        /* Refuse reusing transactions that completed based on cached
+         * data instead of a real packet, if that's requested. */
+        if (!cache_ok &&
+            IN_SET(t->state, DNS_TRANSACTION_SUCCESS, DNS_TRANSACTION_RCODE_FAILURE) &&
+            t->answer_source != DNS_TRANSACTION_NETWORK)
+                return NULL;
 
-                /* Refuse reusing transactions that completed based on
-                 * cached data instead of a real packet, if that's
-                 * requested. */
-                if (!cache_ok &&
-                    IN_SET(t->state, DNS_TRANSACTION_SUCCESS, DNS_TRANSACTION_FAILURE) &&
-                    !t->received)
-                        continue;
-
-                if (dns_question_is_superset(t->question, question) > 0)
-                        return t;
-        }
-
-        return NULL;
+        return t;
 }
 
 static int dns_scope_make_conflict_packet(
@@ -640,7 +839,7 @@ static int dns_scope_make_conflict_packet(
         assert(rr);
         assert(ret);
 
-        r = dns_packet_new(&p, s->protocol, 0);
+        r = dns_packet_new(&p, s->protocol, 0, DNS_PACKET_SIZE_MAX);
         if (r < 0)
                 return r;
 
@@ -654,15 +853,19 @@ static int dns_scope_make_conflict_packet(
                                                               0 /* (ad) */,
                                                               0 /* (cd) */,
                                                               0));
-        random_bytes(&DNS_PACKET_HEADER(p)->id, sizeof(uint16_t));
+
+        /* For mDNS, the transaction ID should always be 0 */
+        if (s->protocol != DNS_PROTOCOL_MDNS)
+                random_bytes(&DNS_PACKET_HEADER(p)->id, sizeof(uint16_t));
+
         DNS_PACKET_HEADER(p)->qdcount = htobe16(1);
         DNS_PACKET_HEADER(p)->arcount = htobe16(1);
 
-        r = dns_packet_append_key(p, rr->key, NULL);
+        r = dns_packet_append_key(p, rr->key, 0, NULL);
         if (r < 0)
                 return r;
 
-        r = dns_packet_append_rr(p, rr, NULL);
+        r = dns_packet_append_rr(p, rr, 0, NULL, NULL);
         if (r < 0)
                 return r;
 
@@ -682,12 +885,16 @@ static int on_conflict_dispatch(sd_event_source *es, usec_t usec, void *userdata
         scope->conflict_event_source = sd_event_source_unref(scope->conflict_event_source);
 
         for (;;) {
+                _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
                 _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
                 _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
 
-                rr = ordered_hashmap_steal_first(scope->conflict_queue);
-                if (!rr)
+                key = ordered_hashmap_first_key(scope->conflict_queue);
+                if (!key)
                         break;
+
+                rr = ordered_hashmap_remove(scope->conflict_queue, key);
+                assert(rr);
 
                 r = dns_scope_make_conflict_packet(scope, rr, &p);
                 if (r < 0) {
@@ -695,7 +902,7 @@ static int on_conflict_dispatch(sd_event_source *es, usec_t usec, void *userdata
                         return 0;
                 }
 
-                r = dns_scope_emit(scope, p);
+                r = dns_scope_emit_udp(scope, -1, p);
                 if (r < 0)
                         log_debug_errno(r, "Failed to send conflict packet: %m");
         }
@@ -722,11 +929,12 @@ int dns_scope_notify_conflict(DnsScope *scope, DnsResourceRecord *rr) {
          * messages, not all of them. That should be enough to
          * indicate where there might be a conflict */
         r = ordered_hashmap_put(scope->conflict_queue, rr->key, rr);
-        if (r == -EEXIST || r == 0)
+        if (IN_SET(r, 0, -EEXIST))
                 return 0;
         if (r < 0)
                 return log_debug_errno(r, "Failed to queue conflicting RR: %m");
 
+        dns_resource_key_ref(rr->key);
         dns_resource_record_ref(rr);
 
         if (scope->conflict_event_source)
@@ -744,27 +952,31 @@ int dns_scope_notify_conflict(DnsScope *scope, DnsResourceRecord *rr) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to add conflict dispatch event: %m");
 
+        (void) sd_event_source_set_description(scope->conflict_event_source, "scope-conflict");
+
         return 0;
 }
 
 void dns_scope_check_conflicts(DnsScope *scope, DnsPacket *p) {
-        unsigned i;
+        DnsResourceRecord *rr;
         int r;
 
         assert(scope);
         assert(p);
 
-        if (p->protocol != DNS_PROTOCOL_LLMNR)
+        if (!IN_SET(p->protocol, DNS_PROTOCOL_LLMNR, DNS_PROTOCOL_MDNS))
                 return;
 
         if (DNS_PACKET_RRCOUNT(p) <= 0)
                 return;
 
-        if (DNS_PACKET_C(p) != 0)
-                return;
+        if (p->protocol == DNS_PROTOCOL_LLMNR) {
+                if (DNS_PACKET_LLMNR_C(p) != 0)
+                        return;
 
-        if (DNS_PACKET_T(p) != 0)
-                return;
+                if (DNS_PACKET_LLMNR_T(p) != 0)
+                        return;
+        }
 
         if (manager_our_packet(scope->manager, p))
                 return;
@@ -777,20 +989,304 @@ void dns_scope_check_conflicts(DnsScope *scope, DnsPacket *p) {
 
         log_debug("Checking for conflicts...");
 
-        for (i = 0; i < p->answer->n_rrs; i++) {
+        DNS_ANSWER_FOREACH(rr, p->answer) {
+                /* No conflict if it is DNS-SD RR used for service enumeration. */
+                if (dns_resource_key_is_dnssd_ptr(rr->key))
+                        continue;
 
                 /* Check for conflicts against the local zone. If we
                  * found one, we won't check any further */
-                r = dns_zone_check_conflicts(&scope->zone, p->answer->rrs[i]);
+                r = dns_zone_check_conflicts(&scope->zone, rr);
                 if (r != 0)
                         continue;
 
                 /* Check for conflicts against the local cache. If so,
                  * send out an advisory query, to inform everybody */
-                r = dns_cache_check_conflicts(&scope->cache, p->answer->rrs[i], p->family, &p->sender);
+                r = dns_cache_check_conflicts(&scope->cache, rr, p->family, &p->sender);
                 if (r <= 0)
                         continue;
 
-                dns_scope_notify_conflict(scope, p->answer->rrs[i]);
+                dns_scope_notify_conflict(scope, rr);
         }
+}
+
+void dns_scope_dump(DnsScope *s, FILE *f) {
+        assert(s);
+
+        if (!f)
+                f = stdout;
+
+        fputs("[Scope protocol=", f);
+        fputs(dns_protocol_to_string(s->protocol), f);
+
+        if (s->link) {
+                fputs(" interface=", f);
+                fputs(s->link->name, f);
+        }
+
+        if (s->family != AF_UNSPEC) {
+                fputs(" family=", f);
+                fputs(af_to_name(s->family), f);
+        }
+
+        fputs("]\n", f);
+
+        if (!dns_zone_is_empty(&s->zone)) {
+                fputs("ZONE:\n", f);
+                dns_zone_dump(&s->zone, f);
+        }
+
+        if (!dns_cache_is_empty(&s->cache)) {
+                fputs("CACHE:\n", f);
+                dns_cache_dump(&s->cache, f);
+        }
+}
+
+DnsSearchDomain *dns_scope_get_search_domains(DnsScope *s) {
+        assert(s);
+
+        if (s->protocol != DNS_PROTOCOL_DNS)
+                return NULL;
+
+        if (s->link)
+                return s->link->search_domains;
+
+        return s->manager->search_domains;
+}
+
+bool dns_scope_name_needs_search_domain(DnsScope *s, const char *name) {
+        assert(s);
+
+        if (s->protocol != DNS_PROTOCOL_DNS)
+                return false;
+
+        return dns_name_is_single_label(name);
+}
+
+bool dns_scope_network_good(DnsScope *s) {
+        /* Checks whether the network is in good state for lookups on this scope. For mDNS/LLMNR/Classic DNS scopes
+         * bound to links this is easy, as they don't even exist if the link isn't in a suitable state. For the global
+         * DNS scope we check whether there are any links that are up and have an address. */
+
+        if (s->link)
+                return true;
+
+        return manager_routable(s->manager, AF_UNSPEC);
+}
+
+int dns_scope_ifindex(DnsScope *s) {
+        assert(s);
+
+        if (s->link)
+                return s->link->ifindex;
+
+        return 0;
+}
+
+static int on_announcement_timeout(sd_event_source *s, usec_t usec, void *userdata) {
+        DnsScope *scope = userdata;
+
+        assert(s);
+
+        scope->announce_event_source = sd_event_source_unref(scope->announce_event_source);
+
+        (void) dns_scope_announce(scope, false);
+        return 0;
+}
+
+int dns_scope_announce(DnsScope *scope, bool goodbye) {
+        _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL;
+        _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
+        _cleanup_set_free_ Set *types = NULL;
+        DnsTransaction *t;
+        DnsZoneItem *z, *i;
+        unsigned size = 0;
+        Iterator iterator;
+        char *service_type;
+        int r;
+
+        if (!scope)
+                return 0;
+
+        if (scope->protocol != DNS_PROTOCOL_MDNS)
+                return 0;
+
+        /* Check if we're done with probing. */
+        LIST_FOREACH(transactions_by_scope, t, scope->transactions)
+                if (DNS_TRANSACTION_IS_LIVE(t->state))
+                        return 0;
+
+        /* Check if there're services pending conflict resolution. */
+        if (manager_next_dnssd_names(scope->manager))
+                return 0; /* we reach this point only if changing hostname didn't help */
+
+        /* Calculate answer's size. */
+        HASHMAP_FOREACH(z, scope->zone.by_key, iterator) {
+                if (z->state != DNS_ZONE_ITEM_ESTABLISHED)
+                        continue;
+
+                if (z->rr->key->type == DNS_TYPE_PTR &&
+                    !dns_zone_contains_name(&scope->zone, z->rr->ptr.name)) {
+                        char key_str[DNS_RESOURCE_KEY_STRING_MAX];
+
+                        log_debug("Skip PTR RR <%s> since its counterparts seem to be withdrawn", dns_resource_key_to_string(z->rr->key, key_str, sizeof key_str));
+                        z->state = DNS_ZONE_ITEM_WITHDRAWN;
+                        continue;
+                }
+
+                /* Collect service types for _services._dns-sd._udp.local RRs in a set */
+                if (!scope->announced &&
+                    dns_resource_key_is_dnssd_ptr(z->rr->key)) {
+                        if (!set_contains(types, dns_resource_key_name(z->rr->key))) {
+                                r = set_ensure_allocated(&types, &dns_name_hash_ops);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to allocate set: %m");
+
+                                r = set_put(types, dns_resource_key_name(z->rr->key));
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to add item to set: %m");
+                        }
+                }
+
+                LIST_FOREACH(by_key, i, z)
+                        size++;
+        }
+
+        answer = dns_answer_new(size + set_size(types));
+        if (!answer)
+                return log_oom();
+
+        /* Second iteration, actually add RRs to the answer. */
+        HASHMAP_FOREACH(z, scope->zone.by_key, iterator)
+                LIST_FOREACH (by_key, i, z) {
+                        DnsAnswerFlags flags;
+
+                        if (i->state != DNS_ZONE_ITEM_ESTABLISHED)
+                                continue;
+
+                        if (dns_resource_key_is_dnssd_ptr(i->rr->key))
+                                flags = goodbye ? DNS_ANSWER_GOODBYE : 0;
+                        else
+                                flags = goodbye ? (DNS_ANSWER_GOODBYE|DNS_ANSWER_CACHE_FLUSH) : DNS_ANSWER_CACHE_FLUSH;
+
+                        r = dns_answer_add(answer, i->rr, 0 , flags);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to add RR to announce: %m");
+                }
+
+        /* Since all the active services are in the zone make them discoverable now. */
+        SET_FOREACH(service_type, types, iterator) {
+                _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr;
+
+                rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_PTR,
+                                                  "_services._dns-sd._udp.local");
+                rr->ptr.name = strdup(service_type);
+                rr->ttl = MDNS_DEFAULT_TTL;
+
+                r = dns_zone_put(&scope->zone, scope, rr, false);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to add DNS-SD PTR record to MDNS zone: %m");
+
+                r = dns_answer_add(answer, rr, 0 , 0);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to add RR to announce: %m");
+        }
+
+        if (dns_answer_isempty(answer))
+                return 0;
+
+        r = dns_scope_make_reply_packet(scope, 0, DNS_RCODE_SUCCESS, NULL, answer, NULL, false, &p);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to build reply packet: %m");
+
+        r = dns_scope_emit_udp(scope, -1, p);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to send reply packet: %m");
+
+        /* In section 8.3 of RFC6762: "The Multicast DNS responder MUST send at least two unsolicited
+         * responses, one second apart." */
+        if (!scope->announced) {
+                usec_t ts;
+
+                scope->announced = true;
+
+                assert_se(sd_event_now(scope->manager->event, clock_boottime_or_monotonic(), &ts) >= 0);
+                ts += MDNS_ANNOUNCE_DELAY;
+
+                r = sd_event_add_time(
+                                scope->manager->event,
+                                &scope->announce_event_source,
+                                clock_boottime_or_monotonic(),
+                                ts,
+                                MDNS_JITTER_RANGE_USEC,
+                                on_announcement_timeout, scope);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to schedule second announcement: %m");
+
+                (void) sd_event_source_set_description(scope->announce_event_source, "mdns-announce");
+        }
+
+        return 0;
+}
+
+int dns_scope_add_dnssd_services(DnsScope *scope) {
+        Iterator i;
+        DnssdService *service;
+        DnssdTxtData *txt_data;
+        int r;
+
+        assert(scope);
+
+        if (hashmap_size(scope->manager->dnssd_services) == 0)
+                return 0;
+
+        scope->announced = false;
+
+        HASHMAP_FOREACH(service, scope->manager->dnssd_services, i) {
+                service->withdrawn = false;
+
+                r = dns_zone_put(&scope->zone, scope, service->ptr_rr, false);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to add PTR record to MDNS zone: %m");
+
+                r = dns_zone_put(&scope->zone, scope, service->srv_rr, true);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to add SRV record to MDNS zone: %m");
+
+                LIST_FOREACH(items, txt_data, service->txt_data_items) {
+                        r = dns_zone_put(&scope->zone, scope, txt_data->rr, true);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to add TXT record to MDNS zone: %m");
+                }
+        }
+
+        return 0;
+}
+
+int dns_scope_remove_dnssd_services(DnsScope *scope) {
+        _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
+        Iterator i;
+        DnssdService *service;
+        DnssdTxtData *txt_data;
+        int r;
+
+        assert(scope);
+
+        key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_PTR,
+                                   "_services._dns-sd._udp.local");
+        if (!key)
+                return log_oom();
+
+        r = dns_zone_remove_rrs_by_key(&scope->zone, key);
+        if (r < 0)
+                return r;
+
+        HASHMAP_FOREACH(service, scope->manager->dnssd_services, i) {
+                dns_zone_remove_rr(&scope->zone, service->ptr_rr);
+                dns_zone_remove_rr(&scope->zone, service->srv_rr);
+                LIST_FOREACH(items, txt_data, service->txt_data_items)
+                        dns_zone_remove_rr(&scope->zone, txt_data->rr);
+        }
+
+        return 0;
 }

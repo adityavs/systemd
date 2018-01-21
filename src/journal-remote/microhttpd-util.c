@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -24,16 +23,18 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "microhttpd-util.h"
-#include "log.h"
-#include "macro.h"
-#include "util.h"
-#include "strv.h"
-
-#ifdef HAVE_GNUTLS
+#if HAVE_GNUTLS
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #endif
+
+#include "alloc-util.h"
+#include "log.h"
+#include "macro.h"
+#include "microhttpd-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "util.h"
 
 void microhttpd_logger(void *arg, const char *fmt, va_list ap) {
         char *f;
@@ -48,7 +49,7 @@ void microhttpd_logger(void *arg, const char *fmt, va_list ap) {
 
 static int mhd_respond_internal(struct MHD_Connection *connection,
                                 enum MHD_RequestTerminationCode code,
-                                char *buffer,
+                                const char *buffer,
                                 size_t size,
                                 enum MHD_ResponseMemoryMode mode) {
         struct MHD_Response *response;
@@ -56,11 +57,11 @@ static int mhd_respond_internal(struct MHD_Connection *connection,
 
         assert(connection);
 
-        response = MHD_create_response_from_buffer(size, buffer, mode);
+        response = MHD_create_response_from_buffer(size, (char*) buffer, mode);
         if (!response)
                 return MHD_NO;
 
-        log_debug("Queing response %u: %s", code, buffer);
+        log_debug("Queueing response %u: %s", code, buffer);
         MHD_add_response_header(response, "Content-Type", "text/plain");
         r = MHD_queue_response(connection, code, response);
         MHD_destroy_response(response);
@@ -72,19 +73,25 @@ int mhd_respond(struct MHD_Connection *connection,
                 enum MHD_RequestTerminationCode code,
                 const char *message) {
 
+        const char *fmt;
+
+        fmt = strjoina(message, "\n");
+
         return mhd_respond_internal(connection, code,
-                                    (char*) message, strlen(message),
+                                    fmt, strlen(message) + 1,
                                     MHD_RESPMEM_PERSISTENT);
 }
 
 int mhd_respond_oom(struct MHD_Connection *connection) {
-        return mhd_respond(connection, MHD_HTTP_SERVICE_UNAVAILABLE,  "Out of memory.\n");
+        return mhd_respond(connection, MHD_HTTP_SERVICE_UNAVAILABLE,  "Out of memory.");
 }
 
 int mhd_respondf(struct MHD_Connection *connection,
+                 int error,
                  enum MHD_RequestTerminationCode code,
                  const char *format, ...) {
 
+        const char *fmt;
         char *m;
         int r;
         va_list ap;
@@ -92,8 +99,15 @@ int mhd_respondf(struct MHD_Connection *connection,
         assert(connection);
         assert(format);
 
+        if (error < 0)
+                error = -error;
+        errno = -error;
+        fmt = strjoina(format, "\n");
         va_start(ap, format);
-        r = vasprintf(&m, format, ap);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        r = vasprintf(&m, fmt, ap);
+#pragma GCC diagnostic pop
         va_end(ap);
 
         if (r < 0)
@@ -102,7 +116,7 @@ int mhd_respondf(struct MHD_Connection *connection,
         return mhd_respond_internal(connection, code, m, r, MHD_RESPMEM_MUST_FREE);
 }
 
-#ifdef HAVE_GNUTLS
+#if HAVE_GNUTLS
 
 static struct {
         const char *const names[4];

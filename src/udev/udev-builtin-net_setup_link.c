@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "alloc-util.h"
 #include "link-config.h"
-#include "udev.h"
 #include "log.h"
+#include "udev.h"
 
 static link_config_ctx *ctx = NULL;
 
@@ -52,10 +52,8 @@ static int builtin_net_setup_link(struct udev_device *dev, int argc, char **argv
         }
 
         r = link_config_apply(ctx, link, dev, &name);
-        if (r < 0) {
-                log_error_errno(r, "Could not apply link config to %s: %m", udev_device_get_sysname(dev));
-                return EXIT_FAILURE;
-        }
+        if (r < 0)
+                log_warning_errno(r, "Could not apply link config to %s, ignoring: %m", udev_device_get_sysname(dev));
 
         udev_builtin_add_property(dev, test, "ID_NET_LINK_FILE", link->filename);
 

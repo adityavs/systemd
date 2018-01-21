@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,8 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "log.h"
 #include "bus-introspect.h"
+#include "log.h"
 
 static int prop_get(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *error) {
         return -EINVAL;
@@ -41,7 +40,7 @@ static const sd_bus_vtable vtable[] = {
         SD_BUS_PROPERTY("AReadOnlyDeprecatedProperty", "(ut)", prop_get, 0, SD_BUS_VTABLE_DEPRECATED),
         SD_BUS_PROPERTY("ChangingProperty", "t", prop_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Invalidating", "t", prop_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
-        SD_BUS_PROPERTY("Constant", "t", prop_get, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Constant", "t", prop_get, 0, SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_PROPERTY_EXPLICIT),
         SD_BUS_VTABLE_END
 };
 

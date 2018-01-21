@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
  This file is part of systemd.
 
@@ -19,19 +18,28 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <netinet/ether.h>
-#include <linux/if.h>
 #include <arpa/inet.h>
+#include <linux/if.h>
+#include <netinet/ether.h>
 
-#include "strv.h"
-#include "siphash24.h"
+#include "sd-id128.h"
+#include "sd-ndisc.h"
+
+#include "alloc-util.h"
+#include "condition.h"
+#include "conf-parser.h"
 #include "dhcp-lease-internal.h"
+#include "ether-addr-util.h"
+#include "hexdecoct.h"
 #include "log.h"
+#include "network-internal.h"
+#include "parse-util.h"
+#include "siphash24.h"
+#include "socket-util.h"
+#include "string-util.h"
+#include "strv.h"
 #include "utf8.h"
 #include "util.h"
-#include "conf-parser.h"
-#include "condition.h"
-#include "network-internal.h"
 
 const char *net_get_name(struct udev_device *device) {
         const char *name, *field;
@@ -50,7 +58,7 @@ const char *net_get_name(struct udev_device *device) {
 
 #define HASH_KEY SD_ID128_MAKE(d3,1e,48,fa,90,fe,4b,4c,9d,af,d5,d7,a1,b1,2e,8a)
 
-int net_get_unique_predictable_data(struct udev_device *device, uint8_t result[8]) {
+int net_get_unique_predictable_data(struct udev_device *device, uint64_t *result) {
         size_t l, sz = 0;
         const char *name = NULL;
         int r;
@@ -75,9 +83,31 @@ int net_get_unique_predictable_data(struct udev_device *device, uint8_t result[8
         /* Let's hash the machine ID plus the device name. We
         * use a fixed, but originally randomly created hash
         * key here. */
-        siphash24(result, v, sz, HASH_KEY.bytes);
+        *result = htole64(siphash24(v, sz, HASH_KEY.bytes));
 
         return 0;
+}
+
+static bool net_condition_test_strv(char * const *raw_patterns,
+                                    const char *string) {
+        if (strv_isempty(raw_patterns))
+                return true;
+
+        /* If the patterns begin with "!", edit it out and negate the test. */
+        if (raw_patterns[0][0] == '!') {
+                char **patterns;
+                unsigned i, length;
+
+                length = strv_length(raw_patterns) + 1; /* Include the NULL. */
+                patterns = newa(char*, length);
+                patterns[0] = raw_patterns[0] + 1; /* Skip the "!". */
+                for (i = 1; i < length; i++)
+                        patterns[i] = raw_patterns[i];
+
+                return !string || !strv_fnmatch(patterns, string, 0);
+        }
+
+        return string && strv_fnmatch(raw_patterns, string, 0);
 }
 
 bool net_match_config(const struct ether_addr *match_mac,
@@ -87,7 +117,8 @@ bool net_match_config(const struct ether_addr *match_mac,
                       char * const *match_names,
                       Condition *match_host,
                       Condition *match_virt,
-                      Condition *match_kernel,
+                      Condition *match_kernel_cmdline,
+                      Condition *match_kernel_version,
                       Condition *match_arch,
                       const struct ether_addr *dev_mac,
                       const char *dev_path,
@@ -96,35 +127,34 @@ bool net_match_config(const struct ether_addr *match_mac,
                       const char *dev_type,
                       const char *dev_name) {
 
-        if (match_host && !condition_test(match_host))
+        if (match_host && condition_test(match_host) <= 0)
                 return false;
 
-        if (match_virt && !condition_test(match_virt))
+        if (match_virt && condition_test(match_virt) <= 0)
                 return false;
 
-        if (match_kernel && !condition_test(match_kernel))
+        if (match_kernel_cmdline && condition_test(match_kernel_cmdline) <= 0)
                 return false;
 
-        if (match_arch && !condition_test(match_arch))
+        if (match_kernel_version && condition_test(match_kernel_version) <= 0)
+                return false;
+
+        if (match_arch && condition_test(match_arch) <= 0)
                 return false;
 
         if (match_mac && (!dev_mac || memcmp(match_mac, dev_mac, ETH_ALEN)))
                 return false;
 
-        if (!strv_isempty(match_paths) &&
-            (!dev_path || !strv_fnmatch(match_paths, dev_path, 0)))
+        if (!net_condition_test_strv(match_paths, dev_path))
                 return false;
 
-        if (!strv_isempty(match_drivers) &&
-            (!dev_driver || !strv_fnmatch(match_drivers, dev_driver, 0)))
+        if (!net_condition_test_strv(match_drivers, dev_driver))
                 return false;
 
-        if (!strv_isempty(match_types) &&
-            (!dev_type || !strv_fnmatch_or_empty(match_types, dev_type, 0)))
+        if (!net_condition_test_strv(match_types, dev_type))
                 return false;
 
-        if (!strv_isempty(match_names) &&
-            (!dev_name || !strv_fnmatch_or_empty(match_names, dev_name, 0)))
+        if (!net_condition_test_strv(match_names, dev_name))
                 return false;
 
         return true;
@@ -171,59 +201,19 @@ int config_parse_net_condition(const char *unit,
         return 0;
 }
 
-int config_parse_ifname(const char *unit,
-                        const char *filename,
-                        unsigned line,
-                        const char *section,
-                        unsigned section_line,
-                        const char *lvalue,
-                        int ltype,
-                        const char *rvalue,
-                        void *data,
-                        void *userdata) {
-
-        char **s = data;
-        _cleanup_free_ char *n = NULL;
-
-        assert(filename);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        n = strdup(rvalue);
-        if (!n)
-                return log_oom();
-
-        if (!ascii_is_valid(n) || strlen(n) >= IFNAMSIZ) {
-                log_syntax(unit, LOG_ERR, filename, line, EINVAL,
-                           "Interface name is not ASCII clean or is too long, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        free(*s);
-        if (*n) {
-                *s = n;
-                n = NULL;
-        } else
-                *s = NULL;
-
-        return 0;
-}
-
-int config_parse_ifnames(const char *unit,
-                        const char *filename,
-                        unsigned line,
-                        const char *section,
-                        unsigned section_line,
-                        const char *lvalue,
-                        int ltype,
-                        const char *rvalue,
-                        void *data,
-                        void *userdata) {
+int config_parse_ifnames(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
 
         char ***sv = data;
-        const char *word, *state;
-        size_t l;
         int r;
 
         assert(filename);
@@ -231,23 +221,27 @@ int config_parse_ifnames(const char *unit,
         assert(rvalue);
         assert(data);
 
-        FOREACH_WORD(word, l, rvalue, state) {
-                char *n;
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
 
-                n = strndup(word, l);
-                if (!n)
-                        return log_oom();
+                r = extract_first_word(&rvalue, &word, NULL, 0);
+                if (r < 0) {
+                        log_syntax(unit, LOG_ERR, filename, line, 0, "Failed to parse interface name list: %s", rvalue);
+                        return 0;
+                }
+                if (r == 0)
+                        break;
 
-                if (!ascii_is_valid(n) || strlen(n) >= IFNAMSIZ) {
-                        log_syntax(unit, LOG_ERR, filename, line, EINVAL,
-                                   "Interface name is not ASCII clean or is too long, ignoring assignment: %s", rvalue);
-                        free(n);
+                if (!ifname_valid(word)) {
+                        log_syntax(unit, LOG_ERR, filename, line, 0, "Interface name is not valid or too long, ignoring assignment: %s", rvalue);
                         return 0;
                 }
 
-                r = strv_consume(sv, n);
+                r = strv_push(sv, word);
                 if (r < 0)
                         return log_oom();
+
+                word = NULL;
         }
 
         return 0;
@@ -277,8 +271,7 @@ int config_parse_ifalias(const char *unit,
                 return log_oom();
 
         if (!ascii_is_valid(n) || strlen(n) >= IFALIASZ) {
-                log_syntax(unit, LOG_ERR, filename, line, EINVAL,
-                           "Interface alias is not ASCII clean or is too long, ignoring assignment: %s", rvalue);
+                log_syntax(unit, LOG_ERR, filename, line, 0, "Interface alias is not ASCII clean or is too long, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
@@ -304,6 +297,8 @@ int config_parse_hwaddr(const char *unit,
                         void *userdata) {
         struct ether_addr **hwaddr = data;
         struct ether_addr *n;
+        const char *start;
+        size_t offset;
         int r;
 
         assert(filename);
@@ -315,16 +310,11 @@ int config_parse_hwaddr(const char *unit,
         if (!n)
                 return log_oom();
 
-        r = sscanf(rvalue, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
-                   &n->ether_addr_octet[0],
-                   &n->ether_addr_octet[1],
-                   &n->ether_addr_octet[2],
-                   &n->ether_addr_octet[3],
-                   &n->ether_addr_octet[4],
-                   &n->ether_addr_octet[5]);
-        if (r != 6) {
-                log_syntax(unit, LOG_ERR, filename, line, EINVAL,
-                           "Not a valid MAC address, ignoring assignment: %s", rvalue);
+        start = rvalue + strspn(rvalue, WHITESPACE);
+        r = ether_addr_from_string(start, n, &offset);
+
+        if (r || (start[offset + strspn(start + offset, WHITESPACE)] != '\0')) {
+                log_syntax(unit, LOG_ERR, filename, line, 0, "Not a valid MAC address, ignoring assignment: %s", rvalue);
                 free(n);
                 return 0;
         }
@@ -334,6 +324,75 @@ int config_parse_hwaddr(const char *unit,
 
         return 0;
 }
+
+int config_parse_iaid(const char *unit,
+                      const char *filename,
+                      unsigned line,
+                      const char *section,
+                      unsigned section_line,
+                      const char *lvalue,
+                      int ltype,
+                      const char *rvalue,
+                      void *data,
+                      void *userdata) {
+        uint32_t iaid;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = safe_atou32(rvalue, &iaid);
+        if (r < 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Unable to read IAID, ignoring assignment: %s", rvalue);
+                return 0;
+        }
+
+        *((uint32_t *)data) = iaid;
+
+        return 0;
+}
+
+int config_parse_bridge_port_priority(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        uint16_t i;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = safe_atou16(rvalue, &i);
+        if (r < 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Failed to parse bridge port priority, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        if (i > LINK_BRIDGE_PORT_PRIORITY_MAX) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Bridge port priority is larger than maximum %u, ignoring: %s", LINK_BRIDGE_PORT_PRIORITY_MAX, rvalue);
+                return 0;
+        }
+
+        *((uint16_t *)data) = i;
+
+        return 0;
+}
+
 
 void serialize_in_addrs(FILE *f, const struct in_addr *addresses, size_t size) {
         unsigned i;
@@ -350,16 +409,20 @@ void serialize_in_addrs(FILE *f, const struct in_addr *addresses, size_t size) {
 int deserialize_in_addrs(struct in_addr **ret, const char *string) {
         _cleanup_free_ struct in_addr *addresses = NULL;
         int size = 0;
-        const char *word, *state;
-        size_t len;
 
         assert(ret);
         assert(string);
 
-        FOREACH_WORD(word, len, string, state) {
-                _cleanup_free_ char *addr_str = NULL;
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
                 struct in_addr *new_addresses;
                 int r;
+
+                r = extract_first_word(&string, &word, NULL, 0);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
 
                 new_addresses = realloc(addresses, (size + 1) * sizeof(struct in_addr));
                 if (!new_addresses)
@@ -367,48 +430,7 @@ int deserialize_in_addrs(struct in_addr **ret, const char *string) {
                 else
                         addresses = new_addresses;
 
-                addr_str = strndup(word, len);
-                if (!addr_str)
-                        return -ENOMEM;
-
-                r = inet_pton(AF_INET, addr_str, &(addresses[size]));
-                if (r <= 0)
-                        continue;
-
-                size ++;
-        }
-
-        *ret = addresses;
-        addresses = NULL;
-
-        return size;
-}
-
-int deserialize_in6_addrs(struct in6_addr **ret, const char *string) {
-        _cleanup_free_ struct in6_addr *addresses = NULL;
-        int size = 0;
-        const char *word, *state;
-        size_t len;
-
-        assert(ret);
-        assert(string);
-
-        FOREACH_WORD(word, len, string, state) {
-                _cleanup_free_ char *addr_str = NULL;
-                struct in6_addr *new_addresses;
-                int r;
-
-                new_addresses = realloc(addresses, (size + 1) * sizeof(struct in6_addr));
-                if (!new_addresses)
-                        return -ENOMEM;
-                else
-                        addresses = new_addresses;
-
-                addr_str = strndup(word, len);
-                if (!addr_str)
-                        return -ENOMEM;
-
-                r = inet_pton(AF_INET6, addr_str, &(addresses[size]));
+                r = inet_pton(AF_INET, word, &(addresses[size]));
                 if (r <= 0)
                         continue;
 
@@ -421,7 +443,61 @@ int deserialize_in6_addrs(struct in6_addr **ret, const char *string) {
         return size;
 }
 
-void serialize_dhcp_routes(FILE *f, const char *key, struct sd_dhcp_route *routes, size_t size) {
+void serialize_in6_addrs(FILE *f, const struct in6_addr *addresses, size_t size) {
+        unsigned i;
+
+        assert(f);
+        assert(addresses);
+        assert(size);
+
+        for (i = 0; i < size; i++) {
+                char buffer[INET6_ADDRSTRLEN];
+
+                fputs(inet_ntop(AF_INET6, addresses+i, buffer, sizeof(buffer)), f);
+
+                if (i < size - 1)
+                        fputc(' ', f);
+        }
+}
+
+int deserialize_in6_addrs(struct in6_addr **ret, const char *string) {
+        _cleanup_free_ struct in6_addr *addresses = NULL;
+        int size = 0;
+
+        assert(ret);
+        assert(string);
+
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
+                struct in6_addr *new_addresses;
+                int r;
+
+                r = extract_first_word(&string, &word, NULL, 0);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                new_addresses = realloc(addresses, (size + 1) * sizeof(struct in6_addr));
+                if (!new_addresses)
+                        return -ENOMEM;
+                else
+                        addresses = new_addresses;
+
+                r = inet_pton(AF_INET6, word, &(addresses[size]));
+                if (r <= 0)
+                        continue;
+
+                size++;
+        }
+
+        *ret = addresses;
+        addresses = NULL;
+
+        return size;
+}
+
+void serialize_dhcp_routes(FILE *f, const char *key, sd_dhcp_route **routes, size_t size) {
         unsigned i;
 
         assert(f);
@@ -432,10 +508,15 @@ void serialize_dhcp_routes(FILE *f, const char *key, struct sd_dhcp_route *route
         fprintf(f, "%s=", key);
 
         for (i = 0; i < size; i++) {
-                fprintf(f, "%s/%" PRIu8, inet_ntoa(routes[i].dst_addr),
-                        routes[i].dst_prefixlen);
-                fprintf(f, ",%s%s", inet_ntoa(routes[i].gw_addr),
-                        (i < (size - 1)) ? " ": "");
+                struct in_addr dest, gw;
+                uint8_t length;
+
+                assert_se(sd_dhcp_route_get_destination(routes[i], &dest) >= 0);
+                assert_se(sd_dhcp_route_get_gateway(routes[i], &gw) >= 0);
+                assert_se(sd_dhcp_route_get_destination_prefix_length(routes[i], &length) >= 0);
+
+                fprintf(f, "%s/%" PRIu8, inet_ntoa(dest), length);
+                fprintf(f, ",%s%s", inet_ntoa(gw), (i < (size - 1)) ? " ": "");
         }
 
         fputs("\n", f);
@@ -444,29 +525,29 @@ void serialize_dhcp_routes(FILE *f, const char *key, struct sd_dhcp_route *route
 int deserialize_dhcp_routes(struct sd_dhcp_route **ret, size_t *ret_size, size_t *ret_allocated, const char *string) {
         _cleanup_free_ struct sd_dhcp_route *routes = NULL;
         size_t size = 0, allocated = 0;
-        const char *word, *state;
-        size_t len;
 
         assert(ret);
         assert(ret_size);
         assert(ret_allocated);
         assert(string);
 
-        FOREACH_WORD(word, len, string, state) {
-                /* WORD FORMAT: dst_ip/dst_prefixlen,gw_ip */
-                _cleanup_free_ char* entry = NULL;
+         /* WORD FORMAT: dst_ip/dst_prefixlen,gw_ip */
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
                 char *tok, *tok_end;
                 unsigned n;
                 int r;
 
+                r = extract_first_word(&string, &word, NULL, 0);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
                 if (!GREEDY_REALLOC(routes, allocated, size + 1))
                         return -ENOMEM;
 
-                entry = strndup(word, len);
-                if(!entry)
-                        return -ENOMEM;
-
-                tok = entry;
+                tok = word;
 
                 /* get the subnet */
                 tok_end = strchr(tok, '/');
@@ -508,4 +589,31 @@ int deserialize_dhcp_routes(struct sd_dhcp_route **ret, size_t *ret_size, size_t
         routes = NULL;
 
         return 0;
+}
+
+int serialize_dhcp_option(FILE *f, const char *key, const void *data, size_t size) {
+        _cleanup_free_ char *hex_buf = NULL;
+
+        assert(f);
+        assert(key);
+        assert(data);
+
+        hex_buf = hexmem(data, size);
+        if (hex_buf == NULL)
+                return -ENOMEM;
+
+        fprintf(f, "%s=%s\n", key, hex_buf);
+
+        return 0;
+}
+
+int deserialize_dhcp_option(void **data, size_t *data_len, const char *string) {
+        assert(data);
+        assert(data_len);
+        assert(string);
+
+        if (strlen(string) % 2)
+                return -EINVAL;
+
+        return unhexmem(string, strlen(string), (void **)data, data_len);
 }

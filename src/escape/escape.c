@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,14 +18,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <getopt.h>
 
+#include "alloc-util.h"
 #include "log.h"
-#include "unit-name.h"
-#include "build.h"
+#include "string-util.h"
 #include "strv.h"
+#include "unit-name.h"
 
 static enum {
         ACTION_ESCAPE,
@@ -39,7 +39,7 @@ static bool arg_path = false;
 
 static void help(void) {
         printf("%s [OPTIONS...] [NAME...]\n\n"
-               "Show system and user paths.\n\n"
+               "Escape strings for usage in systemd unit names.\n\n"
                "  -h --help               Show this help\n"
                "     --version            Show package version\n"
                "     --suffix=SUFFIX      Unit suffix to append to escaped strings\n"
@@ -83,9 +83,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_SUFFIX:
 
@@ -194,7 +192,7 @@ int main(int argc, char *argv[]) {
                         } else if (arg_suffix) {
                                 char *x;
 
-                                x = strjoin(e, ".", arg_suffix, NULL);
+                                x = strjoin(e, ".", arg_suffix);
                                 if (!x) {
                                         r = log_oom();
                                         goto finish;
@@ -236,5 +234,5 @@ int main(int argc, char *argv[]) {
         fputc('\n', stdout);
 
 finish:
-        return r <= 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

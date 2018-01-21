@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,6 +22,7 @@
 #define _LIBUDEV_H_
 
 #include <stdarg.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus

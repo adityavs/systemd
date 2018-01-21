@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,16 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "macro.h"
+#include "parse-util.h"
 #include "signal-util.h"
+#include "stdio-util.h"
+#include "string-table.h"
+#include "string-util.h"
 
 int reset_all_signal_handlers(void) {
         static const struct sigaction sa = {
@@ -32,7 +39,7 @@ int reset_all_signal_handlers(void) {
         for (sig = 1; sig < _NSIG; sig++) {
 
                 /* These two cannot be caught... */
-                if (sig == SIGKILL || sig == SIGSTOP)
+                if (IN_SET(sig, SIGKILL, SIGSTOP))
                         continue;
 
                 /* On Linux the first two RT signals are reserved by
@@ -219,7 +226,7 @@ static const char *const __signal_table[] = {
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(__signal, int);
 
 const char *signal_to_string(int signo) {
-        static thread_local char buf[sizeof("RTMIN+")-1 + DECIMAL_STR_MAX(int) + 1];
+        static thread_local char buf[STRLEN("RTMIN+") + DECIMAL_STR_MAX(int) + 1];
         const char *name;
 
         name = __signal_to_string(signo);
@@ -227,9 +234,9 @@ const char *signal_to_string(int signo) {
                 return name;
 
         if (signo >= SIGRTMIN && signo <= SIGRTMAX)
-                snprintf(buf, sizeof(buf), "RTMIN+%d", signo - SIGRTMIN);
+                xsprintf(buf, "RTMIN+%d", signo - SIGRTMIN);
         else
-                snprintf(buf, sizeof(buf), "%d", signo);
+                xsprintf(buf, "%d", signo);
 
         return buf;
 }
@@ -249,7 +256,7 @@ int signal_from_string(const char *s) {
         }
         if (safe_atou(s, &u) >= 0) {
                 signo = (int) u + offset;
-                if (signo > 0 && signo < _NSIG)
+                if (SIGNAL_VALID(signo))
                         return signo;
         }
         return -EINVAL;
@@ -265,4 +272,8 @@ int signal_from_string_try_harder(const char *s) {
                         return signal_from_string(s+3);
 
         return signo;
+}
+
+void nop_signal_handler(int sig) {
+        /* nothing here */
 }

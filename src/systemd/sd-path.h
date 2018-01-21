@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #ifndef foosdpathhfoo
 #define foosdpathhfoo
 
@@ -23,6 +22,10 @@
 ***/
 
 #include <inttypes.h>
+
+#include "_sd-common.h"
+
+_SD_BEGIN_DECLARATIONS;
 
 enum {
         /* Temporary files */
@@ -83,5 +86,7 @@ enum {
 
 int sd_path_home(uint64_t type, const char *suffix, char **path);
 int sd_path_search(uint64_t type, const char *suffix, char ***paths);
+
+_SD_END_DECLARATIONS;
 
 #endif

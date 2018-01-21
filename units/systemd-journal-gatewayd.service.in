@@ -1,3 +1,5 @@
+#  SPDX-License-Identifier: LGPL-2.1+
+#
 #  This file is part of systemd.
 #
 #  systemd is free software; you can redistribute it and/or modify it
@@ -7,18 +9,26 @@
 
 [Unit]
 Description=Journal Gateway Service
+Documentation=man:systemd-journal-gatewayd(8)
 Requires=systemd-journal-gatewayd.socket
 
 [Service]
 ExecStart=@rootlibexecdir@/systemd-journal-gatewayd
 User=systemd-journal-gateway
-Group=systemd-journal-gateway
 SupplementaryGroups=systemd-journal
-PrivateTmp=yes
+DynamicUser=yes
 PrivateDevices=yes
 PrivateNetwork=yes
-ProtectSystem=full
 ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=yes
 
 # If there are many split upjournal files we need a lot of fds to
 # access them all and combine

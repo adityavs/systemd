@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,31 +22,32 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "hashmap.h"
 #include "list.h"
 #include "log.h"
-#include "util.h"
 #include "macro.h"
-#include "sigbus.h"
 #include "mmap-cache.h"
+#include "sigbus.h"
+#include "util.h"
 
 typedef struct Window Window;
 typedef struct Context Context;
-typedef struct FileDescriptor FileDescriptor;
 
 struct Window {
         MMapCache *cache;
 
-        bool invalidated;
-        bool keep_always;
-        bool in_unused;
+        bool invalidated:1;
+        bool keep_always:1;
+        bool in_unused:1;
 
         int prot;
         void *ptr;
         uint64_t offset;
         size_t size;
 
-        FileDescriptor *fd;
+        MMapFileDescriptor *fd;
 
         LIST_FIELDS(Window, by_fd);
         LIST_FIELDS(Window, unused);
@@ -63,7 +63,7 @@ struct Context {
         LIST_FIELDS(Context, by_window);
 };
 
-struct FileDescriptor {
+struct MMapFileDescriptor {
         MMapCache *cache;
         int fd;
         bool sigbus;
@@ -76,7 +76,6 @@ struct MMapCache {
 
         unsigned n_hit, n_missed;
 
-
         Hashmap *fds;
         Context *contexts[MMAP_CACHE_MAX_CONTEXTS];
 
@@ -86,7 +85,7 @@ struct MMapCache {
 
 #define WINDOWS_MIN 64
 
-#ifdef ENABLE_DEBUG_MMAP_CACHE
+#if ENABLE_DEBUG_MMAP_CACHE
 /* Tiny windows increase mmap activity and the chance of exposing unsafe use. */
 # define WINDOW_SIZE (page_size())
 #else
@@ -108,7 +107,7 @@ MMapCache* mmap_cache_ref(MMapCache *m) {
         assert(m);
         assert(m->n_ref > 0);
 
-        m->n_ref ++;
+        m->n_ref++;
         return m;
 }
 
@@ -159,23 +158,31 @@ static void window_free(Window *w) {
         free(w);
 }
 
-_pure_ static bool window_matches(Window *w, int fd, int prot, uint64_t offset, size_t size) {
+_pure_ static inline bool window_matches(Window *w, int prot, uint64_t offset, size_t size) {
         assert(w);
-        assert(fd >= 0);
         assert(size > 0);
 
         return
-                w->fd &&
-                fd == w->fd->fd &&
                 prot == w->prot &&
                 offset >= w->offset &&
                 offset + size <= w->offset + w->size;
 }
 
-static Window *window_add(MMapCache *m) {
+_pure_ static bool window_matches_fd(Window *w, MMapFileDescriptor *f, int prot, uint64_t offset, size_t size) {
+        assert(w);
+        assert(f);
+
+        return
+                w->fd &&
+                f->fd == w->fd->fd &&
+                window_matches(w, prot, offset, size);
+}
+
+static Window *window_add(MMapCache *m, MMapFileDescriptor *f, int prot, bool keep_always, uint64_t offset, size_t size, void *ptr) {
         Window *w;
 
         assert(m);
+        assert(f);
 
         if (!m->last_unused || m->n_windows <= WINDOWS_MIN) {
 
@@ -193,6 +200,15 @@ static Window *window_add(MMapCache *m) {
         }
 
         w->cache = m;
+        w->fd = f;
+        w->prot = prot;
+        w->keep_always = keep_always;
+        w->offset = offset;
+        w->size = size;
+        w->ptr = ptr;
+
+        LIST_PREPEND(by_fd, f->windows, w);
+
         return w;
 }
 
@@ -210,7 +226,7 @@ static void context_detach_window(Context *c) {
 
         if (!w->contexts && !w->keep_always) {
                 /* Not used anymore? */
-#ifdef ENABLE_DEBUG_MMAP_CACHE
+#if ENABLE_DEBUG_MMAP_CACHE
                 /* Unmap unused windows immediately to expose use-after-unmap
                  * by SIGSEGV. */
                 window_free(w);
@@ -281,51 +297,7 @@ static void context_free(Context *c) {
         free(c);
 }
 
-static void fd_free(FileDescriptor *f) {
-        assert(f);
-
-        while (f->windows)
-                window_free(f->windows);
-
-        if (f->cache)
-                assert_se(hashmap_remove(f->cache->fds, INT_TO_PTR(f->fd + 1)));
-
-        free(f);
-}
-
-static FileDescriptor* fd_add(MMapCache *m, int fd) {
-        FileDescriptor *f;
-        int r;
-
-        assert(m);
-        assert(fd >= 0);
-
-        f = hashmap_get(m->fds, INT_TO_PTR(fd + 1));
-        if (f)
-                return f;
-
-        r = hashmap_ensure_allocated(&m->fds, NULL);
-        if (r < 0)
-                return NULL;
-
-        f = new0(FileDescriptor, 1);
-        if (!f)
-                return NULL;
-
-        f->cache = m;
-        f->fd = fd;
-
-        r = hashmap_put(m->fds, UINT_TO_PTR(fd + 1), f);
-        if (r < 0) {
-                free(f);
-                return NULL;
-        }
-
-        return f;
-}
-
 static void mmap_cache_free(MMapCache *m) {
-        FileDescriptor *f;
         int i;
 
         assert(m);
@@ -333,9 +305,6 @@ static void mmap_cache_free(MMapCache *m) {
         for (i = 0; i < MMAP_CACHE_MAX_CONTEXTS; i++)
                 if (m->contexts[i])
                         context_free(m->contexts[i]);
-
-        while ((f = hashmap_first(m->fds)))
-                fd_free(f);
 
         hashmap_free(m->fds);
 
@@ -346,10 +315,13 @@ static void mmap_cache_free(MMapCache *m) {
 }
 
 MMapCache* mmap_cache_unref(MMapCache *m) {
-        assert(m);
+
+        if (!m)
+                return NULL;
+
         assert(m->n_ref > 0);
 
-        m->n_ref --;
+        m->n_ref--;
         if (m->n_ref == 0)
                 mmap_cache_free(m);
 
@@ -368,19 +340,20 @@ static int make_room(MMapCache *m) {
 
 static int try_context(
                 MMapCache *m,
-                int fd,
+                MMapFileDescriptor *f,
                 int prot,
                 unsigned context,
                 bool keep_always,
                 uint64_t offset,
                 size_t size,
-                void **ret) {
+                void **ret,
+                size_t *ret_size) {
 
         Context *c;
 
         assert(m);
         assert(m->n_ref > 0);
-        assert(fd >= 0);
+        assert(f);
         assert(size > 0);
         assert(ret);
 
@@ -393,7 +366,7 @@ static int try_context(
         if (!c->window)
                 return 0;
 
-        if (!window_matches(c->window, fd, prot, offset, size)) {
+        if (!window_matches_fd(c->window, f, prot, offset, size)) {
 
                 /* Drop the reference to the window, since it's unnecessary now */
                 context_detach_window(c);
@@ -403,42 +376,39 @@ static int try_context(
         if (c->window->fd->sigbus)
                 return -EIO;
 
-        c->window->keep_always |= keep_always;
+        c->window->keep_always = c->window->keep_always || keep_always;
 
         *ret = (uint8_t*) c->window->ptr + (offset - c->window->offset);
+        if (ret_size)
+                *ret_size = c->window->size - (offset - c->window->offset);
+
         return 1;
 }
 
 static int find_mmap(
                 MMapCache *m,
-                int fd,
+                MMapFileDescriptor *f,
                 int prot,
                 unsigned context,
                 bool keep_always,
                 uint64_t offset,
                 size_t size,
-                void **ret) {
+                void **ret,
+                size_t *ret_size) {
 
-        FileDescriptor *f;
         Window *w;
         Context *c;
 
         assert(m);
         assert(m->n_ref > 0);
-        assert(fd >= 0);
+        assert(f);
         assert(size > 0);
-
-        f = hashmap_get(m->fds, INT_TO_PTR(fd + 1));
-        if (!f)
-                return 0;
-
-        assert(f->fd == fd);
 
         if (f->sigbus)
                 return -EIO;
 
         LIST_FOREACH(by_fd, w, f->windows)
-                if (window_matches(w, fd, prot, offset, size))
+                if (window_matches(w, prot, offset, size))
                         break;
 
         if (!w)
@@ -449,33 +419,63 @@ static int find_mmap(
                 return -ENOMEM;
 
         context_attach_window(c, w);
-        w->keep_always += keep_always;
+        w->keep_always = w->keep_always || keep_always;
 
         *ret = (uint8_t*) w->ptr + (offset - w->offset);
+        if (ret_size)
+                *ret_size = w->size - (offset - w->offset);
+
         return 1;
+}
+
+static int mmap_try_harder(MMapCache *m, void *addr, MMapFileDescriptor *f, int prot, int flags, uint64_t offset, size_t size, void **res) {
+        void *ptr;
+
+        assert(m);
+        assert(f);
+        assert(res);
+
+        for (;;) {
+                int r;
+
+                ptr = mmap(addr, size, prot, flags, f->fd, offset);
+                if (ptr != MAP_FAILED)
+                        break;
+                if (errno != ENOMEM)
+                        return negative_errno();
+
+                r = make_room(m);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -ENOMEM;
+        }
+
+        *res = ptr;
+        return 0;
 }
 
 static int add_mmap(
                 MMapCache *m,
-                int fd,
+                MMapFileDescriptor *f,
                 int prot,
                 unsigned context,
                 bool keep_always,
                 uint64_t offset,
                 size_t size,
                 struct stat *st,
-                void **ret) {
+                void **ret,
+                size_t *ret_size) {
 
         uint64_t woffset, wsize;
         Context *c;
-        FileDescriptor *f;
         Window *w;
         void *d;
         int r;
 
         assert(m);
         assert(m->n_ref > 0);
-        assert(fd >= 0);
+        assert(f);
         assert(size > 0);
         assert(ret);
 
@@ -508,91 +508,70 @@ static int add_mmap(
                         wsize = PAGE_ALIGN(st->st_size - woffset);
         }
 
-        for (;;) {
-                d = mmap(NULL, wsize, prot, MAP_SHARED, fd, woffset);
-                if (d != MAP_FAILED)
-                        break;
-                if (errno != ENOMEM)
-                        return -errno;
-
-                r = make_room(m);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        return -ENOMEM;
-        }
+        r = mmap_try_harder(m, NULL, f, prot, MAP_SHARED, woffset, wsize, &d);
+        if (r < 0)
+                return r;
 
         c = context_add(m, context);
         if (!c)
                 goto outofmem;
 
-        f = fd_add(m, fd);
-        if (!f)
-                goto outofmem;
-
-        w = window_add(m);
+        w = window_add(m, f, prot, keep_always, woffset, wsize, d);
         if (!w)
                 goto outofmem;
 
-        w->keep_always = keep_always;
-        w->ptr = d;
-        w->offset = woffset;
-        w->prot = prot;
-        w->size = wsize;
-        w->fd = f;
-
-        LIST_PREPEND(by_fd, f->windows, w);
-
-        context_detach_window(c);
-        c->window = w;
-        LIST_PREPEND(by_window, w->contexts, c);
+        context_attach_window(c, w);
 
         *ret = (uint8_t*) w->ptr + (offset - w->offset);
+        if (ret_size)
+                *ret_size = w->size - (offset - w->offset);
+
         return 1;
 
 outofmem:
-        munmap(d, wsize);
+        (void) munmap(d, wsize);
         return -ENOMEM;
 }
 
 int mmap_cache_get(
                 MMapCache *m,
-                int fd,
+                MMapFileDescriptor *f,
                 int prot,
                 unsigned context,
                 bool keep_always,
                 uint64_t offset,
                 size_t size,
                 struct stat *st,
-                void **ret) {
+                void **ret,
+                size_t *ret_size) {
 
         int r;
 
         assert(m);
         assert(m->n_ref > 0);
-        assert(fd >= 0);
+        assert(f);
         assert(size > 0);
         assert(ret);
         assert(context < MMAP_CACHE_MAX_CONTEXTS);
 
         /* Check whether the current context is the right one already */
-        r = try_context(m, fd, prot, context, keep_always, offset, size, ret);
+        r = try_context(m, f, prot, context, keep_always, offset, size, ret, ret_size);
         if (r != 0) {
-                m->n_hit ++;
+                m->n_hit++;
                 return r;
         }
 
         /* Search for a matching mmap */
-        r = find_mmap(m, fd, prot, context, keep_always, offset, size, ret);
+        r = find_mmap(m, f, prot, context, keep_always, offset, size, ret, ret_size);
         if (r != 0) {
-                m->n_hit ++;
+                m->n_hit++;
                 return r;
         }
 
         m->n_missed++;
 
         /* Create a new mmap */
-        return add_mmap(m, fd, prot, context, keep_always, offset, size, st, ret);
+        return add_mmap(m, f, prot, context, keep_always, offset, size, st, ret, ret_size);
 }
 
 unsigned mmap_cache_get_hit(MMapCache *m) {
@@ -609,7 +588,7 @@ unsigned mmap_cache_get_missed(MMapCache *m) {
 
 static void mmap_cache_process_sigbus(MMapCache *m) {
         bool found = false;
-        FileDescriptor *f;
+        MMapFileDescriptor *f;
         Iterator i;
         int r;
 
@@ -670,26 +649,47 @@ static void mmap_cache_process_sigbus(MMapCache *m) {
         }
 }
 
-bool mmap_cache_got_sigbus(MMapCache *m, int fd) {
-        FileDescriptor *f;
-
+bool mmap_cache_got_sigbus(MMapCache *m, MMapFileDescriptor *f) {
         assert(m);
-        assert(fd >= 0);
+        assert(f);
 
         mmap_cache_process_sigbus(m);
-
-        f = hashmap_get(m->fds, INT_TO_PTR(fd + 1));
-        if (!f)
-                return false;
 
         return f->sigbus;
 }
 
-void mmap_cache_close_fd(MMapCache *m, int fd) {
-        FileDescriptor *f;
+MMapFileDescriptor* mmap_cache_add_fd(MMapCache *m, int fd) {
+        MMapFileDescriptor *f;
+        int r;
 
         assert(m);
         assert(fd >= 0);
+
+        f = hashmap_get(m->fds, FD_TO_PTR(fd));
+        if (f)
+                return f;
+
+        r = hashmap_ensure_allocated(&m->fds, NULL);
+        if (r < 0)
+                return NULL;
+
+        f = new0(MMapFileDescriptor, 1);
+        if (!f)
+                return NULL;
+
+        f->cache = m;
+        f->fd = fd;
+
+        r = hashmap_put(m->fds, FD_TO_PTR(fd), f);
+        if (r < 0)
+                return mfree(f);
+
+        return f;
+}
+
+void mmap_cache_free_fd(MMapCache *m, MMapFileDescriptor *f) {
+        assert(m);
+        assert(f);
 
         /* Make sure that any queued SIGBUS are first dispatched, so
          * that we don't end up with a SIGBUS entry we cannot relate
@@ -697,9 +697,11 @@ void mmap_cache_close_fd(MMapCache *m, int fd) {
 
         mmap_cache_process_sigbus(m);
 
-        f = hashmap_get(m->fds, INT_TO_PTR(fd + 1));
-        if (!f)
-                return;
+        while (f->windows)
+                window_free(f->windows);
 
-        fd_free(f);
+        if (f->cache)
+                assert_se(hashmap_remove(f->cache->fds, FD_TO_PTR(f->fd)));
+
+        free(f);
 }

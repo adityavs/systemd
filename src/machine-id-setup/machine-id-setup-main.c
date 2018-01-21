@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,24 +18,30 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <getopt.h>
 #include <errno.h>
+#include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-#include "machine-id-setup.h"
+#include "id128-util.h"
 #include "log.h"
-#include "build.h"
+#include "machine-id-setup.h"
+#include "path-util.h"
+#include "util.h"
 
-static const char *arg_root = "";
+static char *arg_root = NULL;
+static bool arg_commit = false;
+static bool arg_print = false;
 
 static void help(void) {
         printf("%s [OPTIONS...]\n\n"
                "Initialize /etc/machine-id from a random source.\n\n"
                "  -h --help             Show this help\n"
                "     --version          Show package version\n"
-               "     --root=ROOT        Filesystem root\n",
-               program_invocation_short_name);
+               "     --root=ROOT        Filesystem root\n"
+               "     --commit           Commit transient ID\n"
+               "     --print            Print used machine ID\n"
+               , program_invocation_short_name);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -44,16 +49,20 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_ROOT,
+                ARG_COMMIT,
+                ARG_PRINT,
         };
 
         static const struct option options[] = {
                 { "help",      no_argument,       NULL, 'h'           },
                 { "version",   no_argument,       NULL, ARG_VERSION   },
                 { "root",      required_argument, NULL, ARG_ROOT      },
+                { "commit",    no_argument,       NULL, ARG_COMMIT    },
+                { "print",     no_argument,       NULL, ARG_PRINT     },
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
@@ -67,12 +76,20 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_ROOT:
-                        arg_root = optarg;
+                        r = parse_path_argument_and_warn(optarg, true, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_COMMIT:
+                        arg_commit = true;
+                        break;
+
+                case ARG_PRINT:
+                        arg_print = true;
                         break;
 
                 case '?':
@@ -91,6 +108,8 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+        char buf[SD_ID128_STRING_MAX];
+        sd_id128_t id;
         int r;
 
         log_parse_environment();
@@ -98,7 +117,31 @@ int main(int argc, char *argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+                goto finish;
 
-        return machine_id_setup(arg_root) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        if (arg_commit) {
+                const char *etc_machine_id;
+
+                r = machine_id_commit(arg_root);
+                if (r < 0)
+                        goto finish;
+
+                etc_machine_id = prefix_roota(arg_root, "/etc/machine-id");
+                r = id128_read(etc_machine_id, ID128_PLAIN, &id);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to read machine ID back: %m");
+                        goto finish;
+                }
+        } else {
+                r = machine_id_setup(arg_root, SD_ID128_NULL, &id);
+                if (r < 0)
+                        goto finish;
+        }
+
+        if (arg_print)
+                puts(sd_id128_to_string(id, buf));
+
+finish:
+        free(arg_root);
+        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

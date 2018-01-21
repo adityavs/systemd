@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
@@ -114,10 +116,10 @@
         <listitem><para>Change the SysV runlevel. This is translated
         into an activation request for
         <filename>runlevel2.target</filename>,
-        <filename>runlevel3.target</filename>, ... and is equivalent
+        <filename>runlevel3.target</filename>, … and is equivalent
         to <command>systemctl isolate runlevel2.target</command>,
         <command>systemctl isolate runlevel3.target</command>,
-        ...</para></listitem>
+        …</para></listitem>
       </varlistentry>
 
       <varlistentry>

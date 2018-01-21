@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,12 +19,12 @@
  ***/
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <netdb.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -33,15 +32,19 @@
 #include "sd-daemon.h"
 #include "sd-event.h"
 #include "sd-resolve.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "log.h"
-#include "socket-util.h"
-#include "util.h"
-#include "build.h"
-#include "set.h"
 #include "path-util.h"
+#include "set.h"
+#include "socket-util.h"
+#include "string-util.h"
+#include "parse-util.h"
+#include "util.h"
 
 #define BUFFER_SIZE (256 * 1024)
-#define CONNECTIONS_MAX 256
+static unsigned arg_connections_max = 256;
 
 static const char *arg_remote_host = NULL;
 
@@ -89,19 +92,10 @@ static void connection_free(Connection *c) {
 }
 
 static void context_free(Context *context) {
-        sd_event_source *es;
-        Connection *c;
-
         assert(context);
 
-        while ((es = set_steal_first(context->listen)))
-                sd_event_source_unref(es);
-
-        while ((c = set_first(context->connections)))
-                connection_free(c);
-
-        set_free(context->listen);
-        set_free(context->connections);
+        set_free_with_destructor(context->listen, sd_event_source_unref);
+        set_free_with_destructor(context->connections, connection_free);
 
         sd_event_unref(context->event);
         sd_resolve_unref(context->resolve);
@@ -162,10 +156,10 @@ static int connection_shovel(
                         if (z > 0) {
                                 *full += z;
                                 shoveled = true;
-                        } else if (z == 0 || errno == EPIPE || errno == ECONNRESET) {
+                        } else if (z == 0 || IN_SET(errno, EPIPE, ECONNRESET)) {
                                 *from_source = sd_event_source_unref(*from_source);
                                 *from = safe_close(*from);
-                        } else if (errno != EAGAIN && errno != EINTR)
+                        } else if (!IN_SET(errno, EAGAIN, EINTR))
                                 return log_error_errno(errno, "Failed to splice: %m");
                 }
 
@@ -174,10 +168,10 @@ static int connection_shovel(
                         if (z > 0) {
                                 *full -= z;
                                 shoveled = true;
-                        } else if (z == 0 || errno == EPIPE || errno == ECONNRESET) {
+                        } else if (z == 0 || IN_SET(errno, EPIPE, ECONNRESET)) {
                                 *to_source = sd_event_source_unref(*to_source);
                                 *to = safe_close(*to);
-                        } else if (errno != EAGAIN && errno != EINTR)
+                        } else if (!IN_SET(errno, EAGAIN, EINTR))
                                 return log_error_errno(errno, "Failed to splice: %m");
                 }
         } while (shoveled);
@@ -399,34 +393,25 @@ static int resolve_remote(Connection *c) {
 
         union sockaddr_union sa = {};
         const char *node, *service;
-        socklen_t salen;
         int r;
 
         if (path_is_absolute(arg_remote_host)) {
                 sa.un.sun_family = AF_UNIX;
-                strncpy(sa.un.sun_path, arg_remote_host, sizeof(sa.un.sun_path)-1);
-                sa.un.sun_path[sizeof(sa.un.sun_path)-1] = 0;
-
-                salen = offsetof(union sockaddr_union, un.sun_path) + strlen(sa.un.sun_path);
-
-                return connection_start(c, &sa.sa, salen);
+                strncpy(sa.un.sun_path, arg_remote_host, sizeof(sa.un.sun_path));
+                return connection_start(c, &sa.sa, SOCKADDR_UN_LEN(sa.un));
         }
 
         if (arg_remote_host[0] == '@') {
                 sa.un.sun_family = AF_UNIX;
                 sa.un.sun_path[0] = 0;
-                strncpy(sa.un.sun_path+1, arg_remote_host+1, sizeof(sa.un.sun_path)-2);
-                sa.un.sun_path[sizeof(sa.un.sun_path)-1] = 0;
-
-                salen = offsetof(union sockaddr_union, un.sun_path) + 1 + strlen(sa.un.sun_path + 1);
-
-                return connection_start(c, &sa.sa, salen);
+                strncpy(sa.un.sun_path+1, arg_remote_host+1, sizeof(sa.un.sun_path)-1);
+                return connection_start(c, &sa.sa, SOCKADDR_UN_LEN(sa.un));
         }
 
         service = strrchr(arg_remote_host, ':');
         if (service) {
                 node = strndupa(arg_remote_host, service - arg_remote_host);
-                service ++;
+                service++;
         } else {
                 node = arg_remote_host;
                 service = "80";
@@ -453,7 +438,7 @@ static int add_connection_socket(Context *context, int fd) {
         assert(context);
         assert(fd >= 0);
 
-        if (set_size(context->connections) > CONNECTIONS_MAX) {
+        if (set_size(context->connections) > arg_connections_max) {
                 log_warning("Hit connection limit, refusing connection.");
                 safe_close(fd);
                 return 0;
@@ -502,7 +487,7 @@ static int accept_cb(sd_event_source *s, int fd, uint32_t revents, void *userdat
                 if (errno != -EAGAIN)
                         log_warning_errno(errno, "Failed to accept() socket: %m");
         } else {
-                getpeername_pretty(nfd, &peer);
+                getpeername_pretty(nfd, true, &peer);
                 log_debug("New connection from %s", strna(peer));
 
                 r = add_connection_socket(context, nfd);
@@ -571,6 +556,7 @@ static void help(void) {
         printf("%1$s [HOST:PORT]\n"
                "%1$s [SOCKET]\n\n"
                "Bidirectionally proxy local sockets to another (possibly remote) socket.\n\n"
+               "  -c --connections-max=  Set the maximum number of connections to be accepted\n"
                "  -h --help              Show this help\n"
                "     --version           Show package version\n",
                program_invocation_short_name);
@@ -584,17 +570,18 @@ static int parse_argv(int argc, char *argv[]) {
         };
 
         static const struct option options[] = {
-                { "help",       no_argument, NULL, 'h'           },
-                { "version",    no_argument, NULL, ARG_VERSION   },
+                { "connections-max", required_argument, NULL, 'c'           },
+                { "help",            no_argument,       NULL, 'h'           },
+                { "version",         no_argument,       NULL, ARG_VERSION   },
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "c:h", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -602,10 +589,22 @@ static int parse_argv(int argc, char *argv[]) {
                         help();
                         return 0;
 
+                case 'c':
+                        r = safe_atou(optarg, &arg_connections_max);
+                        if (r < 0) {
+                                log_error("Failed to parse --connections-max= argument: %s", optarg);
+                                return r;
+                        }
+
+                        if (arg_connections_max < 1) {
+                                log_error("Connection limit is too low.");
+                                return -EINVAL;
+                        }
+
+                        break;
+
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case '?':
                         return -EINVAL;

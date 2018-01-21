@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,15 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "sd-event.h"
 #include "sd-daemon.h"
+#include "sd-event.h"
+
+#include "capability-util.h"
 #include "mkdir.h"
-#include "capability.h"
+#include "resolved-conf.h"
+#include "resolved-manager.h"
+#include "resolved-resolv-conf.h"
 #include "selinux-util.h"
 #include "signal-util.h"
-
-#include "resolved-manager.h"
-#include "resolved-conf.h"
+#include "user-util.h"
 
 int main(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
@@ -48,7 +49,7 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = mac_selinux_init(NULL);
+        r = mac_selinux_init();
         if (r < 0) {
                 log_error_errno(r, "SELinux setup failed: %m");
                 goto finish;
@@ -61,17 +62,26 @@ int main(int argc, char *argv[]) {
         }
 
         /* Always create the directory where resolv.conf will live */
-        r = mkdir_safe_label("/run/systemd/resolve", 0755, uid, gid);
+        r = mkdir_safe_label("/run/systemd/resolve", 0755, uid, gid, false);
         if (r < 0) {
                 log_error_errno(r, "Could not create runtime directory: %m");
                 goto finish;
         }
 
-        r = drop_privileges(uid, gid, 0);
-        if (r < 0)
-                goto finish;
+        /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
+         * privileges are already dropped. */
+        if (getuid() == 0) {
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
+                /* Drop privileges, but keep three caps. Note that we drop those too, later on (see below) */
+                r = drop_privileges(uid, gid,
+                                    (UINT64_C(1) << CAP_NET_RAW)|          /* needed for SO_BINDTODEVICE */
+                                    (UINT64_C(1) << CAP_NET_BIND_SERVICE)| /* needed to bind on port 53 */
+                                    (UINT64_C(1) << CAP_SETPCAP)           /* needed in order to drop the caps later */);
+                if (r < 0)
+                        goto finish;
+        }
+
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, SIGUSR1, SIGUSR2, SIGRTMIN+1, -1) >= 0);
 
         r = manager_new(&m);
         if (r < 0) {
@@ -79,21 +89,21 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        r = manager_parse_config_file(m);
-        if (r < 0)
-                log_warning_errno(r, "Failed to parse configuration file: %m");
-
         r = manager_start(m);
         if (r < 0) {
                 log_error_errno(r, "Failed to start manager: %m");
                 goto finish;
         }
 
-        /* Write finish default resolv.conf to avoid a dangling
-         * symlink */
-        r = manager_write_resolv_conf(m);
-        if (r < 0)
-                log_warning_errno(r, "Could not create resolv.conf: %m");
+        /* Write finish default resolv.conf to avoid a dangling symlink */
+        (void) manager_write_resolv_conf(m);
+
+        /* Let's drop the remaining caps now */
+        r = capability_bounding_set_drop(0, true);
+        if (r < 0) {
+                log_error_errno(r, "Failed to drop remaining caps: %m");
+                goto finish;
+        }
 
         sd_notify(false,
                   "READY=1\n"

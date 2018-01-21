@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 #  -*- Mode: python; coding: utf-8; indent-tabs-mode: nil -*- */
+# SPDX-License-Identifier: LGPL-2.1+
 #
 #  This file is part of systemd.
 #
@@ -20,7 +22,7 @@
 import sys
 import collections
 import re
-from xml_helper import *
+from xml_helper import xml_parse, xml_print, tree
 from copy import deepcopy
 
 TEMPLATE = '''\
@@ -129,15 +131,6 @@ TEMPLATE = '''\
                 systemd process.</para>
 
                 <variablelist id='systemd-directives' />
-        </refsect1>
-
-        <refsect1>
-                <title>bootchart.conf directives</title>
-
-                <para>Directives for configuring the behaviour of the
-                systemd-bootchart process.</para>
-
-                <variablelist id='bootchart-directives' />
         </refsect1>
 
         <refsect1>
@@ -268,6 +261,7 @@ def _make_section(template, name, directives, formatting):
             b = tree.SubElement(para, 'citerefentry')
             c = tree.SubElement(b, 'refentrytitle')
             c.text = manpage
+            c.attrib['target'] = varname
             d = tree.SubElement(b, 'manvolnum')
             d.text = manvolume
         entry.tail = '\n\n'

@@ -6,6 +6,8 @@
 ]>
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2015 David Herrmann <dh.herrmann@gmail.com>
@@ -112,7 +114,7 @@
     <constant>NULL</constant> is returned.</para>
 
     <para><function>udev_enumerate_get_udev()</function> always
-    returns a pointer to the udev context that this enumerate
+    returns a pointer to the udev context that this enumerated
     object is associated with.</para>
   </refsect1>
 

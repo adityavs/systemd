@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,14 +21,19 @@
 #include <getopt.h>
 
 #include "sd-event.h"
-#include "event-util.h"
-#include "verbs.h"
-#include "build.h"
-#include "signal-util.h"
-#include "machine-image.h"
-#include "import-util.h"
-#include "import-tar.h"
+#include "sd-id128.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "hostname-util.h"
 #include "import-raw.h"
+#include "import-tar.h"
+#include "import-util.h"
+#include "machine-image.h"
+#include "signal-util.h"
+#include "string-util.h"
+#include "verbs.h"
 
 static bool arg_force = false;
 static bool arg_read_only = false;
@@ -53,7 +57,7 @@ static void on_tar_finished(TarImport *import, int error, void *userdata) {
 
 static int import_tar(int argc, char *argv[], void *userdata) {
         _cleanup_(tar_import_unrefp) TarImport *import = NULL;
-        _cleanup_event_unref_ sd_event *event = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         const char *path = NULL, *local = NULL;
         _cleanup_free_ char *ll = NULL;
         _cleanup_close_ int open_fd = -1;
@@ -88,7 +92,7 @@ static int import_tar(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         else if (r > 0) {
-                                log_error_errno(EEXIST, "Image '%s' already exists.", local);
+                                log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
                 }
@@ -148,7 +152,7 @@ static void on_raw_finished(RawImport *import, int error, void *userdata) {
 
 static int import_raw(int argc, char *argv[], void *userdata) {
         _cleanup_(raw_import_unrefp) RawImport *import = NULL;
-        _cleanup_event_unref_ sd_event *event = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         const char *path = NULL, *local = NULL;
         _cleanup_free_ char *ll = NULL;
         _cleanup_close_ int open_fd = -1;
@@ -183,7 +187,7 @@ static int import_raw(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         else if (r > 0) {
-                                log_error_errno(EEXIST, "Image '%s' already exists.", local);
+                                log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
                 }
@@ -279,9 +283,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return help(0, NULL, NULL);
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_FORCE:
                         arg_force = true;

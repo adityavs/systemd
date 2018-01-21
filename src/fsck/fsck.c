@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,28 +19,34 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <stdbool.h>
 #include <errno.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-device.h"
 
-#include "util.h"
+#include "alloc-util.h"
+#include "bus-common-errors.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "device-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "proc-cmdline.h"
 #include "process-util.h"
 #include "signal-util.h"
-#include "special.h"
-#include "bus-util.h"
-#include "bus-error.h"
-#include "bus-common-errors.h"
-#include "device-util.h"
-#include "path-util.h"
 #include "socket-util.h"
+#include "special.h"
+#include "stdio-util.h"
+#include "util.h"
 
 /* exit codes as defined in fsck(8) */
 enum {
@@ -60,14 +65,14 @@ static bool arg_force = false;
 static bool arg_show_progress = false;
 static const char *arg_repair = "-a";
 
-static void start_target(const char *target) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+static void start_target(const char *target, const char *mode) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         assert(target);
 
-        r = bus_open_system_systemd(&bus);
+        r = bus_connect_system_systemd(&bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to get D-Bus connection: %m");
                 return;
@@ -83,19 +88,22 @@ static void start_target(const char *target) {
                                "StartUnitReplace",
                                &error,
                                NULL,
-                               "sss", "basic.target", target, "replace");
+                               "sss", "basic.target", target, mode);
 
         /* Don't print a warning if we aren't called during startup */
         if (r < 0 && !sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_JOB))
                 log_error("Failed to start unit: %s", bus_error_message(&error, r));
 }
 
-static int parse_proc_cmdline_item(const char *key, const char *value) {
+static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         int r;
 
         assert(key);
 
-        if (streq(key, "fsck.mode") && value) {
+        if (streq(key, "fsck.mode")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
                 if (streq(value, "auto"))
                         arg_force = arg_skip = false;
@@ -106,7 +114,10 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
                 else
                         log_warning("Invalid fsck.mode= parameter '%s'. Ignoring.", value);
 
-        } else if (streq(key, "fsck.repair") && value) {
+        } else if (streq(key, "fsck.repair")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
                 if (streq(value, "preen"))
                         arg_repair = "-a";
@@ -121,7 +132,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
                 }
         }
 
-#ifdef HAVE_SYSV_COMPAT
+#if HAVE_SYSV_COMPAT
         else if (streq(key, "fastboot") && !value) {
                 log_warning("Please pass 'fsck.mode=skip' rather than 'fastboot' on the kernel command line.");
                 arg_skip = true;
@@ -137,7 +148,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
 
 static void test_files(void) {
 
-#ifdef HAVE_SYSV_COMPAT
+#if HAVE_SYSV_COMPAT
         if (access("/fastboot", F_OK) >= 0) {
                 log_error("Please pass 'fsck.mode=skip' on the kernel command line rather than creating /fastboot on the root file system.");
                 arg_skip = true;
@@ -258,8 +269,8 @@ static int fsck_progress_socket(void) {
         if (fd < 0)
                 return log_warning_errno(errno, "socket(): %m");
 
-        if (connect(fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sa.un.sun_path)) < 0) {
-                r = log_full_errno(errno == ECONNREFUSED || errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
+        if (connect(fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0) {
+                r = log_full_errno(IN_SET(errno, ECONNREFUSED, ENOENT) ? LOG_DEBUG : LOG_WARNING,
                                    errno, "Failed to connect to progress socket %s, ignoring: %m", sa.un.sun_path);
                 safe_close(fd);
                 return r;
@@ -270,12 +281,11 @@ static int fsck_progress_socket(void) {
 
 int main(int argc, char *argv[]) {
         _cleanup_close_pair_ int progress_pipe[2] = { -1, -1 };
-        _cleanup_device_unref_ sd_device *dev = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         const char *device, *type;
         bool root_directory;
-        siginfo_t status;
         struct stat st;
-        int r;
+        int r, exit_status;
         pid_t pid;
 
         if (argc > 2) {
@@ -289,7 +299,7 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = parse_proc_cmdline(parse_proc_cmdline_item);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, PROC_CMDLINE_STRIP_RD_PREFIX);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
@@ -366,12 +376,12 @@ int main(int argc, char *argv[]) {
         r = sd_device_get_property_value(dev, "ID_FS_TYPE", &type);
         if (r >= 0) {
                 r = fsck_exists(type);
-                if (r == -ENOENT) {
-                        log_info("fsck.%s doesn't exist, not checking file system on %s", type, device);
-                        r = 0;
+                if (r < 0)
+                        log_warning_errno(r, "Couldn't detect if fsck.%s may be used for %s, proceeding: %m", type, device);
+                else if (r == 0) {
+                        log_info("fsck.%s doesn't exist, not checking file system on %s.", type, device);
                         goto finish;
-                } else if (r < 0)
-                        log_warning_errno(r, "Couldn't detect if fsck.%s may be used for %s: %m", type, device);
+                }
         }
 
         if (arg_show_progress) {
@@ -381,22 +391,16 @@ int main(int argc, char *argv[]) {
                 }
         }
 
-        pid = fork();
-        if (pid < 0) {
-                r = log_error_errno(errno, "fork(): %m");
+        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        if (r < 0)
                 goto finish;
-        }
-        if (pid == 0) {
-                char dash_c[sizeof("-C")-1 + DECIMAL_STR_MAX(int) + 1];
+        if (r == 0) {
+                char dash_c[STRLEN("-C") + DECIMAL_STR_MAX(int) + 1];
                 int progress_socket = -1;
                 const char *cmdline[9];
                 int i = 0;
 
                 /* Child */
-
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
 
                 /* Close the reading side of the progress pipe */
                 progress_pipe[0] = safe_close(progress_pipe[0]);
@@ -444,38 +448,30 @@ int main(int argc, char *argv[]) {
         (void) process_progress(progress_pipe[0]);
         progress_pipe[0] = -1;
 
-        r = wait_for_terminate(pid, &status);
-        if (r < 0) {
-                log_error_errno(r, "waitid(): %m");
+        exit_status = wait_for_terminate_and_check("fsck", pid, WAIT_LOG_ABNORMAL);
+        if (exit_status < 0) {
+                r = exit_status;
                 goto finish;
         }
+        if (exit_status & ~1) {
+                log_error("fsck failed with exit status %i.", exit_status);
 
-        if (status.si_code != CLD_EXITED || (status.si_status & ~1)) {
-
-                if (status.si_code == CLD_KILLED || status.si_code == CLD_DUMPED)
-                        log_error("fsck terminated by signal %s.", signal_to_string(status.si_status));
-                else if (status.si_code == CLD_EXITED)
-                        log_error("fsck failed with error code %i.", status.si_status);
-                else
-                        log_error("fsck failed due to unknown reason.");
-
-                r = -EINVAL;
-
-                if (status.si_code == CLD_EXITED && (status.si_status & FSCK_SYSTEM_SHOULD_REBOOT) && root_directory)
+                if ((exit_status & FSCK_SYSTEM_SHOULD_REBOOT) && root_directory) {
                         /* System should be rebooted. */
-                        start_target(SPECIAL_REBOOT_TARGET);
-                else if (status.si_code == CLD_EXITED && (status.si_status & (FSCK_SYSTEM_SHOULD_REBOOT | FSCK_ERRORS_LEFT_UNCORRECTED)))
+                        start_target(SPECIAL_REBOOT_TARGET, "replace-irreversibly");
+                        r = -EINVAL;
+                } else if (exit_status & (FSCK_SYSTEM_SHOULD_REBOOT | FSCK_ERRORS_LEFT_UNCORRECTED)) {
                         /* Some other problem */
-                        start_target(SPECIAL_EMERGENCY_TARGET);
-                else {
+                        start_target(SPECIAL_EMERGENCY_TARGET, "replace");
+                        r = -EINVAL;
+                } else {
                         log_warning("Ignoring error.");
                         r = 0;
                 }
-
         } else
                 r = 0;
 
-        if (status.si_code == CLD_EXITED && (status.si_status & FSCK_ERROR_CORRECTED))
+        if (exit_status & FSCK_ERROR_CORRECTED)
                 (void) touch("/run/systemd/quotacheck");
 
 finish:

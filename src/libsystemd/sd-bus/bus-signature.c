@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,6 +19,8 @@
 ***/
 
 #include <util.h>
+
+#include "sd-bus.h"
 
 #include "bus-signature.h"
 #include "bus-type.h"

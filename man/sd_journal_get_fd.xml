@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -146,7 +148,7 @@ if (t == (uint64_t) -1)
 else {
   struct timespec ts;
   uint64_t n;
-  clock_getttime(CLOCK_MONOTONIC, &amp;ts);
+  clock_gettime(CLOCK_MONOTONIC, &amp;ts);
   n = (uint64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
   msec = t > n ? (int) ((t - n + 999) / 1000) : 0;
 }</programlisting>
@@ -187,7 +189,7 @@ else {
     certain latency. This call will return a positive value if the
     journal changes are detected immediately and zero when they need
     to be polled for and hence might be noticed only with a certain
-    latency. Note that there's usually no need to invoke this function
+    latency. Note that there is usually no need to invoke this function
     directly as <function>sd_journal_get_timeout()</function> on these
     file systems will ask for timeouts explicitly anyway.</para>
   </refsect1>
@@ -226,6 +228,20 @@ else {
     in the case of <constant>SD_JOURNAL_APPEND</constant>, it is
     sufficient to simply continue reading at the previous end of the
     journal.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Signal safety</title>
+
+    <para>In general, <function>sd_journal_get_fd()</function>,
+    <function>sd_journal_get_events()</function>, and <function>sd_journal_get_timeout()</function>
+    are <emphasis>not</emphasis> "async signal safe" in the meaning of
+    <citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+    Nevertheless, only the first call to any of those three functions performs unsafe operations, so
+    subsequent calls <emphasis>are</emphasis> safe.</para>
+
+    <para><function>sd_journal_process()</function> and <function>sd_journal_wait()</function> are not
+    safe. <function>sd_journal_reliable_fd()</function> is safe.</para>
   </refsect1>
 
   <refsect1>
@@ -304,7 +320,7 @@ int wait_for_changes(sd_journal *j) {
   else {
     struct timespec ts;
     uint64_t n;
-    clock_getttime(CLOCK_MONOTONIC, &amp;ts);
+    clock_gettime(CLOCK_MONOTONIC, &amp;ts);
     n = (uint64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
     msec = t > n ? (int) ((t - n + 999) / 1000) : 0;
   }

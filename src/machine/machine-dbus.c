@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,6 +21,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/wait.h>
 
 /* When we include libgen.h because we need dirname() we immediately
  * undefine basename() since libgen.h defines it as a macro to the POSIX
@@ -29,44 +29,28 @@
 #include <libgen.h>
 #undef basename
 
-#include "bus-util.h"
-#include "bus-label.h"
-#include "strv.h"
+#include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-internal.h"
+#include "bus-label.h"
+#include "bus-util.h"
 #include "copy.h"
+#include "env-util.h"
+#include "fd-util.h"
 #include "fileio.h"
+#include "format-util.h"
+#include "fs-util.h"
 #include "in-addr-util.h"
 #include "local-addresses.h"
-#include "path-util.h"
-#include "mkdir.h"
-#include "bus-internal.h"
-#include "machine.h"
 #include "machine-dbus.h"
-#include "formats-util.h"
+#include "machine.h"
+#include "mkdir.h"
+#include "path-util.h"
 #include "process-util.h"
-
-static int property_get_id(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        Machine *m = userdata;
-        int r;
-
-        assert(bus);
-        assert(reply);
-        assert(m);
-
-        r = sd_bus_message_append_array(reply, 'y', &m->id, 16);
-        if (r < 0)
-                return r;
-
-        return 1;
-}
+#include "signal-util.h"
+#include "strv.h"
+#include "terminal-util.h"
+#include "user-util.h"
 
 static int property_get_state(
                 sd_bus *bus,
@@ -104,7 +88,6 @@ static int property_get_netif(
                 sd_bus_error *error) {
 
         Machine *m = userdata;
-        int r;
 
         assert(bus);
         assert(reply);
@@ -112,11 +95,7 @@ static int property_get_netif(
 
         assert_cc(sizeof(int) == sizeof(int32_t));
 
-        r = sd_bus_message_append_array(reply, 'i', m->netif, m->n_netif * sizeof(int));
-        if (r < 0)
-                return r;
-
-        return 1;
+        return sd_bus_message_append_array(reply, 'i', m->netif, m->n_netif * sizeof(int));
 }
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_class, machine_class, MachineClass);
@@ -132,6 +111,7 @@ int bus_machine_method_terminate(sd_bus_message *message, void *userdata, sd_bus
                         message,
                         CAP_KILL,
                         "org.freedesktop.machine1.manage-machines",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -170,13 +150,14 @@ int bus_machine_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid kill parameter '%s'", swho);
         }
 
-        if (signo <= 0 || signo >= _NSIG)
+        if (!SIGNAL_VALID(signo))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid signal %i", signo);
 
         r = bus_verify_polkit_async(
                         message,
                         CAP_KILL,
                         "org.freedesktop.machine1.manage-machines",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -194,77 +175,12 @@ int bus_machine_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
 }
 
 int bus_machine_method_get_addresses(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
-        _cleanup_free_ char *us = NULL, *them = NULL;
-        _cleanup_close_ int netns_fd = -1;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Machine *m = userdata;
-        const char *p;
-        siginfo_t si;
-        pid_t child;
         int r;
 
         assert(message);
         assert(m);
-
-        if (m->class != MACHINE_CONTAINER)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Requesting IP address data is only supported on container machines.");
-
-        r = readlink_malloc("/proc/self/ns/net", &us);
-        if (r < 0)
-                return r;
-
-        p = procfs_file_alloca(m->leader, "ns/net");
-        r = readlink_malloc(p, &them);
-        if (r < 0)
-                return r;
-
-        if (streq(us, them))
-                return sd_bus_error_setf(error, BUS_ERROR_NO_PRIVATE_NETWORKING, "Machine %s does not use private networking", m->name);
-
-        r = namespace_open(m->leader, NULL, NULL, &netns_fd, NULL);
-        if (r < 0)
-                return r;
-
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
-                return -errno;
-
-        child = fork();
-        if (child < 0)
-                return sd_bus_error_set_errnof(error, errno, "Failed to fork(): %m");
-
-        if (child == 0) {
-                _cleanup_free_ struct local_address *addresses = NULL;
-                struct local_address *a;
-                int i, n;
-
-                pair[0] = safe_close(pair[0]);
-
-                r = namespace_enter(-1, -1, netns_fd, -1);
-                if (r < 0)
-                        _exit(EXIT_FAILURE);
-
-                n = local_addresses(NULL, 0, AF_UNSPEC, &addresses);
-                if (n < 0)
-                        _exit(EXIT_FAILURE);
-
-                for (a = addresses, i = 0; i < n; a++, i++) {
-                        struct iovec iov[2] = {
-                                { .iov_base = &a->family, .iov_len = sizeof(a->family) },
-                                { .iov_base = &a->address, .iov_len = FAMILY_ADDRESS_SIZE(a->family) },
-                        };
-
-                        r = writev(pair[1], iov, 2);
-                        if (r < 0)
-                                _exit(EXIT_FAILURE);
-                }
-
-                pair[1] = safe_close(pair[1]);
-
-                _exit(EXIT_SUCCESS);
-        }
-
-        pair[1] = safe_close(pair[1]);
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -274,62 +190,163 @@ int bus_machine_method_get_addresses(sd_bus_message *message, void *userdata, sd
         if (r < 0)
                 return r;
 
-        for (;;) {
-                int family;
-                ssize_t n;
-                union in_addr_union in_addr;
-                struct iovec iov[2];
-                struct msghdr mh = {
-                        .msg_iov = iov,
-                        .msg_iovlen = 2,
-                };
+        switch (m->class) {
 
-                iov[0] = (struct iovec) { .iov_base = &family, .iov_len = sizeof(family) };
-                iov[1] = (struct iovec) { .iov_base = &in_addr, .iov_len = sizeof(in_addr) };
+        case MACHINE_HOST: {
+                _cleanup_free_ struct local_address *addresses = NULL;
+                struct local_address *a;
+                int n, i;
 
-                n = recvmsg(pair[0], &mh, 0);
+                n = local_addresses(NULL, 0, AF_UNSPEC, &addresses);
                 if (n < 0)
-                        return -errno;
-                if ((size_t) n < sizeof(family))
-                        break;
+                        return n;
 
-                r = sd_bus_message_open_container(reply, 'r', "iay");
-                if (r < 0)
-                        return r;
+                for (a = addresses, i = 0; i < n; a++, i++) {
 
-                r = sd_bus_message_append(reply, "i", family);
-                if (r < 0)
-                        return r;
+                        r = sd_bus_message_open_container(reply, 'r', "iay");
+                        if (r < 0)
+                                return r;
 
-                switch (family) {
+                        r = sd_bus_message_append(reply, "i", addresses[i].family);
+                        if (r < 0)
+                                return r;
 
-                case AF_INET:
-                        if (n != sizeof(struct in_addr) + sizeof(family))
-                                return -EIO;
+                        r = sd_bus_message_append_array(reply, 'y', &addresses[i].address, FAMILY_ADDRESS_SIZE(addresses[i].family));
+                        if (r < 0)
+                                return r;
 
-                        r = sd_bus_message_append_array(reply, 'y', &in_addr.in, sizeof(in_addr.in));
-                        break;
-
-                case AF_INET6:
-                        if (n != sizeof(struct in6_addr) + sizeof(family))
-                                return -EIO;
-
-                        r = sd_bus_message_append_array(reply, 'y', &in_addr.in6, sizeof(in_addr.in6));
-                        break;
+                        r = sd_bus_message_close_container(reply);
+                        if (r < 0)
+                                return r;
                 }
-                if (r < 0)
-                        return r;
 
-                r = sd_bus_message_close_container(reply);
-                if (r < 0)
-                        return r;
+                break;
         }
 
-        r = wait_for_terminate(child, &si);
-        if (r < 0)
-                return sd_bus_error_set_errnof(error, r, "Failed to wait for client: %m");
-        if (si.si_code != CLD_EXITED || si.si_status != EXIT_SUCCESS)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Client died abnormally.");
+        case MACHINE_CONTAINER: {
+                _cleanup_close_pair_ int pair[2] = { -1, -1 };
+                _cleanup_free_ char *us = NULL, *them = NULL;
+                _cleanup_close_ int netns_fd = -1;
+                const char *p;
+                pid_t child;
+
+                r = readlink_malloc("/proc/self/ns/net", &us);
+                if (r < 0)
+                        return r;
+
+                p = procfs_file_alloca(m->leader, "ns/net");
+                r = readlink_malloc(p, &them);
+                if (r < 0)
+                        return r;
+
+                if (streq(us, them))
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_PRIVATE_NETWORKING, "Machine %s does not use private networking", m->name);
+
+                r = namespace_open(m->leader, NULL, NULL, &netns_fd, NULL, NULL);
+                if (r < 0)
+                        return r;
+
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
+                        return -errno;
+
+                r = safe_fork("(sd-addr)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &child);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
+                if (r == 0) {
+                        _cleanup_free_ struct local_address *addresses = NULL;
+                        struct local_address *a;
+                        int i, n;
+
+                        pair[0] = safe_close(pair[0]);
+
+                        r = namespace_enter(-1, -1, netns_fd, -1, -1);
+                        if (r < 0)
+                                _exit(EXIT_FAILURE);
+
+                        n = local_addresses(NULL, 0, AF_UNSPEC, &addresses);
+                        if (n < 0)
+                                _exit(EXIT_FAILURE);
+
+                        for (a = addresses, i = 0; i < n; a++, i++) {
+                                struct iovec iov[2] = {
+                                        { .iov_base = &a->family, .iov_len = sizeof(a->family) },
+                                        { .iov_base = &a->address, .iov_len = FAMILY_ADDRESS_SIZE(a->family) },
+                                };
+
+                                r = writev(pair[1], iov, 2);
+                                if (r < 0)
+                                        _exit(EXIT_FAILURE);
+                        }
+
+                        pair[1] = safe_close(pair[1]);
+
+                        _exit(EXIT_SUCCESS);
+                }
+
+                pair[1] = safe_close(pair[1]);
+
+                for (;;) {
+                        int family;
+                        ssize_t n;
+                        union in_addr_union in_addr;
+                        struct iovec iov[2];
+                        struct msghdr mh = {
+                                .msg_iov = iov,
+                                .msg_iovlen = 2,
+                        };
+
+                        iov[0] = (struct iovec) { .iov_base = &family, .iov_len = sizeof(family) };
+                        iov[1] = (struct iovec) { .iov_base = &in_addr, .iov_len = sizeof(in_addr) };
+
+                        n = recvmsg(pair[0], &mh, 0);
+                        if (n < 0)
+                                return -errno;
+                        if ((size_t) n < sizeof(family))
+                                break;
+
+                        r = sd_bus_message_open_container(reply, 'r', "iay");
+                        if (r < 0)
+                                return r;
+
+                        r = sd_bus_message_append(reply, "i", family);
+                        if (r < 0)
+                                return r;
+
+                        switch (family) {
+
+                        case AF_INET:
+                                if (n != sizeof(struct in_addr) + sizeof(family))
+                                        return -EIO;
+
+                                r = sd_bus_message_append_array(reply, 'y', &in_addr.in, sizeof(in_addr.in));
+                                break;
+
+                        case AF_INET6:
+                                if (n != sizeof(struct in6_addr) + sizeof(family))
+                                        return -EIO;
+
+                                r = sd_bus_message_append_array(reply, 'y', &in_addr.in6, sizeof(in_addr.in6));
+                                break;
+                        }
+                        if (r < 0)
+                                return r;
+
+                        r = sd_bus_message_close_container(reply);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = wait_for_terminate_and_check("(sd-addr)", child, 0);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to wait for child: %m");
+                if (r != EXIT_SUCCESS)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
+                break;
+        }
+
+        default:
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Requesting IP address data is only supported on container machines.");
+        }
 
         r = sd_bus_message_close_container(reply);
         if (r < 0)
@@ -338,99 +355,98 @@ int bus_machine_method_get_addresses(sd_bus_message *message, void *userdata, sd
         return sd_bus_send(NULL, reply, NULL);
 }
 
+#define EXIT_NOT_FOUND 2
+
 int bus_machine_method_get_os_release(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_close_ int mntns_fd = -1, root_fd = -1;
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
         _cleanup_strv_free_ char **l = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         Machine *m = userdata;
-        char **k, **v;
-        siginfo_t si;
-        pid_t child;
         int r;
 
         assert(message);
         assert(m);
 
-        if (m->class != MACHINE_CONTAINER)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Requesting OS release data is only supported on container machines.");
+        switch (m->class) {
 
-        r = namespace_open(m->leader, NULL, &mntns_fd, NULL, &root_fd);
-        if (r < 0)
-                return r;
-
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
-                return -errno;
-
-        child = fork();
-        if (child < 0)
-                return sd_bus_error_set_errnof(error, errno, "Failed to fork(): %m");
-
-        if (child == 0) {
-                _cleanup_close_ int fd = -1;
-
-                pair[0] = safe_close(pair[0]);
-
-                r = namespace_enter(-1, mntns_fd, -1, root_fd);
-                if (r < 0)
-                        _exit(EXIT_FAILURE);
-
-                fd = open("/etc/os-release", O_RDONLY|O_CLOEXEC);
-                if (fd < 0) {
-                        fd = open("/usr/lib/os-release", O_RDONLY|O_CLOEXEC);
-                        if (fd < 0)
-                                _exit(EXIT_FAILURE);
-                }
-
-                r = copy_bytes(fd, pair[1], (off_t) -1, false);
-                if (r < 0)
-                        _exit(EXIT_FAILURE);
-
-                _exit(EXIT_SUCCESS);
-        }
-
-        pair[1] = safe_close(pair[1]);
-
-        f = fdopen(pair[0], "re");
-        if (!f)
-                return -errno;
-
-        pair[0] = -1;
-
-        r = load_env_file_pairs(f, "/etc/os-release", NULL, &l);
-        if (r < 0)
-                return r;
-
-        r = wait_for_terminate(child, &si);
-        if (r < 0)
-                return sd_bus_error_set_errnof(error, r, "Failed to wait for client: %m");
-        if (si.si_code != CLD_EXITED || si.si_status != EXIT_SUCCESS)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Client died abnormally.");
-
-        r = sd_bus_message_new_method_return(message, &reply);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_open_container(reply, 'a', "{ss}");
-        if (r < 0)
-                return r;
-
-        STRV_FOREACH_PAIR(k, v, l) {
-                r = sd_bus_message_append(reply, "{ss}", *k, *v);
+        case MACHINE_HOST:
+                r = load_env_file_pairs(NULL, "/etc/os-release", NULL, &l);
                 if (r < 0)
                         return r;
+
+                break;
+
+        case MACHINE_CONTAINER: {
+                _cleanup_close_ int mntns_fd = -1, root_fd = -1;
+                _cleanup_close_pair_ int pair[2] = { -1, -1 };
+                _cleanup_fclose_ FILE *f = NULL;
+                pid_t child;
+
+                r = namespace_open(m->leader, NULL, &mntns_fd, NULL, NULL, &root_fd);
+                if (r < 0)
+                        return r;
+
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
+                        return -errno;
+
+                r = safe_fork("(sd-osrel)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &child);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
+                if (r == 0) {
+                        int fd = -1;
+
+                        pair[0] = safe_close(pair[0]);
+
+                        r = namespace_enter(-1, mntns_fd, -1, -1, root_fd);
+                        if (r < 0)
+                                _exit(EXIT_FAILURE);
+
+                        fd = open("/etc/os-release", O_RDONLY|O_CLOEXEC|O_NOCTTY);
+                        if (fd < 0 && errno == ENOENT) {
+                                fd = open("/usr/lib/os-release", O_RDONLY|O_CLOEXEC|O_NOCTTY);
+                                if (fd < 0 && errno == ENOENT)
+                                        _exit(EXIT_NOT_FOUND);
+                        }
+                        if (fd < 0)
+                                _exit(EXIT_FAILURE);
+
+                        r = copy_bytes(fd, pair[1], (uint64_t) -1, 0);
+                        if (r < 0)
+                                _exit(EXIT_FAILURE);
+
+                        _exit(EXIT_SUCCESS);
+                }
+
+                pair[1] = safe_close(pair[1]);
+
+                f = fdopen(pair[0], "re");
+                if (!f)
+                        return -errno;
+
+                pair[0] = -1;
+
+                r = load_env_file_pairs(f, "/etc/os-release", NULL, &l);
+                if (r < 0)
+                        return r;
+
+                r = wait_for_terminate_and_check("(sd-osrel)", child, 0);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to wait for child: %m");
+                if (r == EXIT_NOT_FOUND)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Machine does not contain OS release information");
+                if (r != EXIT_SUCCESS)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
+
+                break;
         }
 
-        r = sd_bus_message_close_container(reply);
-        if (r < 0)
-                return r;
+        default:
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Requesting OS release data is only supported on container machines.");
+        }
 
-        return sd_bus_send(NULL, reply, NULL);
+        return bus_reply_pair_array(message, l);
 }
 
 int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_free_ char *pty_name = NULL;
         _cleanup_close_ int master = -1;
         Machine *m = userdata;
@@ -439,14 +455,25 @@ int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_
         assert(message);
         assert(m);
 
-        if (m->class != MACHINE_CONTAINER)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Opening pseudo TTYs is only supported on container machines.");
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_SYS_ADMIN,
+                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-open-pty" : "org.freedesktop.machine1.open-pty",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->manager->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
 
-        master = openpt_in_namespace(m->leader, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
         if (master < 0)
                 return master;
 
-        r = ptsname_malloc(master, &pty_name);
+        r = ptsname_namespace(master, &pty_name);
         if (r < 0)
                 return r;
 
@@ -461,26 +488,70 @@ int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_
         return sd_bus_send(NULL, reply, NULL);
 }
 
+static int container_bus_new(Machine *m, sd_bus_error *error, sd_bus **ret) {
+        int r;
+
+        assert(m);
+        assert(ret);
+
+        switch (m->class) {
+
+        case MACHINE_HOST:
+                *ret = NULL;
+                break;
+
+        case MACHINE_CONTAINER: {
+                _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+                char *address;
+
+                r = sd_bus_new(&bus);
+                if (r < 0)
+                        return r;
+
+                if (asprintf(&address, "x-machine-kernel:pid=%1$" PID_PRI ";x-machine-unix:pid=%1$" PID_PRI, m->leader) < 0)
+                        return -ENOMEM;
+
+                bus->address = address;
+                bus->bus_client = true;
+                bus->trusted = false;
+                bus->is_system = true;
+
+                r = sd_bus_start(bus);
+                if (r == -ENOENT)
+                        return sd_bus_error_set_errnof(error, r, "There is no system bus in container %s.", m->name);
+                if (r < 0)
+                        return r;
+
+                *ret = bus;
+                bus = NULL;
+                break;
+        }
+
+        default:
+                return -EOPNOTSUPP;
+        }
+
+        return 0;
+}
+
 int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_free_ char *pty_name = NULL, *getty = NULL;
-        _cleanup_bus_unref_ sd_bus *container_bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_free_ char *pty_name = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *allocated_bus = NULL;
         _cleanup_close_ int master = -1;
+        sd_bus *container_bus = NULL;
         Machine *m = userdata;
-        const char *p;
-        char *address;
+        const char *p, *getty;
         int r;
 
         assert(message);
         assert(m);
 
-        if (m->class != MACHINE_CONTAINER)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Opening logins is only supported on container machines.");
-
         r = bus_verify_polkit_async(
                         message,
                         CAP_SYS_ADMIN,
-                        "org.freedesktop.machine1.login",
+                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-login" : "org.freedesktop.machine1.login",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -490,11 +561,11 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* Will call us back */
 
-        master = openpt_in_namespace(m->leader, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
         if (master < 0)
                 return master;
 
-        r = ptsname_malloc(master, &pty_name);
+        r = ptsname_namespace(master, &pty_name);
         if (r < 0)
                 return r;
 
@@ -502,29 +573,13 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
         if (!p)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "PTS name %s is invalid", pty_name);
 
-        if (unlockpt(master) < 0)
-                return -errno;
-
-        r = sd_bus_new(&container_bus);
+        r = container_bus_new(m, error, &allocated_bus);
         if (r < 0)
                 return r;
 
-#  define ADDRESS_FMT "x-machine-kernel:pid=%1$" PID_PRI ";x-machine-unix:pid=%1$" PID_PRI
-        if (asprintf(&address, ADDRESS_FMT, m->leader) < 0)
-                return log_oom();
+        container_bus = allocated_bus ?: m->manager->bus;
 
-        container_bus->address = address;
-        container_bus->bus_client = true;
-        container_bus->trusted = false;
-        container_bus->is_system = true;
-
-        r = sd_bus_start(container_bus);
-        if (r < 0)
-                return r;
-
-        getty = strjoin("container-getty@", p, ".service", NULL);
-        if (!getty)
-                return log_oom();
+        getty = strjoina("container-getty@", p, ".service");
 
         r = sd_bus_call_method(
                         container_bus,
@@ -537,7 +592,248 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        container_bus = sd_bus_unref(container_bus);
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(reply, "hs", master, pty_name);
+        if (r < 0)
+                return r;
+
+        return sd_bus_send(NULL, reply, NULL);
+}
+
+int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL, *tm = NULL;
+        _cleanup_free_ char *pty_name = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *allocated_bus = NULL;
+        sd_bus *container_bus = NULL;
+        _cleanup_close_ int master = -1, slave = -1;
+        _cleanup_strv_free_ char **env = NULL, **args_wire = NULL, **args = NULL;
+        Machine *m = userdata;
+        const char *p, *unit, *user, *path, *description, *utmp_id;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = sd_bus_message_read(message, "ss", &user, &path);
+        if (r < 0)
+                return r;
+        user = empty_to_null(user);
+        r = sd_bus_message_read_strv(message, &args_wire);
+        if (r < 0)
+                return r;
+        if (isempty(path)) {
+                path = "/bin/sh";
+
+                args = new0(char*, 3 + 1);
+                if (!args)
+                        return -ENOMEM;
+                args[0] = strdup("sh");
+                if (!args[0])
+                        return -ENOMEM;
+                args[1] = strdup("-c");
+                if (!args[1])
+                        return -ENOMEM;
+                r = asprintf(&args[2],
+                             "shell=$(getent passwd %s 2>/dev/null | { IFS=: read _ _ _ _ _ _ x; echo \"$x\"; })\n"\
+                             "exec \"${shell:-/bin/sh}\" -l", /* -l is means --login */
+                             isempty(user) ? "root" : user);
+                if (r < 0) {
+                        args[2] = NULL;
+                        return -ENOMEM;
+                }
+        } else {
+                if (!path_is_absolute(path))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Specified path '%s' is not absolute", path);
+                args = args_wire;
+                args_wire = NULL;
+                if (strv_isempty(args)) {
+                        args = strv_free(args);
+
+                        args = strv_new(path, NULL);
+                        if (!args)
+                                return -ENOMEM;
+                }
+        }
+
+        r = sd_bus_message_read_strv(message, &env);
+        if (r < 0)
+                return r;
+        if (!strv_env_is_valid(env))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
+
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_SYS_ADMIN,
+                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-shell" : "org.freedesktop.machine1.shell",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->manager->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        if (master < 0)
+                return master;
+
+        r = ptsname_namespace(master, &pty_name);
+        if (r < 0)
+                return r;
+
+        p = path_startswith(pty_name, "/dev/pts/");
+        assert(p);
+
+        slave = machine_open_terminal(m, pty_name, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        if (slave < 0)
+                return slave;
+
+        utmp_id = path_startswith(pty_name, "/dev/");
+        assert(utmp_id);
+
+        r = container_bus_new(m, error, &allocated_bus);
+        if (r < 0)
+                return r;
+
+        container_bus = allocated_bus ?: m->manager->bus;
+
+        r = sd_bus_message_new_method_call(
+                        container_bus,
+                        &tm,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "StartTransientUnit");
+        if (r < 0)
+                return r;
+
+        /* Name and mode */
+        unit = strjoina("container-shell@", p, ".service");
+        r = sd_bus_message_append(tm, "ss", unit, "fail");
+        if (r < 0)
+                return r;
+
+        /* Properties */
+        r = sd_bus_message_open_container(tm, 'a', "(sv)");
+        if (r < 0)
+                return r;
+
+        description = strjoina("Shell for User ", isempty(user) ? "root" : user);
+        r = sd_bus_message_append(tm,
+                                  "(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)",
+                                  "Description", "s", description,
+                                  "StandardInputFileDescriptor", "h", slave,
+                                  "StandardOutputFileDescriptor", "h", slave,
+                                  "StandardErrorFileDescriptor", "h", slave,
+                                  "SendSIGHUP", "b", true,
+                                  "IgnoreSIGPIPE", "b", false,
+                                  "KillMode", "s", "mixed",
+                                  "TTYReset", "b", true,
+                                  "UtmpIdentifier", "s", utmp_id,
+                                  "UtmpMode", "s", "user",
+                                  "PAMName", "s", "login",
+                                  "WorkingDirectory", "s", "-~");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(tm, "(sv)", "User", "s", isempty(user) ? "root" : user);
+        if (r < 0)
+                return r;
+
+        if (!strv_isempty(env)) {
+                r = sd_bus_message_open_container(tm, 'r', "sv");
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_append(tm, "s", "Environment");
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_open_container(tm, 'v', "as");
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_append_strv(tm, env);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_close_container(tm);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_close_container(tm);
+                if (r < 0)
+                        return r;
+        }
+
+        /* Exec container */
+        r = sd_bus_message_open_container(tm, 'r', "sv");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(tm, "s", "ExecStart");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(tm, 'v', "a(sasb)");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(tm, 'a', "(sasb)");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(tm, 'r', "sasb");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(tm, "s", path);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append_strv(tm, args);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(tm, "b", true);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(tm);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(tm);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(tm);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(tm);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(tm);
+        if (r < 0)
+                return r;
+
+        /* Auxiliary units */
+        r = sd_bus_message_append(tm, "a(sa(sv))", 0);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_call(container_bus, tm, 0, error, NULL);
+        if (r < 0)
+                return r;
+
+        slave = safe_close(slave);
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -556,11 +852,13 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         bool mount_slave_created = false, mount_slave_mounted = false,
                 mount_tmp_created = false, mount_tmp_mounted = false,
                 mount_outside_created = false, mount_outside_mounted = false;
+        _cleanup_free_ char *chased_src = NULL;
+        int read_only, make_file_or_directory;
         const char *dest, *src;
         Machine *m = userdata;
-        int read_only, make_directory;
+        struct stat st;
         pid_t child;
-        siginfo_t si;
+        uid_t uid;
         int r;
 
         assert(message);
@@ -569,22 +867,23 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         if (m->class != MACHINE_CONTAINER)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Bind mounting is only supported on container machines.");
 
-        r = sd_bus_message_read(message, "ssbb", &src, &dest, &read_only, &make_directory);
+        r = sd_bus_message_read(message, "ssbb", &src, &dest, &read_only, &make_file_or_directory);
         if (r < 0)
                 return r;
 
-        if (!path_is_absolute(src) || !path_is_safe(src))
+        if (!path_is_absolute(src) || !path_is_normalized(src))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute and not contain ../.");
 
         if (isempty(dest))
                 dest = src;
-        else if (!path_is_absolute(dest) || !path_is_safe(dest))
+        else if (!path_is_absolute(dest) || !path_is_normalized(dest))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and not contain ../.");
 
         r = bus_verify_polkit_async(
                         message,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -594,6 +893,12 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* Will call us back */
 
+        r = machine_get_uid_shift(m, &uid);
+        if (r < 0)
+                return r;
+        if (uid != 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Can't bind mount on container with user namespacing applied.");
+
         /* One day, when bind mounting /proc/self/fd/n works across
          * namespace boundaries we should rework this logic to make
          * use of it... */
@@ -602,13 +907,22 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         if (laccess(p, F_OK) < 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Container does not allow propagation of mount points.");
 
+        r = chase_symlinks(src, NULL, 0, &chased_src);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to resolve source path: %m");
+
+        if (lstat(chased_src, &st) < 0)
+                return sd_bus_error_set_errnof(error, errno, "Failed to stat() source path: %m");
+        if (S_ISLNK(st.st_mode)) /* This shouldn't really happen, given that we just chased the symlinks above, but let's better be safe… */
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Source directory can't be a symbolic link");
+
         /* Our goal is to install a new bind mount into the container,
            possibly read-only. This is irritatingly complex
            unfortunately, currently.
 
            First, we start by creating a private playground in /tmp,
            that we can mount MS_SLAVE. (Which is necessary, since
-           MS_MOUNT cannot be applied to mounts with MS_SHARED parent
+           MS_MOVE cannot be applied to mounts with MS_SHARED parent
            mounts.) */
 
         if (!mkdtemp(mount_slave))
@@ -628,18 +942,21 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                 goto finish;
         }
 
-        /* Second, we mount the source directory to a directory inside
-           of our MS_SLAVE playground. */
+        /* Second, we mount the source file or directory to a directory inside of our MS_SLAVE playground. */
         mount_tmp = strjoina(mount_slave, "/mount");
-        if (mkdir(mount_tmp, 0700) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to create temporary mount point %s: %m", mount_tmp);
+        if (S_ISDIR(st.st_mode))
+                r = mkdir_errno_wrapper(mount_tmp, 0700);
+        else
+                r = touch(mount_tmp);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, errno, "Failed to create temporary mount point %s: %m", mount_tmp);
                 goto finish;
         }
 
         mount_tmp_created = true;
 
-        if (mount(src, mount_tmp, NULL, MS_BIND, NULL) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to overmount %s: %m", mount_tmp);
+        if (mount(chased_src, mount_tmp, NULL, MS_BIND, NULL) < 0) {
+                r = sd_bus_error_set_errnof(error, errno, "Failed to mount %s: %m", chased_src);
                 goto finish;
         }
 
@@ -652,13 +969,18 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                         goto finish;
                 }
 
-        /* Fourth, we move the new bind mount into the propagation
-         * directory. This way it will appear there read-only
+        /* Fourth, we move the new bind mount into the propagation directory. This way it will appear there read-only
          * right-away. */
 
         mount_outside = strjoina("/run/systemd/nspawn/propagate/", m->name, "/XXXXXX");
-        if (!mkdtemp(mount_outside)) {
-                r = sd_bus_error_set_errnof(error, errno, "Cannot create propagation directory %s: %m", mount_outside);
+        if (S_ISDIR(st.st_mode))
+                r = mkdtemp(mount_outside) ? 0 : -errno;
+        else {
+                r = mkostemp_safe(mount_outside);
+                safe_close(r);
+        }
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, errno, "Cannot create propagation file or directory %s: %m", mount_outside);
                 goto finish;
         }
 
@@ -672,7 +994,10 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         mount_outside_mounted = true;
         mount_tmp_mounted = false;
 
-        (void) rmdir(mount_tmp);
+        if (S_ISDIR(st.st_mode))
+                (void) rmdir(mount_tmp);
+        else
+                (void) unlink(mount_tmp);
         mount_tmp_created = false;
 
         (void) umount(mount_slave);
@@ -686,13 +1011,12 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                 goto finish;
         }
 
-        child = fork();
-        if (child < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to fork(): %m");
+        r = safe_fork("(sd-bindmnt)", FORK_RESET_SIGNALS, &child);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
                 goto finish;
         }
-
-        if (child == 0) {
+        if (r == 0) {
                 const char *mount_inside;
                 int mntfd;
                 const char *q;
@@ -711,8 +1035,14 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                         goto child_fail;
                 }
 
-                if (make_directory)
-                        (void) mkdir_p(dest, 0755);
+                if (make_file_or_directory) {
+                        if (S_ISDIR(st.st_mode))
+                                (void) mkdir_p(dest, 0755);
+                        else {
+                                (void) mkdir_parents(dest, 0755);
+                                safe_close(open(dest, O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC|O_NOCTTY, 0600));
+                        }
+                }
 
                 /* Fifth, move the mount to the right place inside */
                 mount_inside = strjoina("/run/systemd/nspawn/incoming/", basename(mount_outside));
@@ -732,21 +1062,16 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = wait_for_terminate(child, &si);
+        r = wait_for_terminate_and_check("(sd-bindmnt)", child, 0);
         if (r < 0) {
-                r = sd_bus_error_set_errnof(error, r, "Failed to wait for client: %m");
+                r = sd_bus_error_set_errnof(error, r, "Failed to wait for child: %m");
                 goto finish;
         }
-        if (si.si_code != CLD_EXITED) {
-                r = sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Client died abnormally.");
-                goto finish;
-        }
-        if (si.si_status != EXIT_SUCCESS) {
-
+        if (r != EXIT_SUCCESS) {
                 if (read(errno_pipe_fd[0], &r, sizeof(r)) == sizeof(r))
                         r = sd_bus_error_set_errnof(error, r, "Failed to mount: %m");
                 else
-                        r = sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Client failed.");
+                        r = sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Child failed.");
                 goto finish;
         }
 
@@ -754,78 +1079,47 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
 finish:
         if (mount_outside_mounted)
-                umount(mount_outside);
-        if (mount_outside_created)
-                rmdir(mount_outside);
+                (void) umount(mount_outside);
+        if (mount_outside_created) {
+                if (S_ISDIR(st.st_mode))
+                        (void) rmdir(mount_outside);
+                else
+                        (void) unlink(mount_outside);
+        }
 
         if (mount_tmp_mounted)
-                umount(mount_tmp);
-        if (mount_tmp_created)
-                rmdir(mount_tmp);
+                (void) umount(mount_tmp);
+        if (mount_tmp_created) {
+                if (S_ISDIR(st.st_mode))
+                        (void) rmdir(mount_tmp);
+                else
+                        (void) unlink(mount_tmp);
+        }
 
         if (mount_slave_mounted)
-                umount(mount_slave);
+                (void) umount(mount_slave);
         if (mount_slave_created)
-                rmdir(mount_slave);
+                (void) rmdir(mount_slave);
 
         return r;
-}
-
-static int machine_operation_done(sd_event_source *s, const siginfo_t *si, void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        MachineOperation *o = userdata;
-        int r;
-
-        assert(o);
-        assert(si);
-
-        o->pid = 0;
-
-        if (si->si_code != CLD_EXITED) {
-                r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Client died abnormally.");
-                goto fail;
-        }
-
-        if (si->si_status != EXIT_SUCCESS) {
-                if (read(o->errno_fd, &r, sizeof(r)) == sizeof(r))
-                        r = sd_bus_error_set_errnof(&error, r, "%m");
-                else
-                        r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Client failed.");
-
-                goto fail;
-        }
-
-        r = sd_bus_reply_method_return(o->message, NULL);
-        if (r < 0)
-                log_error_errno(r, "Failed to reply to message: %m");
-
-        machine_operation_unref(o);
-        return 0;
-
-fail:
-        r = sd_bus_reply_method_error(o->message, &error);
-        if (r < 0)
-                log_error_errno(r, "Failed to reply to message: %m");
-
-        machine_operation_unref(o);
-        return 0;
 }
 
 int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         const char *src, *dest, *host_path, *container_path, *host_basename, *host_dirname, *container_basename, *container_dirname;
         _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
+        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE;
         _cleanup_close_ int hostfd = -1;
         Machine *m = userdata;
-        MachineOperation *o;
         bool copy_from;
         pid_t child;
+        uid_t uid_shift;
         char *t;
         int r;
 
         assert(message);
         assert(m);
 
-        if (m->n_operations >= MACHINE_OPERATIONS_MAX)
+        if (m->manager->n_operations >= OPERATIONS_MAX)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many ongoing copies.");
 
         if (m->class != MACHINE_CONTAINER)
@@ -835,18 +1129,19 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        if (!path_is_absolute(src) || !path_is_safe(src))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute and not contain ../.");
+        if (!path_is_absolute(src))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute.");
 
         if (isempty(dest))
                 dest = src;
-        else if (!path_is_absolute(dest) || !path_is_safe(dest))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and not contain ../.");
+        else if (!path_is_absolute(dest))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute.");
 
         r = bus_verify_polkit_async(
                         message,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -855,6 +1150,10 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
                 return r;
         if (r == 0)
                 return 1; /* Will call us back */
+
+        r = machine_get_uid_shift(m, &uid_shift);
+        if (r < 0)
+                return r;
 
         copy_from = strstr(sd_bus_message_get_member(message), "CopyFrom");
 
@@ -881,11 +1180,10 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
         if (pipe2(errno_pipe_fd, O_CLOEXEC|O_NONBLOCK) < 0)
                 return sd_bus_error_set_errnof(error, errno, "Failed to create pipe: %m");
 
-        child = fork();
-        if (child < 0)
-                return sd_bus_error_set_errnof(error, errno, "Failed to fork(): %m");
-
-        if (child == 0) {
+        r = safe_fork("(sd-copy)", FORK_RESET_SIGNALS, &child);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
+        if (r == 0) {
                 int containerfd;
                 const char *q;
                 int mntfd;
@@ -910,10 +1208,13 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
                         goto child_fail;
                 }
 
+                /* Run the actual copy operation. Note that when an UID shift is set we'll either clamp the UID/GID to
+                 * 0 or to the actual UID shift depending on the direction we copy. If no UID shift is set we'll copy
+                 * the UID/GIDs as they are. */
                 if (copy_from)
-                        r = copy_tree_at(containerfd, container_basename, hostfd, host_basename, true);
+                        r = copy_tree_at(containerfd, container_basename, hostfd, host_basename, uid_shift == 0 ? UID_INVALID : 0, uid_shift == 0 ? GID_INVALID : 0, copy_flags);
                 else
-                        r = copy_tree_at(hostfd, host_basename, containerfd, container_basename, true);
+                        r = copy_tree_at(hostfd, host_basename, containerfd, container_basename, uid_shift == 0 ? UID_INVALID : uid_shift, uid_shift == 0 ? GID_INVALID : uid_shift, copy_flags);
 
                 hostfd = safe_close(hostfd);
                 containerfd = safe_close(containerfd);
@@ -927,42 +1228,142 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
 
         child_fail:
                 (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
-
                 _exit(EXIT_FAILURE);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        /* Copying might take a while, hence install a watch the
-         * child, and return */
+        /* Copying might take a while, hence install a watch on the child, and return */
 
-        o = new0(MachineOperation, 1);
-        if (!o)
-                return log_oom();
-
-        o->pid = child;
-        o->message = sd_bus_message_ref(message);
-        o->errno_fd = errno_pipe_fd[0];
+        r = operation_new(m->manager, m, child, message, errno_pipe_fd[0], NULL);
+        if (r < 0) {
+                (void) sigkill_wait(child);
+                return r;
+        }
         errno_pipe_fd[0] = -1;
 
-        r = sd_event_add_child(m->manager->event, &o->event_source, child, WEXITED, machine_operation_done, o);
-        if (r < 0) {
-                machine_operation_unref(o);
-                return log_oom();
+        return 1;
+}
+
+int bus_machine_method_open_root_directory(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_close_ int fd = -1;
+        Machine *m = userdata;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.machine1.manage-machines",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->manager->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        switch (m->class) {
+
+        case MACHINE_HOST:
+                fd = open("/", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                if (fd < 0)
+                        return -errno;
+
+                break;
+
+        case MACHINE_CONTAINER: {
+                _cleanup_close_ int mntns_fd = -1, root_fd = -1;
+                _cleanup_close_pair_ int pair[2] = { -1, -1 };
+                pid_t child;
+
+                r = namespace_open(m->leader, NULL, &mntns_fd, NULL, NULL, &root_fd);
+                if (r < 0)
+                        return r;
+
+                if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+                        return -errno;
+
+                r = safe_fork("(sd-openroot)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &child);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
+                if (r == 0) {
+                        _cleanup_close_ int dfd = -1;
+
+                        pair[0] = safe_close(pair[0]);
+
+                        r = namespace_enter(-1, mntns_fd, -1, -1, root_fd);
+                        if (r < 0)
+                                _exit(EXIT_FAILURE);
+
+                        dfd = open("/", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                        if (dfd < 0)
+                                _exit(EXIT_FAILURE);
+
+                        r = send_one_fd(pair[1], dfd, 0);
+                        dfd = safe_close(dfd);
+                        if (r < 0)
+                                _exit(EXIT_FAILURE);
+
+                        _exit(EXIT_SUCCESS);
+                }
+
+                pair[1] = safe_close(pair[1]);
+
+                r = wait_for_terminate_and_check("(sd-openroot)", child, 0);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to wait for child: %m");
+                if (r != EXIT_SUCCESS)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
+
+                fd = receive_one_fd(pair[0], MSG_DONTWAIT);
+                if (fd < 0)
+                        return fd;
+
+                break;
         }
 
-        LIST_PREPEND(operations, m->operations, o);
-        m->n_operations++;
-        o->machine = m;
+        default:
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Opening the root directory is only supported on container machines.");
+        }
 
-        return 1;
+        return sd_bus_reply_method_return(message, "h", fd);
+}
+
+int bus_machine_method_get_uid_shift(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Machine *m = userdata;
+        uid_t shift = 0;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        /* You wonder why this is a method and not a property? Well, properties are not supposed to return errors, but
+         * we kinda have to for this. */
+
+        if (m->class == MACHINE_HOST)
+                return sd_bus_reply_method_return(message, "u", UINT32_C(0));
+
+        if (m->class != MACHINE_CONTAINER)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "UID/GID shift may only be determined for container machines.");
+
+        r = machine_get_uid_shift(m, &shift);
+        if (r == -ENXIO)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Machine %s uses a complex UID/GID mapping, cannot determine shift", m->name);
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(message, "u", (uint32_t) shift);
 }
 
 const sd_bus_vtable machine_vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_PROPERTY("Name", "s", NULL, offsetof(Machine, name), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Id", "ay", property_get_id, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Id", "ay", bus_property_get_id128, offsetof(Machine, id), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(Machine, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Machine, service), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Unit", "s", NULL, offsetof(Machine, unit), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -976,11 +1377,14 @@ const sd_bus_vtable machine_vtable[] = {
         SD_BUS_METHOD("Kill", "si", NULL, bus_machine_method_kill, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetAddresses", NULL, "a(iay)", bus_machine_method_get_addresses, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetOSRelease", NULL, "a{ss}", bus_machine_method_get_os_release, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("OpenPTY", NULL, "hs", bus_machine_method_open_pty, 0),
+        SD_BUS_METHOD("GetUIDShift", NULL, "u", bus_machine_method_get_uid_shift, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("OpenPTY", NULL, "hs", bus_machine_method_open_pty, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("OpenLogin", NULL, "hs", bus_machine_method_open_login, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("OpenShell", "ssasas", "hs", bus_machine_method_open_shell, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("BindMount", "ssbb", NULL, bus_machine_method_bind_mount, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CopyFrom", "ss", NULL, bus_machine_method_copy, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CopyTo", "ss", NULL, bus_machine_method_copy, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("OpenRootDirectory", NULL, "h", bus_machine_method_open_root_directory, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_VTABLE_END
 };
 
@@ -996,7 +1400,7 @@ int machine_object_find(sd_bus *bus, const char *path, const char *interface, vo
         assert(m);
 
         if (streq(path, "/org/freedesktop/machine1/machine/self")) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
                 sd_bus_message *message;
                 pid_t pid;
 
@@ -1095,7 +1499,7 @@ int machine_send_signal(Machine *m, bool new_machine) {
 }
 
 int machine_send_create_reply(Machine *m, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *c = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *c = NULL;
         _cleanup_free_ char *p = NULL;
 
         assert(m);

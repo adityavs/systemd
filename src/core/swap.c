@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,22 +19,30 @@
 ***/
 
 #include <errno.h>
-#include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
-#include <libudev.h>
+#include <unistd.h>
 
-#include "unit.h"
-#include "swap.h"
-#include "unit-name.h"
+#include "libudev.h"
+
+#include "alloc-util.h"
 #include "dbus-swap.h"
-#include "special.h"
+#include "escape.h"
 #include "exit-status.h"
-#include "path-util.h"
-#include "virt.h"
-#include "udev-util.h"
+#include "fd-util.h"
+#include "format-util.h"
 #include "fstab-util.h"
-#include "formats-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "process-util.h"
+#include "special.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "swap.h"
+#include "udev-util.h"
+#include "unit-name.h"
+#include "unit.h"
+#include "virt.h"
 
 static const UnitActiveState state_translation_table[_SWAP_STATE_MAX] = {
         [SWAP_DEAD] = UNIT_INACTIVE,
@@ -43,8 +50,6 @@ static const UnitActiveState state_translation_table[_SWAP_STATE_MAX] = {
         [SWAP_ACTIVATING_DONE] = UNIT_ACTIVE,
         [SWAP_ACTIVE] = UNIT_ACTIVE,
         [SWAP_DEACTIVATING] = UNIT_DEACTIVATING,
-        [SWAP_ACTIVATING_SIGTERM] = UNIT_DEACTIVATING,
-        [SWAP_ACTIVATING_SIGKILL] = UNIT_DEACTIVATING,
         [SWAP_DEACTIVATING_SIGTERM] = UNIT_DEACTIVATING,
         [SWAP_DEACTIVATING_SIGKILL] = UNIT_DEACTIVATING,
         [SWAP_FAILED] = UNIT_FAILED
@@ -53,14 +58,22 @@ static const UnitActiveState state_translation_table[_SWAP_STATE_MAX] = {
 static int swap_dispatch_timer(sd_event_source *source, usec_t usec, void *userdata);
 static int swap_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata);
 
+static bool SWAP_STATE_WITH_PROCESS(SwapState state) {
+        return IN_SET(state,
+                      SWAP_ACTIVATING,
+                      SWAP_ACTIVATING_DONE,
+                      SWAP_DEACTIVATING,
+                      SWAP_DEACTIVATING_SIGTERM,
+                      SWAP_DEACTIVATING_SIGKILL);
+}
+
 static void swap_unset_proc_swaps(Swap *s) {
         assert(s);
 
         if (!s->from_proc_swaps)
                 return;
 
-        free(s->parameters_proc_swaps.what);
-        s->parameters_proc_swaps.what = NULL;
+        s->parameters_proc_swaps.what = mfree(s->parameters_proc_swaps.what);
 
         s->from_proc_swaps = false;
 }
@@ -87,8 +100,7 @@ static int swap_set_devnode(Swap *s, const char *devnode) {
                 else
                         hashmap_remove(swaps, s->devnode);
 
-                free(s->devnode);
-                s->devnode = NULL;
+                s->devnode = mfree(s->devnode);
         }
 
         if (devnode) {
@@ -141,47 +153,42 @@ static void swap_done(Unit *u) {
         swap_unset_proc_swaps(s);
         swap_set_devnode(s, NULL);
 
-        free(s->what);
-        s->what = NULL;
-
-        free(s->parameters_fragment.what);
-        s->parameters_fragment.what = NULL;
-
-        free(s->parameters_fragment.options);
-        s->parameters_fragment.options = NULL;
+        s->what = mfree(s->what);
+        s->parameters_fragment.what = mfree(s->parameters_fragment.what);
+        s->parameters_fragment.options = mfree(s->parameters_fragment.options);
 
         s->exec_runtime = exec_runtime_unref(s->exec_runtime);
         exec_command_done_array(s->exec_command, _SWAP_EXEC_COMMAND_MAX);
         s->control_command = NULL;
+
+        dynamic_creds_unref(&s->dynamic_creds);
 
         swap_unwatch_control_pid(s);
 
         s->timer_event_source = sd_event_source_unref(s->timer_event_source);
 }
 
-static int swap_arm_timer(Swap *s) {
+static int swap_arm_timer(Swap *s, usec_t usec) {
         int r;
 
         assert(s);
 
-        if (s->timeout_usec <= 0) {
-                s->timer_event_source = sd_event_source_unref(s->timer_event_source);
-                return 0;
-        }
-
         if (s->timer_event_source) {
-                r = sd_event_source_set_time(s->timer_event_source, now(CLOCK_MONOTONIC) + s->timeout_usec);
+                r = sd_event_source_set_time(s->timer_event_source, usec);
                 if (r < 0)
                         return r;
 
                 return sd_event_source_set_enabled(s->timer_event_source, SD_EVENT_ONESHOT);
         }
 
+        if (usec == USEC_INFINITY)
+                return 0;
+
         r = sd_event_add_time(
                         UNIT(s)->manager->event,
                         &s->timer_event_source,
                         CLOCK_MONOTONIC,
-                        now(CLOCK_MONOTONIC) + s->timeout_usec, 0,
+                        usec, 0,
                         swap_dispatch_timer, s);
         if (r < 0)
                 return r;
@@ -191,7 +198,7 @@ static int swap_arm_timer(Swap *s) {
         return 0;
 }
 
-static int swap_add_device_links(Swap *s) {
+static int swap_add_device_dependencies(Swap *s) {
         assert(s);
 
         if (!s->what)
@@ -201,24 +208,35 @@ static int swap_add_device_links(Swap *s) {
                 return 0;
 
         if (is_device_path(s->what))
-                return unit_add_node_link(UNIT(s), s->what, UNIT(s)->manager->running_as == MANAGER_SYSTEM);
+                return unit_add_node_dependency(UNIT(s), s->what, MANAGER_IS_SYSTEM(UNIT(s)->manager), UNIT_BINDS_TO, UNIT_DEPENDENCY_FILE);
         else
                 /* File based swap devices need to be ordered after
                  * systemd-remount-fs.service, since they might need a
                  * writable file system. */
-                return unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, NULL, true);
+                return unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, NULL, true, UNIT_DEPENDENCY_FILE);
 }
 
 static int swap_add_default_dependencies(Swap *s) {
+        int r;
+
         assert(s);
 
-        if (UNIT(s)->manager->running_as != MANAGER_SYSTEM)
+        if (!UNIT(s)->default_dependencies)
                 return 0;
 
-        if (detect_container(NULL) > 0)
+        if (!MANAGER_IS_SYSTEM(UNIT(s)->manager))
                 return 0;
 
-        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true);
+        if (detect_container() > 0)
+                return 0;
+
+        /* swap units generated for the swap dev links are missing the
+         * ordering dep against the swap target. */
+        r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_SWAP_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
+        if (r < 0)
+                return r;
+
+        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int swap_verify(Swap *s) {
@@ -274,7 +292,10 @@ static int swap_load(Unit *u) {
         assert(u->load_state == UNIT_STUB);
 
         /* Load a .swap file */
-        r = unit_load_fragment_and_dropin_optional(u);
+        if (SWAP(u)->from_proc_swaps)
+                r = unit_load_fragment_and_dropin_optional(u);
+        else
+                r = unit_load_fragment_and_dropin(u);
         if (r < 0)
                 return r;
 
@@ -306,11 +327,11 @@ static int swap_load(Unit *u) {
                                 return r;
                 }
 
-                r = unit_require_mounts_for(UNIT(s), s->what);
+                r = unit_require_mounts_for(UNIT(s), s->what, UNIT_DEPENDENCY_IMPLICIT);
                 if (r < 0)
                         return r;
 
-                r = swap_add_device_links(s);
+                r = swap_add_device_dependencies(s);
                 if (r < 0)
                         return r;
 
@@ -326,15 +347,13 @@ static int swap_load(Unit *u) {
                 if (r < 0)
                         return r;
 
-                r = unit_add_default_slice(u, &s->cgroup_context);
+                r = unit_set_default_slice(u);
                 if (r < 0)
                         return r;
 
-                if (UNIT(s)->default_dependencies) {
-                        r = swap_add_default_dependencies(s);
-                        if (r < 0)
-                                return r;
-                }
+                r = swap_add_default_dependencies(s);
+                if (r < 0)
+                        return r;
         }
 
         return swap_verify(s);
@@ -373,11 +392,7 @@ static int swap_setup_unit(
         if (!u) {
                 delete = true;
 
-                u = unit_new(m, sizeof(Swap));
-                if (!u)
-                        return log_oom();
-
-                r = unit_add_name(u, e);
+                r = unit_new_for_name(m, sizeof(Swap), e, &u);
                 if (r < 0)
                         goto fail;
 
@@ -416,7 +431,7 @@ static int swap_setup_unit(
 fail:
         log_unit_warning_errno(u, r, "Failed to load swap unit: %m");
 
-        if (delete && u)
+        if (delete)
                 unit_free(u);
 
         return r;
@@ -483,13 +498,7 @@ static void swap_set_state(Swap *s, SwapState state) {
         old_state = s->state;
         s->state = state;
 
-        if (state != SWAP_ACTIVATING &&
-            state != SWAP_ACTIVATING_SIGTERM &&
-            state != SWAP_ACTIVATING_SIGKILL &&
-            state != SWAP_ACTIVATING_DONE &&
-            state != SWAP_DEACTIVATING &&
-            state != SWAP_DEACTIVATING_SIGTERM &&
-            state != SWAP_DEACTIVATING_SIGKILL) {
+        if (!SWAP_STATE_WITH_PROCESS(state)) {
                 s->timer_event_source = sd_event_source_unref(s->timer_event_source);
                 swap_unwatch_control_pid(s);
                 s->control_command = NULL;
@@ -527,25 +536,21 @@ static int swap_coldplug(Unit *u) {
         if (new_state == s->state)
                 return 0;
 
-        if (new_state == SWAP_ACTIVATING ||
-            new_state == SWAP_ACTIVATING_SIGTERM ||
-            new_state == SWAP_ACTIVATING_SIGKILL ||
-            new_state == SWAP_ACTIVATING_DONE ||
-            new_state == SWAP_DEACTIVATING ||
-            new_state == SWAP_DEACTIVATING_SIGTERM ||
-            new_state == SWAP_DEACTIVATING_SIGKILL) {
-
-                if (s->control_pid <= 0)
-                        return -EBADMSG;
+        if (s->control_pid > 0 &&
+            pid_is_unwaited(s->control_pid) &&
+            SWAP_STATE_WITH_PROCESS(new_state)) {
 
                 r = unit_watch_pid(UNIT(s), s->control_pid);
                 if (r < 0)
                         return r;
 
-                r = swap_arm_timer(s);
+                r = swap_arm_timer(s, usec_add(u->state_change_timestamp.monotonic, s->timeout_usec));
                 if (r < 0)
                         return r;
         }
+
+        if (!IN_SET(new_state, SWAP_DEAD, SWAP_FAILED))
+                (void) unit_setup_dynamic_creds(u);
 
         swap_set_state(s, new_state);
         return 0;
@@ -594,48 +599,41 @@ static void swap_dump(Unit *u, FILE *f, const char *prefix) {
 
         exec_context_dump(&s->exec_context, f, prefix);
         kill_context_dump(&s->kill_context, f, prefix);
+        cgroup_context_dump(&s->cgroup_context, f, prefix);
 }
 
 static int swap_spawn(Swap *s, ExecCommand *c, pid_t *_pid) {
+
+        ExecParameters exec_params = {
+                .flags     = EXEC_APPLY_SANDBOXING|EXEC_APPLY_CHROOT|EXEC_APPLY_TTY_STDIN,
+                .stdin_fd  = -1,
+                .stdout_fd = -1,
+                .stderr_fd = -1,
+        };
         pid_t pid;
         int r;
-        ExecParameters exec_params = {
-                .apply_permissions = true,
-                .apply_chroot      = true,
-                .apply_tty_stdin   = true,
-                .bus_endpoint_fd   = -1,
-        };
 
         assert(s);
         assert(c);
         assert(_pid);
 
-        (void) unit_realize_cgroup(UNIT(s));
-        if (s->reset_cpu_usage) {
-                (void) unit_reset_cpu_usage(UNIT(s));
-                s->reset_cpu_usage = false;
-        }
+        r = unit_prepare_exec(UNIT(s));
+        if (r < 0)
+                return r;
 
-        r = unit_setup_exec_runtime(UNIT(s));
+        r = swap_arm_timer(s, usec_add(now(CLOCK_MONOTONIC), s->timeout_usec));
         if (r < 0)
                 goto fail;
 
-        r = swap_arm_timer(s);
-        if (r < 0)
-                goto fail;
-
-        exec_params.environment = UNIT(s)->manager->environment;
-        exec_params.confirm_spawn = UNIT(s)->manager->confirm_spawn;
-        exec_params.cgroup_supported = UNIT(s)->manager->cgroup_supported;
-        exec_params.cgroup_path = UNIT(s)->cgroup_path;
-        exec_params.cgroup_delegate = s->cgroup_context.delegate;
-        exec_params.runtime_prefix = manager_get_runtime_prefix(UNIT(s)->manager);
+        manager_set_exec_params(UNIT(s)->manager, &exec_params);
+        unit_set_exec_params(UNIT(s), &exec_params);
 
         r = exec_spawn(UNIT(s),
                        c,
                        &s->exec_context,
                        &exec_params,
                        s->exec_runtime,
+                       &s->dynamic_creds,
                        &pid);
         if (r < 0)
                 goto fail;
@@ -651,69 +649,83 @@ static int swap_spawn(Swap *s, ExecCommand *c, pid_t *_pid) {
 
 fail:
         s->timer_event_source = sd_event_source_unref(s->timer_event_source);
+
         return r;
 }
 
 static void swap_enter_dead(Swap *s, SwapResult f) {
         assert(s);
 
-        if (f != SWAP_SUCCESS)
+        if (s->result == SWAP_SUCCESS)
                 s->result = f;
+
+        if (s->result != SWAP_SUCCESS)
+                log_unit_warning(UNIT(s), "Failed with result '%s'.", swap_result_to_string(s->result));
+
+        swap_set_state(s, s->result != SWAP_SUCCESS ? SWAP_FAILED : SWAP_DEAD);
 
         exec_runtime_destroy(s->exec_runtime);
         s->exec_runtime = exec_runtime_unref(s->exec_runtime);
 
-        exec_context_destroy_runtime_directory(&s->exec_context, manager_get_runtime_prefix(UNIT(s)->manager));
+        exec_context_destroy_runtime_directory(&s->exec_context, UNIT(s)->manager->prefix[EXEC_DIRECTORY_RUNTIME]);
 
-        swap_set_state(s, s->result != SWAP_SUCCESS ? SWAP_FAILED : SWAP_DEAD);
+        unit_unref_uid_gid(UNIT(s), true);
+
+        dynamic_creds_destroy(&s->dynamic_creds);
 }
 
 static void swap_enter_active(Swap *s, SwapResult f) {
         assert(s);
 
-        if (f != SWAP_SUCCESS)
+        if (s->result == SWAP_SUCCESS)
                 s->result = f;
 
         swap_set_state(s, SWAP_ACTIVE);
 }
 
+static void swap_enter_dead_or_active(Swap *s, SwapResult f) {
+        assert(s);
+
+        if (s->from_proc_swaps)
+                swap_enter_active(s, f);
+        else
+                swap_enter_dead(s, f);
+}
+
 static void swap_enter_signal(Swap *s, SwapState state, SwapResult f) {
         int r;
+        KillOperation kop;
 
         assert(s);
 
-        if (f != SWAP_SUCCESS)
+        if (s->result == SWAP_SUCCESS)
                 s->result = f;
 
-        r = unit_kill_context(
-                        UNIT(s),
-                        &s->kill_context,
-                        (state != SWAP_ACTIVATING_SIGTERM && state != SWAP_DEACTIVATING_SIGTERM) ?
-                        KILL_KILL : KILL_TERMINATE,
-                        -1,
-                        s->control_pid,
-                        false);
+        if (state == SWAP_DEACTIVATING_SIGTERM)
+                kop = KILL_TERMINATE;
+        else
+                kop = KILL_KILL;
+
+        r = unit_kill_context(UNIT(s), &s->kill_context, kop, -1, s->control_pid, false);
         if (r < 0)
                 goto fail;
 
         if (r > 0) {
-                r = swap_arm_timer(s);
+                r = swap_arm_timer(s, usec_add(now(CLOCK_MONOTONIC), s->timeout_usec));
                 if (r < 0)
                         goto fail;
 
                 swap_set_state(s, state);
-        } else if (state == SWAP_ACTIVATING_SIGTERM)
-                swap_enter_signal(s, SWAP_ACTIVATING_SIGKILL, SWAP_SUCCESS);
-        else if (state == SWAP_DEACTIVATING_SIGTERM)
+        } else if (state == SWAP_DEACTIVATING_SIGTERM && s->kill_context.send_sigkill)
                 swap_enter_signal(s, SWAP_DEACTIVATING_SIGKILL, SWAP_SUCCESS);
         else
-                swap_enter_dead(s, SWAP_SUCCESS);
+                swap_enter_dead_or_active(s, SWAP_SUCCESS);
 
         return;
 
 fail:
         log_unit_warning_errno(UNIT(s), r, "Failed to kill processes: %m");
-        swap_enter_dead(s, SWAP_FAILURE_RESOURCES);
+        swap_enter_dead_or_active(s, SWAP_FAILURE_RESOURCES);
 }
 
 static void swap_enter_activating(Swap *s) {
@@ -721,6 +733,8 @@ static void swap_enter_activating(Swap *s) {
         int r;
 
         assert(s);
+
+        unit_warn_leftover_processes(UNIT(s));
 
         s->control_command_id = SWAP_EXEC_ACTIVATE;
         s->control_command = s->exec_command + SWAP_EXEC_ACTIVATE;
@@ -771,7 +785,7 @@ static void swap_enter_activating(Swap *s) {
 
 fail:
         log_unit_warning_errno(UNIT(s), r, "Failed to run 'swapon' task: %m");
-        swap_enter_dead(s, SWAP_FAILURE_RESOURCES);
+        swap_enter_dead_or_active(s, SWAP_FAILURE_RESOURCES);
 }
 
 static void swap_enter_deactivating(Swap *s) {
@@ -801,30 +815,29 @@ static void swap_enter_deactivating(Swap *s) {
 
 fail:
         log_unit_warning_errno(UNIT(s), r, "Failed to run 'swapoff' task: %m");
-        swap_enter_active(s, SWAP_FAILURE_RESOURCES);
+        swap_enter_dead_or_active(s, SWAP_FAILURE_RESOURCES);
 }
 
 static int swap_start(Unit *u) {
         Swap *s = SWAP(u), *other;
+        int r;
 
         assert(s);
 
-        /* We cannot fulfill this request right now, try again later
-         * please! */
-
-        if (s->state == SWAP_DEACTIVATING ||
-            s->state == SWAP_DEACTIVATING_SIGTERM ||
-            s->state == SWAP_DEACTIVATING_SIGKILL ||
-            s->state == SWAP_ACTIVATING_SIGTERM ||
-            s->state == SWAP_ACTIVATING_SIGKILL)
+        /* We cannot fulfill this request right now, try again later please! */
+        if (IN_SET(s->state,
+                   SWAP_DEACTIVATING,
+                   SWAP_DEACTIVATING_SIGTERM,
+                   SWAP_DEACTIVATING_SIGKILL))
                 return -EAGAIN;
 
+        /* Already on it! */
         if (s->state == SWAP_ACTIVATING)
                 return 0;
 
-        assert(s->state == SWAP_DEAD || s->state == SWAP_FAILED);
+        assert(IN_SET(s->state, SWAP_DEAD, SWAP_FAILED));
 
-        if (detect_container(NULL) > 0)
+        if (detect_container() > 0)
                 return -EPERM;
 
         /* If there's a job for another swap unit for the same node
@@ -834,8 +847,19 @@ static int swap_start(Unit *u) {
                 if (UNIT(other)->job && UNIT(other)->job->state == JOB_RUNNING)
                         return -EAGAIN;
 
+        r = unit_start_limit_test(u);
+        if (r < 0) {
+                swap_enter_dead(s, SWAP_FAILURE_START_LIMIT_HIT);
+                return r;
+        }
+
+        r = unit_acquire_invocation_id(u);
+        if (r < 0)
+                return r;
+
         s->result = SWAP_SUCCESS;
-        s->reset_cpu_usage = true;
+
+        u->reset_accounting = true;
 
         swap_enter_activating(s);
         return 1;
@@ -846,22 +870,30 @@ static int swap_stop(Unit *u) {
 
         assert(s);
 
-        if (s->state == SWAP_DEACTIVATING ||
-            s->state == SWAP_DEACTIVATING_SIGTERM ||
-            s->state == SWAP_DEACTIVATING_SIGKILL ||
-            s->state == SWAP_ACTIVATING_SIGTERM ||
-            s->state == SWAP_ACTIVATING_SIGKILL)
+        switch (s->state) {
+
+        case SWAP_DEACTIVATING:
+        case SWAP_DEACTIVATING_SIGTERM:
+        case SWAP_DEACTIVATING_SIGKILL:
+                /* Already on it */
                 return 0;
 
-        assert(s->state == SWAP_ACTIVATING ||
-               s->state == SWAP_ACTIVATING_DONE ||
-               s->state == SWAP_ACTIVE);
+        case SWAP_ACTIVATING:
+        case SWAP_ACTIVATING_DONE:
+                /* There's a control process pending, directly enter kill mode */
+                swap_enter_signal(s, SWAP_DEACTIVATING_SIGTERM, SWAP_SUCCESS);
+                return 0;
 
-        if (detect_container(NULL) > 0)
-                return -EPERM;
+        case SWAP_ACTIVE:
+                if (detect_container() > 0)
+                        return -EPERM;
 
-        swap_enter_deactivating(s);
-        return 1;
+                swap_enter_deactivating(s);
+                return 1;
+
+        default:
+                assert_not_reached("Unexpected state.");
+        }
 }
 
 static int swap_serialize(Unit *u, FILE *f, FDSet *fds) {
@@ -961,7 +993,7 @@ static void swap_sigchld_event(Unit *u, pid_t pid, int code, int status) {
 
         s->control_pid = 0;
 
-        if (is_clean_exit(code, status, NULL))
+        if (is_clean_exit(code, status, EXIT_CLEAN_COMMAND, NULL))
                 f = SWAP_SUCCESS;
         else if (code == CLD_EXITED)
                 f = SWAP_FAILURE_EXIT_CODE;
@@ -972,7 +1004,7 @@ static void swap_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         else
                 assert_not_reached("Unknown code");
 
-        if (f != SWAP_SUCCESS)
+        if (s->result == SWAP_SUCCESS)
                 s->result = f;
 
         if (s->control_command) {
@@ -989,10 +1021,8 @@ static void swap_sigchld_event(Unit *u, pid_t pid, int code, int status) {
 
         case SWAP_ACTIVATING:
         case SWAP_ACTIVATING_DONE:
-        case SWAP_ACTIVATING_SIGTERM:
-        case SWAP_ACTIVATING_SIGKILL:
 
-                if (f == SWAP_SUCCESS)
+                if (f == SWAP_SUCCESS || s->from_proc_swaps)
                         swap_enter_active(s, f);
                 else
                         swap_enter_dead(s, f);
@@ -1002,7 +1032,7 @@ static void swap_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         case SWAP_DEACTIVATING_SIGKILL:
         case SWAP_DEACTIVATING_SIGTERM:
 
-                swap_enter_dead(s, f);
+                swap_enter_dead_or_active(s, f);
                 break;
 
         default:
@@ -1024,7 +1054,7 @@ static int swap_dispatch_timer(sd_event_source *source, usec_t usec, void *userd
         case SWAP_ACTIVATING:
         case SWAP_ACTIVATING_DONE:
                 log_unit_warning(UNIT(s), "Activation timed out. Stopping.");
-                swap_enter_signal(s, SWAP_ACTIVATING_SIGTERM, SWAP_FAILURE_TIMEOUT);
+                swap_enter_signal(s, SWAP_DEACTIVATING_SIGTERM, SWAP_FAILURE_TIMEOUT);
                 break;
 
         case SWAP_DEACTIVATING:
@@ -1032,30 +1062,19 @@ static int swap_dispatch_timer(sd_event_source *source, usec_t usec, void *userd
                 swap_enter_signal(s, SWAP_DEACTIVATING_SIGTERM, SWAP_FAILURE_TIMEOUT);
                 break;
 
-        case SWAP_ACTIVATING_SIGTERM:
-                if (s->kill_context.send_sigkill) {
-                        log_unit_warning(UNIT(s), "Activation timed out. Killing.");
-                        swap_enter_signal(s, SWAP_ACTIVATING_SIGKILL, SWAP_FAILURE_TIMEOUT);
-                } else {
-                        log_unit_warning(UNIT(s), "Activation timed out. Skipping SIGKILL. Ignoring.");
-                        swap_enter_dead(s, SWAP_FAILURE_TIMEOUT);
-                }
-                break;
-
         case SWAP_DEACTIVATING_SIGTERM:
                 if (s->kill_context.send_sigkill) {
-                        log_unit_warning(UNIT(s), "Deactivation timed out. Killing.");
+                        log_unit_warning(UNIT(s), "Swap process timed out. Killing.");
                         swap_enter_signal(s, SWAP_DEACTIVATING_SIGKILL, SWAP_FAILURE_TIMEOUT);
                 } else {
-                        log_unit_warning(UNIT(s), "Deactivation timed out. Skipping SIGKILL. Ignoring.");
-                        swap_enter_dead(s, SWAP_FAILURE_TIMEOUT);
+                        log_unit_warning(UNIT(s), "Swap process timed out. Skipping SIGKILL. Ignoring.");
+                        swap_enter_dead_or_active(s, SWAP_FAILURE_TIMEOUT);
                 }
                 break;
 
-        case SWAP_ACTIVATING_SIGKILL:
         case SWAP_DEACTIVATING_SIGKILL:
                 log_unit_warning(UNIT(s), "Swap process still around after SIGKILL. Ignoring.");
-                swap_enter_dead(s, SWAP_FAILURE_TIMEOUT);
+                swap_enter_dead_or_active(s, SWAP_FAILURE_TIMEOUT);
                 break;
 
         default:
@@ -1162,6 +1181,7 @@ static int swap_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
 
                         case SWAP_DEAD:
                         case SWAP_FAILED:
+                                (void) unit_acquire_invocation_id(UNIT(swap));
                                 swap_enter_active(swap, SWAP_SUCCESS);
                                 break;
 
@@ -1202,7 +1222,7 @@ static Unit *swap_following(Unit *u) {
                 if (other->from_fragment)
                         return UNIT(other);
 
-        /* Otherwise make everybody follow the unit that's named after
+        /* Otherwise, make everybody follow the unit that's named after
          * the swap device in the kernel */
 
         if (streq_ptr(s->what, s->devnode))
@@ -1259,35 +1279,41 @@ static void swap_shutdown(Manager *m) {
 
         m->swap_event_source = sd_event_source_unref(m->swap_event_source);
 
-        if (m->proc_swaps) {
-                fclose(m->proc_swaps);
-                m->proc_swaps = NULL;
-        }
+        m->proc_swaps = safe_fclose(m->proc_swaps);
 
-        hashmap_free(m->swaps_by_devnode);
-        m->swaps_by_devnode = NULL;
+        m->swaps_by_devnode = hashmap_free(m->swaps_by_devnode);
 }
 
-static int swap_enumerate(Manager *m) {
+static void swap_enumerate(Manager *m) {
         int r;
 
         assert(m);
 
         if (!m->proc_swaps) {
                 m->proc_swaps = fopen("/proc/swaps", "re");
-                if (!m->proc_swaps)
-                        return errno == ENOENT ? 0 : -errno;
+                if (!m->proc_swaps) {
+                        if (errno == ENOENT)
+                                log_debug("Not swap enabled, skipping enumeration");
+                        else
+                                log_error_errno(errno, "Failed to open /proc/swaps: %m");
+
+                        return;
+                }
 
                 r = sd_event_add_io(m->event, &m->swap_event_source, fileno(m->proc_swaps), EPOLLPRI, swap_dispatch_io, m);
-                if (r < 0)
+                if (r < 0) {
+                        log_error_errno(r, "Failed to watch /proc/swaps: %m");
                         goto fail;
+                }
 
                 /* Dispatch this before we dispatch SIGCHLD, so that
                  * we always get the events from /proc/swaps before
                  * the SIGCHLD of /sbin/swapon. */
                 r = sd_event_source_set_priority(m->swap_event_source, -10);
-                if (r < 0)
+                if (r < 0) {
+                        log_error_errno(r, "Failed to change /proc/swaps priority: %m");
                         goto fail;
+                }
 
                 (void) sd_event_source_set_description(m->swap_event_source, "swap-proc");
         }
@@ -1296,18 +1322,17 @@ static int swap_enumerate(Manager *m) {
         if (r < 0)
                 goto fail;
 
-        return 0;
+        return;
 
 fail:
         swap_shutdown(m);
-        return r;
 }
 
 int swap_process_device_new(Manager *m, struct udev_device *dev) {
         struct udev_list_entry *item = NULL, *first = NULL;
         _cleanup_free_ char *e = NULL;
         const char *dn;
-        Swap *s;
+        Unit *u;
         int r = 0;
 
         assert(m);
@@ -1321,9 +1346,9 @@ int swap_process_device_new(Manager *m, struct udev_device *dev) {
         if (r < 0)
                 return r;
 
-        s = hashmap_get(m->units, e);
-        if (s)
-                r = swap_set_devnode(s, dn);
+        u = manager_get_unit(m, e);
+        if (u)
+                r = swap_set_devnode(SWAP(u), dn);
 
         first = udev_device_get_devlinks_list_entry(dev);
         udev_list_entry_foreach(item, first) {
@@ -1334,9 +1359,9 @@ int swap_process_device_new(Manager *m, struct udev_device *dev) {
                 if (q < 0)
                         return q;
 
-                s = hashmap_get(m->units, n);
-                if (s) {
-                        q = swap_set_devnode(s, dn);
+                u = manager_get_unit(m, n);
+                if (u) {
+                        q = swap_set_devnode(SWAP(u), dn);
                         if (q < 0)
                                 r = q;
                 }
@@ -1380,17 +1405,21 @@ static int swap_kill(Unit *u, KillWho who, int signo, sd_bus_error *error) {
         return unit_kill_common(u, who, signo, -1, SWAP(u)->control_pid, error);
 }
 
-static int swap_get_timeout(Unit *u, uint64_t *timeout) {
+static int swap_get_timeout(Unit *u, usec_t *timeout) {
         Swap *s = SWAP(u);
+        usec_t t;
         int r;
 
         if (!s->timer_event_source)
                 return 0;
 
-        r = sd_event_source_get_time(s->timer_event_source, timeout);
+        r = sd_event_source_get_time(s->timer_event_source, &t);
         if (r < 0)
                 return r;
+        if (t == USEC_INFINITY)
+                return 0;
 
+        *timeout = t;
         return 1;
 }
 
@@ -1404,25 +1433,18 @@ static bool swap_supported(void) {
         if (supported < 0)
                 supported =
                         access("/proc/swaps", F_OK) >= 0 &&
-                        detect_container(NULL) <= 0;
+                        detect_container() <= 0;
 
         return supported;
 }
 
-static const char* const swap_state_table[_SWAP_STATE_MAX] = {
-        [SWAP_DEAD] = "dead",
-        [SWAP_ACTIVATING] = "activating",
-        [SWAP_ACTIVATING_DONE] = "activating-done",
-        [SWAP_ACTIVE] = "active",
-        [SWAP_DEACTIVATING] = "deactivating",
-        [SWAP_ACTIVATING_SIGTERM] = "activating-sigterm",
-        [SWAP_ACTIVATING_SIGKILL] = "activating-sigkill",
-        [SWAP_DEACTIVATING_SIGTERM] = "deactivating-sigterm",
-        [SWAP_DEACTIVATING_SIGKILL] = "deactivating-sigkill",
-        [SWAP_FAILED] = "failed"
-};
+static int swap_control_pid(Unit *u) {
+        Swap *s = SWAP(u);
 
-DEFINE_STRING_TABLE_LOOKUP(swap_state, SwapState);
+        assert(s);
+
+        return s->control_pid;
+}
 
 static const char* const swap_exec_command_table[_SWAP_EXEC_COMMAND_MAX] = {
         [SWAP_EXEC_ACTIVATE] = "ExecActivate",
@@ -1437,7 +1459,8 @@ static const char* const swap_result_table[_SWAP_RESULT_MAX] = {
         [SWAP_FAILURE_TIMEOUT] = "timeout",
         [SWAP_FAILURE_EXIT_CODE] = "exit-code",
         [SWAP_FAILURE_SIGNAL] = "signal",
-        [SWAP_FAILURE_CORE_DUMP] = "core-dump"
+        [SWAP_FAILURE_CORE_DUMP] = "core-dump",
+        [SWAP_FAILURE_START_LIMIT_HIT] = "start-limit-hit",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(swap_result, SwapResult);
@@ -1448,15 +1471,13 @@ const UnitVTable swap_vtable = {
         .cgroup_context_offset = offsetof(Swap, cgroup_context),
         .kill_context_offset = offsetof(Swap, kill_context),
         .exec_runtime_offset = offsetof(Swap, exec_runtime),
+        .dynamic_creds_offset = offsetof(Swap, dynamic_creds),
 
         .sections =
                 "Unit\0"
                 "Swap\0"
                 "Install\0",
         .private_section = "Swap",
-
-        .no_alias = true,
-        .no_instances = true,
 
         .init = swap_init,
         .load = swap_load,
@@ -1485,7 +1506,8 @@ const UnitVTable swap_vtable = {
 
         .reset_failed = swap_reset_failed,
 
-        .bus_interface = "org.freedesktop.systemd1.Swap",
+        .control_pid = swap_control_pid,
+
         .bus_vtable = bus_swap_vtable,
         .bus_set_property = bus_swap_set_property,
         .bus_commit_properties = bus_swap_commit_properties,
@@ -1505,7 +1527,6 @@ const UnitVTable swap_vtable = {
                 .finished_start_job = {
                         [JOB_DONE]       = "Activated swap %s.",
                         [JOB_FAILED]     = "Failed to activate swap %s.",
-                        [JOB_DEPENDENCY] = "Dependency failed for %s.",
                         [JOB_TIMEOUT]    = "Timed out activating swap %s.",
                 },
                 .finished_stop_job = {

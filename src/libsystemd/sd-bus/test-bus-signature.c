@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,10 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-
-#include "log.h"
-#include "bus-signature.h"
 #include "bus-internal.h"
+#include "bus-signature.h"
+#include "log.h"
+#include "string-util.h"
 
 int main(int argc, char *argv[]) {
         char prefix[256];

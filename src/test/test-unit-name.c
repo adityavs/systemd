@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,21 +20,28 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pwd.h>
 
+#include "alloc-util.h"
+#include "glob-util.h"
+#include "hostname-util.h"
+#include "macro.h"
 #include "manager.h"
-#include "unit.h"
+#include "path-util.h"
+#include "rm-rf.h"
+#include "special.h"
+#include "specifier.h"
+#include "string-util.h"
+#include "test-helper.h"
+#include "tests.h"
 #include "unit-name.h"
 #include "unit-printf.h"
-#include "specifier.h"
+#include "unit.h"
+#include "user-util.h"
 #include "util.h"
-#include "macro.h"
-#include "path-util.h"
-#include "test-helper.h"
-#include "hostname-util.h"
 
 static void test_unit_name_is_valid(void) {
         assert_se(unit_name_is_valid("foo.service", UNIT_NAME_ANY));
@@ -63,26 +69,26 @@ static void test_unit_name_is_valid(void) {
         assert_se(!unit_name_is_valid("@piep.service", UNIT_NAME_ANY));
 }
 
-static void test_u_n_r_i_one(const char *pattern, const char *repl, const char *expected, int ret) {
+static void test_unit_name_replace_instance_one(const char *pattern, const char *repl, const char *expected, int ret) {
         _cleanup_free_ char *t = NULL;
         assert_se(unit_name_replace_instance(pattern, repl, &t) == ret);
         puts(strna(t));
         assert_se(streq_ptr(t, expected));
 }
 
-static void test_u_n_r_i(void) {
+static void test_unit_name_replace_instance(void) {
         puts("-------------------------------------------------");
-        test_u_n_r_i_one("foo@.service", "waldo", "foo@waldo.service", 0);
-        test_u_n_r_i_one("foo@xyz.service", "waldo", "foo@waldo.service", 0);
-        test_u_n_r_i_one("xyz", "waldo", NULL, -EINVAL);
-        test_u_n_r_i_one("", "waldo", NULL, -EINVAL);
-        test_u_n_r_i_one("foo.service", "waldo", NULL, -EINVAL);
-        test_u_n_r_i_one(".service", "waldo", NULL, -EINVAL);
-        test_u_n_r_i_one("foo@", "waldo", NULL, -EINVAL);
-        test_u_n_r_i_one("@bar", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one("foo@.service", "waldo", "foo@waldo.service", 0);
+        test_unit_name_replace_instance_one("foo@xyz.service", "waldo", "foo@waldo.service", 0);
+        test_unit_name_replace_instance_one("xyz", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one("", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one("foo.service", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one(".service", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one("foo@", "waldo", NULL, -EINVAL);
+        test_unit_name_replace_instance_one("@bar", "waldo", NULL, -EINVAL);
 }
 
-static void test_u_n_f_p_one(const char *path, const char *suffix, const char *expected, int ret) {
+static void test_unit_name_from_path_one(const char *path, const char *suffix, const char *expected, int ret) {
         _cleanup_free_ char *t = NULL;
 
         assert_se(unit_name_from_path(path, suffix, &t) == ret);
@@ -97,19 +103,19 @@ static void test_u_n_f_p_one(const char *path, const char *suffix, const char *e
         }
 }
 
-static void test_u_n_f_p(void) {
+static void test_unit_name_from_path(void) {
         puts("-------------------------------------------------");
-        test_u_n_f_p_one("/waldo", ".mount", "waldo.mount", 0);
-        test_u_n_f_p_one("/waldo/quuix", ".mount", "waldo-quuix.mount", 0);
-        test_u_n_f_p_one("/waldo/quuix/", ".mount", "waldo-quuix.mount", 0);
-        test_u_n_f_p_one("", ".mount", "-.mount", 0);
-        test_u_n_f_p_one("/", ".mount", "-.mount", 0);
-        test_u_n_f_p_one("///", ".mount", "-.mount", 0);
-        test_u_n_f_p_one("/foo/../bar", ".mount", NULL, -EINVAL);
-        test_u_n_f_p_one("/foo/./bar", ".mount", NULL, -EINVAL);
+        test_unit_name_from_path_one("/waldo", ".mount", "waldo.mount", 0);
+        test_unit_name_from_path_one("/waldo/quuix", ".mount", "waldo-quuix.mount", 0);
+        test_unit_name_from_path_one("/waldo/quuix/", ".mount", "waldo-quuix.mount", 0);
+        test_unit_name_from_path_one("", ".mount", "-.mount", 0);
+        test_unit_name_from_path_one("/", ".mount", "-.mount", 0);
+        test_unit_name_from_path_one("///", ".mount", "-.mount", 0);
+        test_unit_name_from_path_one("/foo/../bar", ".mount", NULL, -EINVAL);
+        test_unit_name_from_path_one("/foo/./bar", ".mount", NULL, -EINVAL);
 }
 
-static void test_u_n_f_p_i_one(const char *pattern, const char *path, const char *suffix, const char *expected, int ret) {
+static void test_unit_name_from_path_instance_one(const char *pattern, const char *path, const char *suffix, const char *expected, int ret) {
         _cleanup_free_ char *t = NULL;
 
         assert_se(unit_name_from_path_instance(pattern, path, suffix, &t) == ret);
@@ -125,65 +131,71 @@ static void test_u_n_f_p_i_one(const char *pattern, const char *path, const char
         }
 }
 
-static void test_u_n_f_p_i(void) {
+static void test_unit_name_from_path_instance(void) {
         puts("-------------------------------------------------");
 
-        test_u_n_f_p_i_one("waldo", "/waldo", ".mount", "waldo@waldo.mount", 0);
-        test_u_n_f_p_i_one("waldo", "/waldo////quuix////", ".mount", "waldo@waldo-quuix.mount", 0);
-        test_u_n_f_p_i_one("waldo", "/", ".mount", "waldo@-.mount", 0);
-        test_u_n_f_p_i_one("waldo", "", ".mount", "waldo@-.mount", 0);
-        test_u_n_f_p_i_one("waldo", "///", ".mount", "waldo@-.mount", 0);
-        test_u_n_f_p_i_one("waldo", "..", ".mount", NULL, -EINVAL);
-        test_u_n_f_p_i_one("waldo", "/foo", ".waldi", NULL, -EINVAL);
-        test_u_n_f_p_i_one("wa--ldo", "/--", ".mount", "wa--ldo@\\x2d\\x2d.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "/waldo", ".mount", "waldo@waldo.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "/waldo////quuix////", ".mount", "waldo@waldo-quuix.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "/", ".mount", "waldo@-.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "", ".mount", "waldo@-.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "///", ".mount", "waldo@-.mount", 0);
+        test_unit_name_from_path_instance_one("waldo", "..", ".mount", NULL, -EINVAL);
+        test_unit_name_from_path_instance_one("waldo", "/foo", ".waldi", NULL, -EINVAL);
+        test_unit_name_from_path_instance_one("wa--ldo", "/--", ".mount", "wa--ldo@\\x2d\\x2d.mount", 0);
 }
 
-static void test_u_n_t_p_one(const char *unit, const char *path, int ret) {
+static void test_unit_name_to_path_one(const char *unit, const char *path, int ret) {
         _cleanup_free_ char *p = NULL;
 
         assert_se(unit_name_to_path(unit, &p) == ret);
         assert_se(streq_ptr(path, p));
 }
 
-static void test_u_n_t_p(void) {
-        test_u_n_t_p_one("home.mount", "/home", 0);
-        test_u_n_t_p_one("home-lennart.mount", "/home/lennart", 0);
-        test_u_n_t_p_one("home-lennart-.mount", NULL, -EINVAL);
-        test_u_n_t_p_one("-home-lennart.mount", NULL, -EINVAL);
-        test_u_n_t_p_one("-home--lennart.mount", NULL, -EINVAL);
-        test_u_n_t_p_one("home-..-lennart.mount", NULL, -EINVAL);
-        test_u_n_t_p_one("", NULL, -EINVAL);
-        test_u_n_t_p_one("home/foo", NULL, -EINVAL);
+static void test_unit_name_to_path(void) {
+        test_unit_name_to_path_one("home.mount", "/home", 0);
+        test_unit_name_to_path_one("home-lennart.mount", "/home/lennart", 0);
+        test_unit_name_to_path_one("home-lennart-.mount", NULL, -EINVAL);
+        test_unit_name_to_path_one("-home-lennart.mount", NULL, -EINVAL);
+        test_unit_name_to_path_one("-home--lennart.mount", NULL, -EINVAL);
+        test_unit_name_to_path_one("home-..-lennart.mount", NULL, -EINVAL);
+        test_unit_name_to_path_one("", NULL, -EINVAL);
+        test_unit_name_to_path_one("home/foo", NULL, -EINVAL);
 }
 
-static void test_u_n_m_one(const char *pattern, const char *expect, int ret) {
+static void test_unit_name_mangle_one(UnitNameMangle allow_globs, const char *pattern, const char *expect, int ret) {
         _cleanup_free_ char *t = NULL;
 
-        assert_se(unit_name_mangle(pattern, UNIT_NAME_NOGLOB, &t) == ret);
+        assert_se(unit_name_mangle(pattern, allow_globs, &t) == ret);
         puts(strna(t));
         assert_se(streq_ptr(t, expect));
 
         if (t) {
                 _cleanup_free_ char *k = NULL;
 
-                assert_se(unit_name_is_valid(t, UNIT_NAME_ANY));
+                assert_se(unit_name_is_valid(t, UNIT_NAME_ANY) ||
+                          (allow_globs == UNIT_NAME_GLOB && string_is_glob(t)));
 
-                assert_se(unit_name_mangle(t, UNIT_NAME_NOGLOB, &k) == 0);
+                assert_se(unit_name_mangle(t, allow_globs, &k) == 0);
                 assert_se(streq_ptr(t, k));
         }
 }
 
-static void test_u_n_m(void) {
+static void test_unit_name_mangle(void) {
         puts("-------------------------------------------------");
-        test_u_n_m_one("foo.service", "foo.service", 0);
-        test_u_n_m_one("/home", "home.mount", 1);
-        test_u_n_m_one("/dev/sda", "dev-sda.device", 1);
-        test_u_n_m_one("üxknürz.service", "\\xc3\\xbcxkn\\xc3\\xbcrz.service", 1);
-        test_u_n_m_one("foobar-meh...waldi.service", "foobar-meh...waldi.service", 0);
-        test_u_n_m_one("_____####----.....service", "_____\\x23\\x23\\x23\\x23----.....service", 1);
-        test_u_n_m_one("_____##@;;;,,,##----.....service", "_____\\x23\\x23@\\x3b\\x3b\\x3b\\x2c\\x2c\\x2c\\x23\\x23----.....service", 1);
-        test_u_n_m_one("xxx@@@@/////\\\\\\\\\\yyy.service", "xxx@@@@-----\\\\\\\\\\yyy.service", 1);
-        test_u_n_m_one("", NULL, -EINVAL);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "foo.service", "foo.service", 0);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "/home", "home.mount", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "/dev/sda", "dev-sda.device", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "üxknürz.service", "\\xc3\\xbcxkn\\xc3\\xbcrz.service", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "foobar-meh...waldi.service", "foobar-meh...waldi.service", 0);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "_____####----.....service", "_____\\x23\\x23\\x23\\x23----.....service", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "_____##@;;;,,,##----.....service", "_____\\x23\\x23@\\x3b\\x3b\\x3b\\x2c\\x2c\\x2c\\x23\\x23----.....service", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "xxx@@@@/////\\\\\\\\\\yyy.service", "xxx@@@@-----\\\\\\\\\\yyy.service", 1);
+        test_unit_name_mangle_one(UNIT_NAME_NOGLOB, "", NULL, -EINVAL);
+
+        test_unit_name_mangle_one(UNIT_NAME_GLOB, "foo.service", "foo.service", 0);
+        test_unit_name_mangle_one(UNIT_NAME_GLOB, "foo", "foo.service", 1);
+        test_unit_name_mangle_one(UNIT_NAME_GLOB, "foo*", "foo*", 0);
+        test_unit_name_mangle_one(UNIT_NAME_GLOB, "ü*", "\\xc3\\xbc*", 1);
 }
 
 static int test_unit_printf(void) {
@@ -191,19 +203,19 @@ static int test_unit_printf(void) {
         Unit *u, *u2;
         int r;
 
-        _cleanup_free_ char *mid, *bid, *host, *root_uid;
-        struct passwd *root;
+        _cleanup_free_ char *mid = NULL, *bid = NULL, *host = NULL, *uid = NULL, *user = NULL, *shell = NULL, *home = NULL;
 
         assert_se(specifier_machine_id('m', NULL, NULL, &mid) >= 0 && mid);
         assert_se(specifier_boot_id('b', NULL, NULL, &bid) >= 0 && bid);
-        assert_se((host = gethostname_malloc()));
+        assert_se(host = gethostname_malloc());
+        assert_se(user = uid_to_name(getuid()));
+        assert_se(asprintf(&uid, UID_FMT, getuid()));
+        assert_se(get_home_dir(&home) >= 0);
+        assert_se(get_shell(&shell) >= 0);
 
-        assert_se((root = getpwnam("root")));
-        assert_se(asprintf(&root_uid, "%d", (int) root->pw_uid) > 0);
-
-        r = manager_new(MANAGER_USER, true, &m);
-        if (r == -EPERM || r == -EACCES || r == -EADDRINUSE) {
-                puts("manager_new: Permission denied. Skipping test.");
+        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_MINIMAL, &m);
+        if (MANAGER_SKIP_TEST(r)) {
+                log_notice_errno(r, "Skipping test: manager_new: %m");
                 return EXIT_TEST_SKIP;
         }
         assert_se(r == 0);
@@ -220,10 +232,6 @@ static int test_unit_printf(void) {
                         assert_se(streq(t, expected));                     \
         }
 
-        assert_se(setenv("USER", "root", 1) == 0);
-        assert_se(setenv("HOME", "/root", 1) == 0);
-        assert_se(setenv("XDG_RUNTIME_DIR", "/run/user/1/", 1) == 0);
-
         assert_se(u = unit_new(m, sizeof(Service)));
         assert_se(unit_add_name(u, "blah.service") == 0);
         assert_se(unit_add_name(u, "blah.service") == 0);
@@ -231,7 +239,8 @@ static int test_unit_printf(void) {
         /* general tests */
         expect(u, "%%", "%");
         expect(u, "%%s", "%s");
-        expect(u, "%", "");    // REALLY?
+        expect(u, "%,", "%,");
+        expect(u, "%", "%");
 
         /* normal unit */
         expect(u, "%n", "blah.service");
@@ -240,9 +249,9 @@ static int test_unit_printf(void) {
         expect(u, "%p", "blah");
         expect(u, "%P", "blah");
         expect(u, "%i", "");
-        expect(u, "%u", root->pw_name);
-        expect(u, "%U", root_uid);
-        expect(u, "%h", root->pw_dir);
+        expect(u, "%u", user);
+        expect(u, "%U", uid);
+        expect(u, "%h", home);
         expect(u, "%m", mid);
         expect(u, "%b", bid);
         expect(u, "%H", host);
@@ -260,9 +269,9 @@ static int test_unit_printf(void) {
         expect(u2, "%P", "blah");
         expect(u2, "%i", "foo-foo");
         expect(u2, "%I", "foo/foo");
-        expect(u2, "%u", root->pw_name);
-        expect(u2, "%U", root_uid);
-        expect(u2, "%h", root->pw_dir);
+        expect(u2, "%u", user);
+        expect(u2, "%U", uid);
+        expect(u2, "%h", home);
         expect(u2, "%m", mid);
         expect(u2, "%b", bid);
         expect(u2, "%H", host);
@@ -330,7 +339,7 @@ static void test_unit_name_build(void) {
 }
 
 static void test_slice_name_is_valid(void) {
-        assert_se(slice_name_is_valid("-.slice"));
+        assert_se(slice_name_is_valid(SPECIAL_ROOT_SLICE));
         assert_se(slice_name_is_valid("foo.slice"));
         assert_se(slice_name_is_valid("foo-bar.slice"));
         assert_se(slice_name_is_valid("foo-bar-baz.slice"));
@@ -348,7 +357,7 @@ static void test_build_subslice(void) {
         char *a;
         char *b;
 
-        assert_se(slice_build_subslice("-.slice", "foo", &a) >= 0);
+        assert_se(slice_build_subslice(SPECIAL_ROOT_SLICE, "foo", &a) >= 0);
         assert_se(slice_build_subslice(a, "bar", &b) >= 0);
         free(a);
         assert_se(slice_build_subslice(b, "barfoo", &a) >= 0);
@@ -370,8 +379,8 @@ static void test_build_parent_slice_one(const char *name, const char *expect, in
 }
 
 static void test_build_parent_slice(void) {
-        test_build_parent_slice_one("-.slice", NULL, 0);
-        test_build_parent_slice_one("foo.slice", "-.slice", 1);
+        test_build_parent_slice_one(SPECIAL_ROOT_SLICE, NULL, 0);
+        test_build_parent_slice_one("foo.slice", SPECIAL_ROOT_SLICE, 1);
         test_build_parent_slice_one("foo-bar.slice", "foo.slice", 1);
         test_build_parent_slice_one("foo-bar-baz.slice", "foo-bar.slice", 1);
         test_build_parent_slice_one("foo-bar--baz.slice", NULL, -EINVAL);
@@ -457,13 +466,26 @@ static void test_unit_name_path_unescape(void) {
 }
 
 int main(int argc, char* argv[]) {
-        int rc = 0;
+        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
+        int r, rc = 0;
+
+        log_parse_environment();
+        log_open();
+
+        r = enter_cgroup_subroot();
+        if (r == -ENOMEDIUM) {
+                log_notice_errno(r, "Skipping test: cgroupfs not available");
+                return EXIT_TEST_SKIP;
+        }
+
+        assert_se(runtime_dir = setup_fake_runtime_dir());
+
         test_unit_name_is_valid();
-        test_u_n_r_i();
-        test_u_n_f_p();
-        test_u_n_f_p_i();
-        test_u_n_m();
-        test_u_n_t_p();
+        test_unit_name_replace_instance();
+        test_unit_name_from_path();
+        test_unit_name_from_path_instance();
+        test_unit_name_mangle();
+        test_unit_name_to_path();
         TEST_REQ_RUNNING_SYSTEMD(rc = test_unit_printf());
         test_unit_instance_is_valid();
         test_unit_prefix_is_valid();

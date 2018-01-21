@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,52 +19,33 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <locale.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <getopt.h>
-#include <string.h>
 #include <ftw.h>
+#include <getopt.h>
+#include <locale.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "sd-bus.h"
-#include "bus-util.h"
+
 #include "bus-error.h"
-#include "util.h"
-#include "spawn-polkit-agent.h"
-#include "build.h"
-#include "strv.h"
-#include "pager.h"
-#include "set.h"
+#include "bus-util.h"
 #include "def.h"
-#include "virt.h"
+#include "fd-util.h"
 #include "fileio.h"
 #include "locale-util.h"
+#include "pager.h"
+#include "set.h"
+#include "spawn-polkit-agent.h"
+#include "strv.h"
+#include "util.h"
+#include "virt.h"
 
 static bool arg_no_pager = false;
 static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static char *arg_host = NULL;
 static bool arg_convert = true;
-
-static void pager_open_if_enabled(void) {
-
-        if (arg_no_pager)
-                return;
-
-        pager_open(false);
-}
-
-static void polkit_agent_open_if_enabled(void) {
-
-        /* Open the polkit agent as a child process if necessary */
-        if (!arg_ask_password)
-                return;
-
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
-                return;
-
-        polkit_agent_open();
-}
 
 typedef struct StatusInfo {
         char **locale;
@@ -96,7 +76,7 @@ static void print_overridden_variables(void) {
         LocaleVariable j;
         bool print_warning = true;
 
-        if (detect_container(NULL) > 0 || arg_host)
+        if (detect_container() > 0 || arg_host)
                 return;
 
         r = parse_env_file("/proc/cmdline", WHITESPACE,
@@ -125,11 +105,11 @@ static void print_overridden_variables(void) {
                 if (variables[j]) {
                         if (print_warning) {
                                 log_warning("Warning: Settings on kernel command line override system locale settings in /etc/locale.conf.\n"
-                                            "  Command Line: %s=%s", locale_variable_to_string(j), variables[j]);
+                                            "    Command Line: %s=%s", locale_variable_to_string(j), variables[j]);
 
                                 print_warning = false;
                         } else
-                                log_warning("                %s=%s", locale_variable_to_string(j), variables[j]);
+                                log_warning("                  %s=%s", locale_variable_to_string(j), variables[j]);
                 }
  finish:
         for (j = 0; j < _VARIABLE_LC_MAX; j++)
@@ -140,7 +120,7 @@ static void print_status_info(StatusInfo *i) {
         assert(i);
 
         if (strv_isempty(i->locale))
-                puts("   System Locale: n/a\n");
+                puts("   System Locale: n/a");
         else {
                 char **j;
 
@@ -175,6 +155,8 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
                 { "Locale",               "as", NULL, offsetof(StatusInfo, locale) },
                 {}
         };
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(bus);
@@ -183,9 +165,10 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
                                    "org.freedesktop.locale1",
                                    "/org/freedesktop/locale1",
                                    map,
+                                   &error,
                                    &info);
         if (r < 0)
-                return log_error_errno(r, "Could not get properties: %m");
+                return log_error_errno(r, "Could not get properties: %s", bus_error_message(&error, r));
 
         print_overridden_variables();
         print_status_info(&info);
@@ -194,14 +177,14 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_locale(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(bus);
         assert(args);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_message_new_method_call(
                         bus,
@@ -240,14 +223,14 @@ static int list_locales(sd_bus *bus, char **args, unsigned n) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read list of locales: %m");
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
         strv_print(l);
 
         return 0;
 }
 
 static int set_vconsole_keymap(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *map, *toggle_map;
         int r;
 
@@ -259,7 +242,7 @@ static int set_vconsole_keymap(sd_bus *bus, char **args, unsigned n) {
                 return -EINVAL;
         }
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         map = args[1];
         toggle_map = n > 2 ? args[2] : "";
@@ -279,70 +262,17 @@ static int set_vconsole_keymap(sd_bus *bus, char **args, unsigned n) {
         return r;
 }
 
-static Set *keymaps = NULL;
-
-static int nftw_cb(
-                const char *fpath,
-                const struct stat *sb,
-                int tflag,
-                struct FTW *ftwbuf) {
-
-        char *p, *e;
-        int r;
-
-        if (tflag != FTW_F)
-                return 0;
-
-        if (!endswith(fpath, ".map") &&
-            !endswith(fpath, ".map.gz"))
-                return 0;
-
-        p = strdup(basename(fpath));
-        if (!p)
-                return log_oom();
-
-        e = endswith(p, ".map");
-        if (e)
-                *e = 0;
-
-        e = endswith(p, ".map.gz");
-        if (e)
-                *e = 0;
-
-        r = set_consume(keymaps, p);
-        if (r < 0 && r != -EEXIST)
-                return log_error_errno(r, "Can't add keymap: %m");
-
-        return 0;
-}
-
 static int list_vconsole_keymaps(sd_bus *bus, char **args, unsigned n) {
         _cleanup_strv_free_ char **l = NULL;
-        const char *dir;
+        int r;
 
-        keymaps = set_new(&string_hash_ops);
-        if (!keymaps)
-                return log_oom();
+        assert(args);
 
-        NULSTR_FOREACH(dir, KBD_KEYMAP_DIRS)
-                nftw(dir, nftw_cb, 20, FTW_MOUNT|FTW_PHYS);
+        r = get_keymaps(&l);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read list of keymaps: %m");
 
-        l = set_get_strv(keymaps);
-        if (!l) {
-                set_free_free(keymaps);
-                return log_oom();
-        }
-
-        set_free(keymaps);
-
-        if (strv_isempty(l)) {
-                log_error("Couldn't find any console keymaps.");
-                return -ENOENT;
-        }
-
-        strv_sort(l);
-
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         strv_print(l);
 
@@ -350,7 +280,7 @@ static int list_vconsole_keymaps(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_x11_keymap(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *layout, *model, *variant, *options;
         int r;
 
@@ -362,7 +292,7 @@ static int set_x11_keymap(sd_bus *bus, char **args, unsigned n) {
                 return -EINVAL;
         }
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         layout = args[1];
         model = n > 2 ? args[2] : "";
@@ -467,9 +397,9 @@ static int list_x11_keymaps(sd_bus *bus, char **args, unsigned n) {
                 } else
                         *w = 0;
 
-                 r = strv_extend(&list, l);
-                 if (r < 0)
-                         return log_oom();
+                r = strv_extend(&list, l);
+                if (r < 0)
+                        return log_oom();
         }
 
         if (strv_isempty(list)) {
@@ -480,7 +410,7 @@ static int list_x11_keymaps(sd_bus *bus, char **args, unsigned n) {
         strv_sort(list);
         strv_uniq(list);
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         strv_print(list);
         return 0;
@@ -546,9 +476,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_NO_CONVERT:
                         arg_convert = false;
@@ -667,7 +595,7 @@ static int localectl_main(sd_bus *bus, int argc, char *argv[]) {
 }
 
 int main(int argc, char*argv[]) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");
@@ -678,7 +606,7 @@ int main(int argc, char*argv[]) {
         if (r <= 0)
                 goto finish;
 
-        r = bus_open_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to create bus connection: %m");
                 goto finish;
@@ -687,6 +615,9 @@ int main(int argc, char*argv[]) {
         r = localectl_main(bus, argc, argv);
 
 finish:
+        /* make sure we terminate the bus connection first, and then close the
+         * pager, see issue #3543 for the details. */
+        sd_bus_flush_close_unref(bus);
         pager_close();
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

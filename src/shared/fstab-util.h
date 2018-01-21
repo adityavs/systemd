@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,10 +22,13 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+
 #include "macro.h"
 
-int fstab_filter_options(const char *opts, const char *names,
-                         const char **namefound, char **value, char **filtered);
+int fstab_is_mount_point(const char *mount);
+int fstab_has_fstype(const char *fstype);
+
+int fstab_filter_options(const char *opts, const char *names, const char **namefound, char **value, char **filtered);
 
 int fstab_extract_values(const char *opts, const char *name, char ***values);
 
@@ -48,3 +50,5 @@ static inline bool fstab_test_yes_no_option(const char *opts, const char *yes_no
 
         return opt == yes_no;
 }
+
+char *fstab_node_to_udev_node(const char *p);

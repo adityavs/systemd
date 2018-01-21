@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,11 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "alloc-util.h"
 #include "fstab-util.h"
-#include "util.h"
 #include "log.h"
+#include "string-util.h"
+#include "util.h"
 
 /*
 int fstab_filter_options(const char *opts, const char *names,
@@ -131,8 +132,45 @@ static void test_fstab_yes_no_option(void) {
         assert_se(fstab_test_yes_no_option("nofail,nofail=0,fail=0", "nofail\0fail\0") == false);
 }
 
+static void test_fstab_node_to_udev_node(void) {
+        char *n;
+
+        n = fstab_node_to_udev_node("LABEL=applé/jack");
+        puts(n);
+        assert_se(streq(n, "/dev/disk/by-label/applé\\x2fjack"));
+        free(n);
+
+        n = fstab_node_to_udev_node("PARTLABEL=pinkié pie");
+        puts(n);
+        assert_se(streq(n, "/dev/disk/by-partlabel/pinkié\\x20pie"));
+        free(n);
+
+        n = fstab_node_to_udev_node("UUID=037b9d94-148e-4ee4-8d38-67bfe15bb535");
+        puts(n);
+        assert_se(streq(n, "/dev/disk/by-uuid/037b9d94-148e-4ee4-8d38-67bfe15bb535"));
+        free(n);
+
+        n = fstab_node_to_udev_node("PARTUUID=037b9d94-148e-4ee4-8d38-67bfe15bb535");
+        puts(n);
+        assert_se(streq(n, "/dev/disk/by-partuuid/037b9d94-148e-4ee4-8d38-67bfe15bb535"));
+        free(n);
+
+        n = fstab_node_to_udev_node("PONIES=awesome");
+        puts(n);
+        assert_se(streq(n, "PONIES=awesome"));
+        free(n);
+
+        n = fstab_node_to_udev_node("/dev/xda1");
+        puts(n);
+        assert_se(streq(n, "/dev/xda1"));
+        free(n);
+}
+
 int main(void) {
         test_fstab_filter_options();
         test_fstab_find_pri();
         test_fstab_yes_no_option();
+        test_fstab_node_to_udev_node();
+
+        return 0;
 }

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,10 +18,11 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "util.h"
+#include "alloc-util.h"
 #include "strbuf.h"
 
 /*
@@ -63,8 +63,7 @@ struct strbuf *strbuf_new(void) {
 err:
         free(str->buf);
         free(str->root);
-        free(str);
-        return NULL;
+        return mfree(str);
 }
 
 static void strbuf_node_cleanup(struct strbuf_node *node) {
@@ -122,7 +121,7 @@ static void bubbleinsert(struct strbuf_node *node,
                 sizeof(struct strbuf_child_entry) * (node->children_count - left));
         node->children[left] = new;
 
-        node->children_count ++;
+        node->children_count++;
 }
 
 /* add string, return the index/offset into the buffer */
@@ -157,8 +156,13 @@ ssize_t strbuf_add_string(struct strbuf *str, const char *s, size_t len) {
                         return off;
                 }
 
-                /* lookup child node */
                 c = s[len - 1 - depth];
+
+                /* bsearch is not allowed on a NULL sequence */
+                if (node->children_count == 0)
+                        break;
+
+                /* lookup child node */
                 search.c = c;
                 child = bsearch(&search, node->children, node->children_count,
                                 sizeof(struct strbuf_child_entry),

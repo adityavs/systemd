@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,14 +20,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <libmount.h>
 #include <stdbool.h>
 #include <stdio.h>
 
 #include "sd-bus.h"
 #include "sd-event.h"
-#include "fdset.h"
+
 #include "cgroup-util.h"
+#include "fdset.h"
 #include "hashmap.h"
+#include "ip-address-access.h"
 #include "list.h"
 #include "ratelimit.h"
 
@@ -68,11 +70,38 @@ typedef enum StatusType {
         STATUS_TYPE_EMERGENCY,
 } StatusType;
 
+typedef enum ManagerTimestamp {
+        MANAGER_TIMESTAMP_FIRMWARE,
+        MANAGER_TIMESTAMP_LOADER,
+        MANAGER_TIMESTAMP_KERNEL,
+        MANAGER_TIMESTAMP_INITRD,
+        MANAGER_TIMESTAMP_USERSPACE,
+        MANAGER_TIMESTAMP_FINISH,
+
+        MANAGER_TIMESTAMP_SECURITY_START,
+        MANAGER_TIMESTAMP_SECURITY_FINISH,
+        MANAGER_TIMESTAMP_GENERATORS_START,
+        MANAGER_TIMESTAMP_GENERATORS_FINISH,
+        MANAGER_TIMESTAMP_UNITS_LOAD_START,
+        MANAGER_TIMESTAMP_UNITS_LOAD_FINISH,
+        _MANAGER_TIMESTAMP_MAX,
+        _MANAGER_TIMESTAMP_INVALID = -1,
+} ManagerTimestamp;
+
+#include "execute.h"
 #include "job.h"
 #include "path-lookup.h"
-#include "execute.h"
-#include "unit-name.h"
 #include "show-status.h"
+#include "unit-name.h"
+
+enum {
+        /* 0 = run normally */
+        MANAGER_TEST_RUN_MINIMAL = 1,        /* run test w/o generators */
+        MANAGER_TEST_RUN_ENV_GENERATORS = 2, /* also run env generators  */
+        MANAGER_TEST_RUN_GENERATORS = 4,     /* also run unit generators */
+        MANAGER_TEST_FULL = MANAGER_TEST_RUN_ENV_GENERATORS | MANAGER_TEST_RUN_GENERATORS,
+};
+assert_cc((MANAGER_TEST_FULL & UINT8_MAX) == MANAGER_TEST_FULL);
 
 struct Manager {
         /* Note that the set of units we know of is allowed to be
@@ -81,6 +110,7 @@ struct Manager {
 
         /* Active jobs and units */
         Hashmap *units;  /* name string => Unit object n:1 */
+        Hashmap *units_by_invocation_id;
         Hashmap *jobs;   /* job id => Job object 1:1 */
 
         /* To make it easy to iterate through the units of a specific
@@ -103,11 +133,15 @@ struct Manager {
         /* Units to remove */
         LIST_HEAD(Unit, cleanup_queue);
 
-        /* Units to check when doing GC */
-        LIST_HEAD(Unit, gc_queue);
+        /* Units and jobs to check when doing GC */
+        LIST_HEAD(Unit, gc_unit_queue);
+        LIST_HEAD(Job, gc_job_queue);
 
         /* Units that should be realized */
-        LIST_HEAD(Unit, cgroup_queue);
+        LIST_HEAD(Unit, cgroup_realize_queue);
+
+        /* Units whose cgroup ran empty */
+        LIST_HEAD(Unit, cgroup_empty_queue);
 
         sd_event *event;
 
@@ -132,6 +166,9 @@ struct Manager {
         int notify_fd;
         sd_event_source *notify_event_source;
 
+        int cgroups_agent_fd;
+        sd_event_source *cgroups_agent_event_source;
+
         int signal_fd;
         sd_event_source *signal_event_source;
 
@@ -140,8 +177,10 @@ struct Manager {
 
         sd_event_source *jobs_in_progress_event_source;
 
-        unsigned n_snapshots;
+        int user_lookup_fds[2];
+        sd_event_source *user_lookup_event_source;
 
+        UnitFileScope unit_file_scope;
         LookupPaths lookup_paths;
         Set *unit_path_cache;
 
@@ -150,23 +189,7 @@ struct Manager {
         usec_t runtime_watchdog;
         usec_t shutdown_watchdog;
 
-        dual_timestamp firmware_timestamp;
-        dual_timestamp loader_timestamp;
-        dual_timestamp kernel_timestamp;
-        dual_timestamp initrd_timestamp;
-        dual_timestamp userspace_timestamp;
-        dual_timestamp finish_timestamp;
-
-        dual_timestamp security_start_timestamp;
-        dual_timestamp security_finish_timestamp;
-        dual_timestamp generators_start_timestamp;
-        dual_timestamp generators_finish_timestamp;
-        dual_timestamp units_load_start_timestamp;
-        dual_timestamp units_load_finish_timestamp;
-
-        char *generator_unit_path;
-        char *generator_unit_path_early;
-        char *generator_unit_path_late;
+        dual_timestamp timestamps[_MANAGER_TIMESTAMP_MAX];
 
         struct udev* udev;
 
@@ -176,10 +199,8 @@ struct Manager {
         Hashmap *devices_by_sysfs;
 
         /* Data specific to the mount subsystem */
-        FILE *proc_self_mountinfo;
+        struct libmnt_monitor *mount_monitor;
         sd_event_source *mount_event_source;
-        int utab_inotify_fd;
-        sd_event_source *mount_utab_event_source;
 
         /* Data specific to the swap filesystem */
         FILE *proc_swaps;
@@ -215,30 +236,46 @@ struct Manager {
 
         /* Data specific to the cgroup subsystem */
         Hashmap *cgroup_unit;
-        CGroupControllerMask cgroup_supported;
+        CGroupMask cgroup_supported;
         char *cgroup_root;
 
-        int gc_marker;
-        unsigned n_in_gc_queue;
+        /* Notifications from cgroups, when the unified hierarchy is used is done via inotify. */
+        int cgroup_inotify_fd;
+        sd_event_source *cgroup_inotify_event_source;
+        Hashmap *cgroup_inotify_wd_unit;
+
+        /* A defer event for handling cgroup empty events and processing them after SIGCHLD in all cases. */
+        sd_event_source *cgroup_empty_event_source;
 
         /* Make sure the user cannot accidentally unmount our cgroup
          * file system */
         int pin_cgroupfs_fd;
 
+        unsigned gc_marker;
+
         /* Flags */
-        ManagerRunningAs running_as;
         ManagerExitCode exit_code:5;
 
         bool dispatching_load_queue:1;
         bool dispatching_dbus_queue:1;
 
         bool taint_usr:1;
-        bool first_boot:1;
 
-        bool test_run:1;
+        /* Have we already sent out the READY=1 notification? */
+        bool ready_sent:1;
+
+        /* Have we already printed the taint line if necessary? */
+        bool taint_logged:1;
+
+        unsigned test_run_flags:8;
+
+        /* If non-zero, exit with the following value when the systemd
+         * process terminate. Useful for containers: systemd-nspawn could get
+         * the return value. */
+        uint8_t return_value;
 
         ShowStatus show_status;
-        bool confirm_spawn;
+        char *confirm_spawn;
         bool no_console_output;
 
         ExecOutput default_std_output, default_std_error;
@@ -250,8 +287,12 @@ struct Manager {
 
         bool default_cpu_accounting;
         bool default_memory_accounting;
+        bool default_io_accounting;
         bool default_blockio_accounting;
+        bool default_tasks_accounting;
+        bool default_ip_accounting;
 
+        uint64_t default_tasks_max;
         usec_t default_timer_accuracy_usec;
 
         struct rlimit *rlimit[_RLIMIT_MAX];
@@ -284,29 +325,47 @@ struct Manager {
          * value where Unit objects are contained. */
         Hashmap *units_requiring_mounts_for;
 
-        /* Reference to the kdbus bus control fd */
-        int kdbus_fd;
-
         /* Used for processing polkit authorization responses */
         Hashmap *polkit_registry;
 
-        /* When the user hits C-A-D more than 7 times per 2s, reboot immediately... */
+        /* Dynamic users/groups, indexed by their name */
+        Hashmap *dynamic_users;
+
+        /* Keep track of all UIDs and GIDs any of our services currently use. This is useful for the RemoveIPC= logic. */
+        Hashmap *uid_refs;
+        Hashmap *gid_refs;
+
+        /* When the user hits C-A-D more than 7 times per 2s, do something immediately... */
         RateLimit ctrl_alt_del_ratelimit;
+        EmergencyAction cad_burst_action;
 
         const char *unit_log_field;
         const char *unit_log_format_string;
+
+        const char *invocation_log_field;
+        const char *invocation_log_format_string;
+
+        int first_boot; /* tri-state */
+
+        /* prefixes of e.g. RuntimeDirectory= */
+        char *prefix[_EXEC_DIRECTORY_TYPE_MAX];
 };
 
-int manager_new(ManagerRunningAs running_as, bool test_run, Manager **m);
+#define MANAGER_IS_SYSTEM(m) ((m)->unit_file_scope == UNIT_FILE_SYSTEM)
+#define MANAGER_IS_USER(m) ((m)->unit_file_scope != UNIT_FILE_SYSTEM)
+
+#define MANAGER_IS_RELOADING(m) ((m)->n_reloading > 0)
+
+#define MANAGER_IS_FINISHED(m) (dual_timestamp_is_set((m)->timestamps + MANAGER_TIMESTAMP_FINISH))
+
+int manager_new(UnitFileScope scope, unsigned test_run_flags, Manager **m);
 Manager* manager_free(Manager *m);
 
-int manager_enumerate(Manager *m);
+void manager_enumerate(Manager *m);
 int manager_startup(Manager *m, FILE *serialization, FDSet *fds);
 
 Job *manager_get_job(Manager *m, uint32_t id);
 Unit *manager_get_unit(Manager *m, const char *name);
-
-int manager_get_unit_by_path(Manager *m, const char *path, const char *suffix, Unit **_found);
 
 int manager_get_job_from_dbus_path(Manager *m, const char *s, Job **_j);
 
@@ -314,11 +373,15 @@ int manager_load_unit_prepare(Manager *m, const char *name, const char *path, sd
 int manager_load_unit(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **_ret);
 int manager_load_unit_from_dbus_path(Manager *m, const char *s, sd_bus_error *e, Unit **_u);
 
-int manager_add_job(Manager *m, JobType type, Unit *unit, JobMode mode, bool force, sd_bus_error *e, Job **_ret);
-int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, bool force, sd_bus_error *e, Job **_ret);
+int manager_add_job(Manager *m, JobType type, Unit *unit, JobMode mode, sd_bus_error *e, Job **_ret);
+int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, sd_bus_error *e, Job **_ret);
+int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Job **ret);
+int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error *e);
 
 void manager_dump_units(Manager *s, FILE *f, const char *prefix);
 void manager_dump_jobs(Manager *s, FILE *f, const char *prefix);
+void manager_dump(Manager *s, FILE *f, const char *prefix);
+int manager_get_dump_string(Manager *m, char **ret);
 
 void manager_clear_jobs(Manager *m);
 
@@ -329,16 +392,12 @@ int manager_set_default_rlimits(Manager *m, struct rlimit **default_rlimit);
 
 int manager_loop(Manager *m);
 
-void manager_dispatch_bus_name_owner_changed(Manager *m, const char *name, const char* old_owner, const char *new_owner);
-
 int manager_open_serialization(Manager *m, FILE **_f);
 
 int manager_serialize(Manager *m, FILE *f, FDSet *fds, bool switching_root);
 int manager_deserialize(Manager *m, FILE *f, FDSet *fds);
 
 int manager_reload(Manager *m);
-
-bool manager_is_reloading_or_reexecuting(Manager *m) _pure_;
 
 void manager_reset_failed(Manager *m);
 
@@ -359,11 +418,35 @@ void manager_flip_auto_status(Manager *m, bool enable);
 
 Set *manager_get_units_requiring_mounts_for(Manager *m, const char *path);
 
-const char *manager_get_runtime_prefix(Manager *m);
+void manager_set_exec_params(Manager *m, ExecParameters *p);
 
 ManagerState manager_state(Manager *m);
 
-void manager_update_failed_units(Manager *m, Unit *u, bool failed);
+int manager_update_failed_units(Manager *m, Unit *u, bool failed);
+
+void manager_unref_uid(Manager *m, uid_t uid, bool destroy_now);
+int manager_ref_uid(Manager *m, uid_t uid, bool clean_ipc);
+
+void manager_unref_gid(Manager *m, gid_t gid, bool destroy_now);
+int manager_ref_gid(Manager *m, gid_t gid, bool destroy_now);
+
+void manager_vacuum_uid_refs(Manager *m);
+void manager_vacuum_gid_refs(Manager *m);
+
+void manager_serialize_uid_refs(Manager *m, FILE *f);
+void manager_deserialize_uid_refs_one(Manager *m, const char *value);
+
+void manager_serialize_gid_refs(Manager *m, FILE *f);
+void manager_deserialize_gid_refs_one(Manager *m, const char *value);
+
+char *manager_taint_string(Manager *m);
 
 const char *manager_state_to_string(ManagerState m) _const_;
 ManagerState manager_state_from_string(const char *s) _pure_;
+
+const char *manager_get_confirm_spawn(Manager *m);
+bool manager_is_confirm_spawn_disabled(Manager *m);
+void manager_disable_confirm_spawn(void);
+
+const char *manager_timestamp_to_string(ManagerTimestamp m) _const_;
+ManagerTimestamp manager_timestamp_from_string(const char *s) _pure_;

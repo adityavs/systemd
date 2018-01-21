@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,12 +18,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "alloc-util.h"
 #include "macro.h"
-#include "util.h"
 #include "replace-var.h"
-#include "def.h"
+#include "string-util.h"
 
 /*
  * Generic infrastructure for replacing @FOO@ style variables in
@@ -53,7 +55,7 @@ static int get_variable(const char *b, char **r) {
         return 1;
 }
 
-char *replace_var(const char *text, char *(*lookup)(const char *variable, void*userdata), void *userdata) {
+char *replace_var(const char *text, char *(*lookup)(const char *variable, void *userdata), void *userdata) {
         char *r, *t;
         const char *f;
         size_t l;
@@ -106,6 +108,5 @@ char *replace_var(const char *text, char *(*lookup)(const char *variable, void*u
         return r;
 
 oom:
-        free(r);
-        return NULL;
+        return mfree(r);
 }

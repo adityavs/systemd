@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -24,25 +23,7 @@
 typedef struct Mount Mount;
 
 #include "kill.h"
-#include "execute.h"
-
-typedef enum MountState {
-        MOUNT_DEAD,
-        MOUNT_MOUNTING,               /* /usr/bin/mount is running, but the mount is not done yet. */
-        MOUNT_MOUNTING_DONE,          /* /usr/bin/mount is running, and the mount is done. */
-        MOUNT_MOUNTED,
-        MOUNT_REMOUNTING,
-        MOUNT_UNMOUNTING,
-        MOUNT_MOUNTING_SIGTERM,
-        MOUNT_MOUNTING_SIGKILL,
-        MOUNT_REMOUNTING_SIGTERM,
-        MOUNT_REMOUNTING_SIGKILL,
-        MOUNT_UNMOUNTING_SIGTERM,
-        MOUNT_UNMOUNTING_SIGKILL,
-        MOUNT_FAILED,
-        _MOUNT_STATE_MAX,
-        _MOUNT_STATE_INVALID = -1
-} MountState;
+#include "dynamic-user.h"
 
 typedef enum MountExecCommand {
         MOUNT_EXEC_MOUNT,
@@ -59,6 +40,7 @@ typedef enum MountResult {
         MOUNT_FAILURE_EXIT_CODE,
         MOUNT_FAILURE_SIGNAL,
         MOUNT_FAILURE_CORE_DUMP,
+        MOUNT_FAILURE_START_LIMIT_HIT,
         _MOUNT_RESULT_MAX,
         _MOUNT_RESULT_INVALID = -1
 } MountResult;
@@ -86,9 +68,10 @@ struct Mount {
         bool just_mounted:1;
         bool just_changed:1;
 
-        bool reset_cpu_usage:1;
-
         bool sloppy_options;
+
+        bool lazy_unmount;
+        bool force_unmount;
 
         MountResult result;
         MountResult reload_result;
@@ -104,6 +87,7 @@ struct Mount {
         CGroupContext cgroup_context;
 
         ExecRuntime *exec_runtime;
+        DynamicCreds dynamic_creds;
 
         MountState state, deserialized_state;
 
@@ -119,9 +103,6 @@ struct Mount {
 extern const UnitVTable mount_vtable;
 
 void mount_fd_event(Manager *m, int events);
-
-const char* mount_state_to_string(MountState i) _const_;
-MountState mount_state_from_string(const char *s) _pure_;
 
 const char* mount_exec_command_to_string(MountExecCommand i) _const_;
 MountExecCommand mount_exec_command_from_string(const char *s) _pure_;

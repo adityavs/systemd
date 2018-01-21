@@ -1,4 +1,5 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
 
 /***
   This file is part of systemd.
@@ -20,80 +21,36 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#pragma once
+#include "sd-event.h"
+#include "sd-lldp.h"
 
+#include "hashmap.h"
 #include "log.h"
-#include "list.h"
-#include "refcnt.h"
-#include "lldp-tlv.h"
 #include "prioq.h"
 
-typedef struct lldp_neighbour_port lldp_neighbour_port;
-typedef struct lldp_chassis lldp_chassis;
-typedef struct lldp_chassis_id lldp_chassis_id;
-typedef struct lldp_agent_statistics lldp_agent_statistics;
+struct sd_lldp {
+        unsigned n_ref;
 
-struct lldp_neighbour_port {
-        uint8_t type;
-        uint8_t *data;
+        int ifindex;
+        int fd;
 
-        uint16_t length;
-        usec_t until;
+        sd_event *event;
+        int64_t event_priority;
+        sd_event_source *io_event_source;
+        sd_event_source *timer_event_source;
 
-        unsigned prioq_idx;
+        Prioq *neighbor_by_expiry;
+        Hashmap *neighbor_by_id;
 
-        lldp_chassis *c;
-        tlv_packet *packet;
+        uint64_t neighbors_max;
 
-        LIST_FIELDS(lldp_neighbour_port, port);
+        sd_lldp_callback_t callback;
+        void *userdata;
+
+        uint16_t capability_mask;
+
+        struct ether_addr filter_address;
 };
 
-int lldp_neighbour_port_new(lldp_chassis *c, tlv_packet *tlv, lldp_neighbour_port **ret);
-void lldp_neighbour_port_free(lldp_neighbour_port *p);
-void lldp_neighbour_port_remove_and_free(lldp_neighbour_port *p);
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(lldp_neighbour_port *, lldp_neighbour_port_free);
-#define _cleanup_lldp_neighbour_port_free_ _cleanup_(lldp_neighbour_port_freep)
-
-struct lldp_chassis_id {
-        uint8_t type;
-        uint16_t length;
-
-        uint8_t *data;
-};
-
-struct lldp_chassis {
-        RefCount n_ref;
-
-        lldp_chassis_id chassis_id;
-
-        Prioq *by_expiry;
-        Hashmap *neighbour_mib;
-
-        LIST_HEAD(lldp_neighbour_port, ports);
-};
-
-int lldp_chassis_new(tlv_packet *tlv,
-                     Prioq *by_expiry,
-                     Hashmap *neighbour_mib,
-                     lldp_chassis **ret);
-
-void lldp_chassis_free(lldp_chassis *c);
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(lldp_chassis *, lldp_chassis_free);
-#define _cleanup_lldp_chassis_free_ _cleanup_(lldp_chassis_freep)
-
-int lldp_mib_update_objects(lldp_chassis *c, tlv_packet *tlv);
-int lldp_mib_add_objects(Prioq *by_expiry, Hashmap *neighbour_mib, tlv_packet *tlv);
-int lldp_mib_remove_objects(lldp_chassis *c, tlv_packet *tlv);
-
-int lldp_read_chassis_id(tlv_packet *tlv, uint8_t *type, uint16_t *length, uint8_t **data);
-int lldp_read_port_id(tlv_packet *tlv, uint8_t *type, uint16_t *length, uint8_t **data);
-int lldp_read_ttl(tlv_packet *tlv, uint16_t *ttl);
-int lldp_read_system_name(tlv_packet *tlv, uint16_t *length, char **data);
-int lldp_read_system_description(tlv_packet *tlv, uint16_t *length, char **data);
-int lldp_read_system_capability(tlv_packet *tlv, uint16_t *data);
-int lldp_read_port_description(tlv_packet *tlv, uint16_t *length, char **data);
-
-int lldp_handle_packet(tlv_packet *m, uint16_t length);
-#define log_lldp(fmt, ...) log_internal(LOG_DEBUG, 0, __FILE__, __LINE__, __func__, "LLDP: " fmt, ##__VA_ARGS__)
+#define log_lldp_errno(error, fmt, ...) log_internal(LOG_DEBUG, error, __FILE__, __LINE__, __func__, "LLDP: " fmt, ##__VA_ARGS__)
+#define log_lldp(fmt, ...) log_lldp_errno(0, fmt, ##__VA_ARGS__)

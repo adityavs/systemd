@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,9 +21,10 @@
 ***/
 
 #include "sd-bus.h"
-#include "unit.h"
+
 #include "kill.h"
+#include "unit.h"
 
 extern const sd_bus_vtable bus_kill_vtable[];
 
-int bus_kill_context_set_transient_property(Unit *u, KillContext *c, const char *name, sd_bus_message *message, UnitSetPropertiesMode mode, sd_bus_error *error);
+int bus_kill_context_set_transient_property(Unit *u, KillContext *c, const char *name, sd_bus_message *message, UnitWriteFlags flags, sd_bus_error *error);

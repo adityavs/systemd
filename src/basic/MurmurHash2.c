@@ -15,6 +15,10 @@
 
 #include "MurmurHash2.h"
 
+#if __GNUC__ >= 7
+_Pragma("GCC diagnostic ignored \"-Wimplicit-fallthrough\"")
+#endif
+
 //-----------------------------------------------------------------------------
 // Platform-specific functions and macros
 
@@ -50,7 +54,7 @@ uint32_t MurmurHash2 ( const void * key, int len, uint32_t seed )
 
   const unsigned char * data = (const unsigned char *)key;
 
-  while(len >= 4)
+  while (len >= 4)
   {
     uint32_t k = *(uint32_t*)data;
 
@@ -69,9 +73,9 @@ uint32_t MurmurHash2 ( const void * key, int len, uint32_t seed )
 
   switch(len)
   {
-  case 3: h ^= data[2] << 16;
-  case 2: h ^= data[1] << 8;
-  case 1: h ^= data[0];
+  case 3: h ^= data[2] << 16; /* fall through */
+  case 2: h ^= data[1] << 8;  /* fall through */
+  case 1: h ^= data[0];       /* fall through */
       h *= m;
   };
 

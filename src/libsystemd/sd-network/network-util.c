@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "strv.h"
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "network-util.h"
+#include "strv.h"
 
 bool network_is_online(void) {
         _cleanup_free_ char *state = NULL;

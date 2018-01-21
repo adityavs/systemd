@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,19 +18,19 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
 #include <signal.h>
+#include <stdlib.h>
 
 #include "exit-status.h"
-#include "set.h"
 #include "macro.h"
+#include "set.h"
 
-const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) {
+const char* exit_status_to_string(int status, ExitStatusLevel level) {
 
         /* We cast to int here, so that -Wenum doesn't complain that
          * EXIT_SUCCESS/EXIT_FAILURE aren't in the enum */
 
-        switch ((int) status) {
+        switch (status) {
 
         case EXIT_SUCCESS:
                 return "SUCCESS";
@@ -40,9 +39,8 @@ const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) {
                 return "FAILURE";
         }
 
-
-        if (level == EXIT_STATUS_SYSTEMD || level == EXIT_STATUS_LSB) {
-                switch ((int) status) {
+        if (IN_SET(level, EXIT_STATUS_SYSTEMD, EXIT_STATUS_LSB)) {
+                switch (status) {
 
                 case EXIT_CHDIR:
                         return "CHDIR";
@@ -146,16 +144,28 @@ const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) {
                 case EXIT_CHOWN:
                         return "CHOWN";
 
-                case EXIT_MAKE_STARTER:
-                        return "MAKE_STARTER";
+                case EXIT_SMACK_PROCESS_LABEL:
+                        return "SMACK_PROCESS_LABEL";
 
-                case EXIT_BUS_ENDPOINT:
-                        return "BUS_ENDPOINT";
+                case EXIT_KEYRING:
+                        return "KEYRING";
+
+                case EXIT_STATE_DIRECTORY:
+                        return "STATE_DIRECTORY";
+
+                case EXIT_CACHE_DIRECTORY:
+                        return "CACHE_DIRECTORY";
+
+                case EXIT_LOGS_DIRECTORY:
+                        return "LOGS_DIRECTORY";
+
+                case EXIT_CONFIGURATION_DIRECTORY:
+                        return "CONFIGURATION_DIRECTORY";
                 }
         }
 
         if (level == EXIT_STATUS_LSB) {
-                switch ((int) status) {
+                switch (status) {
 
                 case EXIT_INVALIDARGUMENT:
                         return "INVALIDARGUMENT";
@@ -180,44 +190,28 @@ const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) {
         return NULL;
 }
 
-
-bool is_clean_exit(int code, int status, ExitStatusSet *success_status) {
+bool is_clean_exit(int code, int status, ExitClean clean, ExitStatusSet *success_status) {
 
         if (code == CLD_EXITED)
                 return status == 0 ||
                        (success_status &&
                        set_contains(success_status->status, INT_TO_PTR(status)));
 
-        /* If a daemon does not implement handlers for some of the
-         * signals that's not considered an unclean shutdown */
+        /* If a daemon does not implement handlers for some of the signals that's not considered an unclean shutdown */
         if (code == CLD_KILLED)
                 return
-                        status == SIGHUP ||
-                        status == SIGINT ||
-                        status == SIGTERM ||
-                        status == SIGPIPE ||
+                        (clean == EXIT_CLEAN_DAEMON && IN_SET(status, SIGHUP, SIGINT, SIGTERM, SIGPIPE)) ||
                         (success_status &&
-                        set_contains(success_status->signal, INT_TO_PTR(status)));
+                         set_contains(success_status->signal, INT_TO_PTR(status)));
 
         return false;
-}
-
-bool is_clean_exit_lsb(int code, int status, ExitStatusSet *success_status) {
-
-        if (is_clean_exit(code, status, success_status))
-                return true;
-
-        return
-                code == CLD_EXITED &&
-                (status == EXIT_NOTINSTALLED || status == EXIT_NOTCONFIGURED);
 }
 
 void exit_status_set_free(ExitStatusSet *x) {
         assert(x);
 
-        set_free(x->status);
-        set_free(x->signal);
-        x->status = x->signal = NULL;
+        x->status = set_free(x->status);
+        x->signal = set_free(x->signal);
 }
 
 bool exit_status_set_is_empty(ExitStatusSet *x) {

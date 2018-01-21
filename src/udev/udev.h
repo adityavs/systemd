@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
+#pragma once
+
 /*
  * Copyright (C) 2003 Greg Kroah-Hartman <greg@kroah.com>
  * Copyright (C) 2003-2010 Kay Sievers <kay@vrfy.org>
@@ -16,18 +19,18 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#pragma once
-
-#include <sys/types.h>
 #include <sys/param.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 
-#include "macro.h"
-#include "sd-netlink.h"
 #include "libudev.h"
-#include "libudev-private.h"
-#include "util.h"
+#include "sd-netlink.h"
+
 #include "label.h"
+#include "libudev-private.h"
+#include "macro.h"
 #include "strv.h"
+#include "util.h"
 
 struct udev_event {
         struct udev *udev;
@@ -70,23 +73,24 @@ struct udev_rules;
 struct udev_rules *udev_rules_new(struct udev *udev, int resolve_names);
 struct udev_rules *udev_rules_unref(struct udev_rules *rules);
 bool udev_rules_check_timestamp(struct udev_rules *rules);
-int udev_rules_apply_to_event(struct udev_rules *rules, struct udev_event *event,
-                              usec_t timeout_usec, usec_t timeout_warn_usec,
-                              struct udev_list *properties_list);
+void udev_rules_apply_to_event(struct udev_rules *rules, struct udev_event *event,
+                               usec_t timeout_usec, usec_t timeout_warn_usec,
+                               struct udev_list *properties_list);
 int udev_rules_apply_static_dev_perms(struct udev_rules *rules);
 
 /* udev-event.c */
 struct udev_event *udev_event_new(struct udev_device *dev);
 void udev_event_unref(struct udev_event *event);
-size_t udev_event_apply_format(struct udev_event *event, const char *src, char *dest, size_t size);
+size_t udev_event_apply_format(struct udev_event *event,
+                               const char *src, char *dest, size_t size,
+                               bool replace_whitespace);
 int udev_event_apply_subsys_kernel(struct udev_event *event, const char *string,
                                    char *result, size_t maxsize, int read_value);
 int udev_event_spawn(struct udev_event *event,
                      usec_t timeout_usec,
                      usec_t timeout_warn_usec,
                      bool accept_failure,
-                     const char *cmd, char **envp,
-                     char *result, size_t ressize);
+                     const char *cmd, char *result, size_t ressize);
 void udev_event_execute_rules(struct udev_event *event,
                               usec_t timeout_usec, usec_t timeout_warn_usec,
                               struct udev_list *properties_list,
@@ -143,21 +147,21 @@ int udev_ctrl_get_set_children_max(struct udev_ctrl_msg *ctrl_msg);
 
 /* built-in commands */
 enum udev_builtin_cmd {
-#ifdef HAVE_BLKID
+#if HAVE_BLKID
         UDEV_BUILTIN_BLKID,
 #endif
         UDEV_BUILTIN_BTRFS,
         UDEV_BUILTIN_HWDB,
         UDEV_BUILTIN_INPUT_ID,
         UDEV_BUILTIN_KEYBOARD,
-#ifdef HAVE_KMOD
+#if HAVE_KMOD
         UDEV_BUILTIN_KMOD,
 #endif
         UDEV_BUILTIN_NET_ID,
         UDEV_BUILTIN_NET_LINK,
         UDEV_BUILTIN_PATH_ID,
         UDEV_BUILTIN_USB_ID,
-#ifdef HAVE_ACL
+#if HAVE_ACL
         UDEV_BUILTIN_UACCESS,
 #endif
         UDEV_BUILTIN_MAX
@@ -171,14 +175,14 @@ struct udev_builtin {
         bool (*validate)(struct udev *udev);
         bool run_once;
 };
-#ifdef HAVE_BLKID
+#if HAVE_BLKID
 extern const struct udev_builtin udev_builtin_blkid;
 #endif
 extern const struct udev_builtin udev_builtin_btrfs;
 extern const struct udev_builtin udev_builtin_hwdb;
 extern const struct udev_builtin udev_builtin_input_id;
 extern const struct udev_builtin udev_builtin_keyboard;
-#ifdef HAVE_KMOD
+#if HAVE_KMOD
 extern const struct udev_builtin udev_builtin_kmod;
 #endif
 extern const struct udev_builtin udev_builtin_net_id;

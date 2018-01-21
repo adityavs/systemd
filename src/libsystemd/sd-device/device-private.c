@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,25 +20,31 @@
 ***/
 
 #include <ctype.h>
-#include <sys/types.h>
 #include <net/if.h>
-
-#include "util.h"
-#include "macro.h"
-#include "refcnt.h"
-#include "path-util.h"
-#include "strxcpyx.h"
-#include "fileio.h"
-#include "hashmap.h"
-#include "set.h"
-#include "strv.h"
-#include "mkdir.h"
+#include <sys/types.h>
 
 #include "sd-device.h"
 
-#include "device-util.h"
+#include "alloc-util.h"
 #include "device-internal.h"
 #include "device-private.h"
+#include "device-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
+#include "hashmap.h"
+#include "macro.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "refcnt.h"
+#include "set.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "strv.h"
+#include "strxcpyx.h"
+#include "user-util.h"
+#include "util.h"
 
 int device_add_property(sd_device *device, const char *key, const char *value) {
         int r;
@@ -200,10 +207,8 @@ static int device_read_db(sd_device *device) {
         if (r < 0) {
                 if (r == -ENOENT)
                         return 0;
-                else {
-                        log_debug("sd-device: failed to read db '%s': %s", path, strerror(-r));
-                        return r;
-                }
+                else
+                        return log_debug_errno(r, "sd-device: failed to read db '%s': %m", path);
         }
 
         /* devices with a database entry are initialized */
@@ -247,7 +252,7 @@ static int device_read_db(sd_device *device) {
                                 db[i] = '\0';
                                 r = handle_db_line(device, key, value);
                                 if (r < 0)
-                                        log_debug("sd-device: failed to handle db entry '%c:%s': %s", key, value, strerror(-r));
+                                        log_debug_errno(r, "sd-device: failed to handle db entry '%c:%s': %m", key, value);
 
                                 state = PRE_KEY;
                         }
@@ -462,6 +467,8 @@ static const char* const device_action_table[_DEVICE_ACTION_MAX] = {
         [DEVICE_ACTION_MOVE] = "move",
         [DEVICE_ACTION_ONLINE] = "online",
         [DEVICE_ACTION_OFFLINE] = "offline",
+        [DEVICE_ACTION_BIND] = "bind",
+        [DEVICE_ACTION_UNBIND] = "unbind",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(device_action, DeviceAction);
@@ -549,7 +556,7 @@ static int device_verify(sd_device *device, DeviceAction action, uint64_t seqnum
 }
 
 int device_new_from_strv(sd_device **ret, char **strv) {
-        _cleanup_device_unref_ sd_device *device = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         char **key;
         const char *major = NULL, *minor = NULL;
         DeviceAction action = _DEVICE_ACTION_INVALID;
@@ -586,7 +593,7 @@ int device_new_from_strv(sd_device **ret, char **strv) {
 }
 
 int device_new_from_nulstr(sd_device **ret, uint8_t *nulstr, size_t len) {
-        _cleanup_device_unref_ sd_device *device = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         const char *major = NULL, *minor = NULL;
         DeviceAction action = _DEVICE_ACTION_INVALID;
         uint64_t seqnum;
@@ -671,13 +678,9 @@ static int device_update_properties_bufs(sd_device *device) {
                 i++;
         }
 
-        free(device->properties_nulstr);
-        device->properties_nulstr = buf_nulstr;
-        buf_nulstr = NULL;
+        free_and_replace(device->properties_nulstr, buf_nulstr);
         device->properties_nulstr_len = nulstr_len;
-        free(device->properties_strv);
-        device->properties_strv = buf_strv;
-        buf_strv = NULL;
+        free_and_replace(device->properties_strv, buf_strv);
 
         device->properties_buf_outdated = false;
 
@@ -774,12 +777,12 @@ int device_rename(sd_device *device, const char *name) {
 
         r = sd_device_get_property_value(device, "INTERFACE", &interface);
         if (r >= 0) {
-                r = device_add_property_internal(device, "INTERFACE", name);
+                /* like DEVPATH_OLD, INTERFACE_OLD is not saved to the db, but only stays around for the current event */
+                r = device_add_property_internal(device, "INTERFACE_OLD", interface);
                 if (r < 0)
                         return r;
 
-                /* like DEVPATH_OLD, INTERFACE_OLD is not saved to the db, but only stays around for the current event */
-                r = device_add_property_internal(device, "INTERFACE_OLD", interface);
+                r = device_add_property_internal(device, "INTERFACE", name);
                 if (r < 0)
                         return r;
         } else if (r != -ENOENT)
@@ -789,7 +792,7 @@ int device_rename(sd_device *device, const char *name) {
 }
 
 int device_shallow_clone(sd_device *old_device, sd_device **new_device) {
-        _cleanup_device_unref_ sd_device *ret = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *ret = NULL;
         int r;
 
         assert(old_device);
@@ -816,7 +819,7 @@ int device_shallow_clone(sd_device *old_device, sd_device **new_device) {
 }
 
 int device_clone_with_db(sd_device *old_device, sd_device **new_device) {
-        _cleanup_device_unref_ sd_device *ret = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *ret = NULL;
         int r;
 
         assert(old_device);
@@ -839,7 +842,7 @@ int device_clone_with_db(sd_device *old_device, sd_device **new_device) {
 }
 
 int device_new_from_synthetic_event(sd_device **new_device, const char *syspath, const char *action) {
-        _cleanup_device_unref_ sd_device *ret = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *ret = NULL;
         int r;
 
         assert(new_device);
@@ -886,7 +889,7 @@ void device_cleanup_tags(sd_device *device) {
         set_free_free(device->tags);
         device->tags = NULL;
         device->property_tags_outdated = true;
-        device->tags_generation ++;
+        device->tags_generation++;
 }
 
 void device_cleanup_devlinks(sd_device *device) {
@@ -895,7 +898,7 @@ void device_cleanup_devlinks(sd_device *device) {
         set_free_free(device->devlinks);
         device->devlinks = NULL;
         device->property_devlinks_outdated = true;
-        device->devlinks_generation ++;
+        device->devlinks_generation++;
 }
 
 void device_remove_tag(sd_device *device, const char *tag) {
@@ -904,7 +907,7 @@ void device_remove_tag(sd_device *device, const char *tag) {
 
         free(set_remove(device->tags, tag));
         device->property_tags_outdated = true;
-        device->tags_generation ++;
+        device->tags_generation++;
 }
 
 static int device_tag(sd_device *device, const char *tag, bool add) {
@@ -1047,7 +1050,7 @@ int device_update_db(sd_device *device) {
                         const char *devlink;
 
                         FOREACH_DEVICE_DEVLINK(device, devlink)
-                                fprintf(f, "S:%s\n", devlink + strlen("/dev/"));
+                                fprintf(f, "S:%s\n", devlink + STRLEN("/dev/"));
 
                         if (device->devlink_priority != 0)
                                 fprintf(f, "L:%i\n", device->devlink_priority);
@@ -1082,12 +1085,10 @@ int device_update_db(sd_device *device) {
         return 0;
 
 fail:
-        log_error_errno(r, "failed to create %s file '%s' for '%s'", has_info ? "db" : "empty",
-                        path, device->devpath);
-        unlink(path);
-        unlink(path_tmp);
+        (void) unlink(path);
+        (void) unlink(path_tmp);
 
-        return r;
+        return log_error_errno(r, "failed to create %s file '%s' for '%s'", has_info ? "db" : "empty", path, device->devpath);
 }
 
 int device_delete_db(sd_device *device) {

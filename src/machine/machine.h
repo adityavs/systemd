@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,11 +21,11 @@
 ***/
 
 typedef struct Machine Machine;
-typedef struct MachineOperation MachineOperation;
 typedef enum KillWho KillWho;
 
 #include "list.h"
 #include "machined.h"
+#include "operation.h"
 
 typedef enum MachineState {
         MACHINE_OPENING,    /* Machine is being registered */
@@ -39,6 +38,7 @@ typedef enum MachineState {
 typedef enum MachineClass {
         MACHINE_CONTAINER,
         MACHINE_VM,
+        MACHINE_HOST,
         _MACHINE_CLASS_MAX,
         _MACHINE_CLASS_INVALID = -1
 } MachineClass;
@@ -50,24 +50,12 @@ enum KillWho {
         _KILL_WHO_INVALID = -1
 };
 
-#define MACHINE_OPERATIONS_MAX 64
-
-struct MachineOperation {
-        Machine *machine;
-        pid_t pid;
-        sd_bus_message *message;
-        int errno_fd;
-        sd_event_source *event_source;
-        LIST_FIELDS(MachineOperation, operations);
-};
-
 struct Machine {
         Manager *manager;
 
         char *name;
         sd_id128_t id;
 
-        MachineState state;
         MachineClass class;
 
         char *state_file;
@@ -83,24 +71,25 @@ struct Machine {
 
         bool in_gc_queue:1;
         bool started:1;
+        bool stopping:1;
 
         sd_bus_message *create_message;
 
         int *netif;
         unsigned n_netif;
 
-        LIST_FIELDS(Machine, gc_queue);
+        LIST_HEAD(Operation, operations);
 
-        MachineOperation *operations;
-        unsigned n_operations;
+        LIST_FIELDS(Machine, gc_queue);
 };
 
-Machine* machine_new(Manager *manager, const char *name);
+Machine* machine_new(Manager *manager, MachineClass class, const char *name);
 void machine_free(Machine *m);
 bool machine_check_gc(Machine *m, bool drop_not_started);
 void machine_add_to_gc_queue(Machine *m);
 int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error);
 int machine_stop(Machine *m);
+int machine_finalize(Machine *m);
 int machine_save(Machine *m);
 int machine_load(Machine *m);
 int machine_kill(Machine *m, KillWho who, int signo);
@@ -108,8 +97,6 @@ int machine_kill(Machine *m, KillWho who, int signo);
 void machine_release_unit(Machine *m);
 
 MachineState machine_get_state(Machine *u);
-
-MachineOperation *machine_operation_unref(MachineOperation *o);
 
 const char* machine_class_to_string(MachineClass t) _const_;
 MachineClass machine_class_from_string(const char *s) _pure_;
@@ -119,3 +106,8 @@ MachineState machine_state_from_string(const char *s) _pure_;
 
 const char *kill_who_to_string(KillWho k) _const_;
 KillWho kill_who_from_string(const char *s) _pure_;
+
+int machine_openpt(Machine *m, int flags);
+int machine_open_terminal(Machine *m, const char *path, int mode);
+
+int machine_get_uid_shift(Machine *m, uid_t *ret);

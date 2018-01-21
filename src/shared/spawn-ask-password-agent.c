@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,14 +18,14 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <signal.h>
 
 #include "log.h"
-#include "util.h"
 #include "process-util.h"
 #include "spawn-ask-password-agent.h"
+#include "util.h"
 
 static pid_t agent_pid = 0;
 
@@ -41,14 +40,18 @@ int ask_password_agent_open(void) {
         if (!isatty(STDIN_FILENO))
                 return 0;
 
-        r = fork_agent(&agent_pid,
+        if (!is_main_thread())
+                return -EPERM;
+
+        r = fork_agent("(sd-askpwagent)",
                        NULL, 0,
+                       &agent_pid,
                        SYSTEMD_TTY_ASK_PASSWORD_AGENT_BINARY_PATH,
                        SYSTEMD_TTY_ASK_PASSWORD_AGENT_BINARY_PATH, "--watch", NULL);
         if (r < 0)
-                log_error_errno(r, "Failed to fork TTY ask password agent: %m");
+                return log_error_errno(r, "Failed to fork TTY ask password agent: %m");
 
-        return r;
+        return 1;
 }
 
 void ask_password_agent_close(void) {
@@ -57,8 +60,7 @@ void ask_password_agent_close(void) {
                 return;
 
         /* Inform agent that we are done */
-        kill(agent_pid, SIGTERM);
-        kill(agent_pid, SIGCONT);
+        (void) kill_and_sigcont(agent_pid, SIGTERM);
         (void) wait_for_terminate(agent_pid, NULL);
         agent_pid = 0;
 }

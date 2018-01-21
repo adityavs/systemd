@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,11 +20,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
 #include <stdbool.h>
-#include <libudev.h>
+#include <sys/types.h>
 
-#ifdef HAVE_ACL
+#include "libudev.h"
+
+#if HAVE_ACL
 
 int devnode_acl(const char *path,
                 bool flush,

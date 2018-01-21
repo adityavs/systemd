@@ -1,3 +1,5 @@
+#  SPDX-License-Identifier: LGPL-2.1+
+#
 #  This file is part of systemd.
 #
 #  systemd is free software; you can redistribute it and/or modify it
@@ -7,15 +9,28 @@
 
 [Unit]
 Description=Journal Remote Upload Service
-After=network.target
+Documentation=man:systemd-journal-upload(8)
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-ExecStart=@rootlibexecdir@/systemd-journal-upload \
-          --save-state
+ExecStart=@rootlibexecdir@/systemd-journal-upload --save-state
 User=systemd-journal-upload
-PrivateTmp=yes
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+WatchdogSec=3min
 PrivateDevices=yes
-WatchdogSec=20min
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=yes
+StateDirectory=systemd/journal-upload
 
 # If there are many split up journal files we need a lot of fds to
 # access them all and combine

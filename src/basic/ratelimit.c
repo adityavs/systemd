@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,6 +19,9 @@
 ***/
 
 
+#include <sys/time.h>
+
+#include "macro.h"
 #include "ratelimit.h"
 
 /* Modelled after Linux' lib/ratelimit.c by Dave Young

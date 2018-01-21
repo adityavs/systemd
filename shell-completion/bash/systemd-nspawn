@@ -1,4 +1,5 @@
 # systemd-nspawn(1) completion                  -*- shell-script -*-
+# SPDX-License-Identifier: LGPL-2.1+
 #
 # This file is part of systemd.
 #
@@ -45,7 +46,10 @@ __get_env() {
 }
 
 __get_interfaces(){
-    cut -f 1 -d ' ' /proc/net/dev | tail -n +3 | tr -s '\n' | tr -d ':' | xargs
+        { cd /sys/class/net && echo *; } | \
+        while read -d' ' -r name; do
+                [[ "$name" != "lo" ]] && echo "$name"
+        done
 }
 
 _systemd_nspawn() {
@@ -53,25 +57,27 @@ _systemd_nspawn() {
         local i verb comps
 
         local -A OPTS=(
-               [STANDALONE]='-h --help --version --private-network -b --boot --read-only -q --quiet --share-system --keep-unit --network-veth -j'
-                      [ARG]='-D --directory -u --user --uuid --capability --drop-capability --link-journal --bind --bind-ro -M --machine
-                             -S --slice --setenv -Z --selinux-context -L --selinux-apifs-context --register --network-interface --network-bridge
-                             --personality -i --image --tmpfs --volatile
-                             --network-macvlan'
+                [STANDALONE]='-h --help --version --private-network -b --boot --read-only -q --quiet --share-system --keep-unit -n --network-veth
+                              -j -x --ephemeral -a --as-pid2 --private-users-chown -U'
+                       [ARG]='-D --directory -u --user --uuid --capability --drop-capability --link-journal --bind --bind-ro -M --machine
+                              -S --slice -E --setenv -Z --selinux-context -L --selinux-apifs-context --register --network-interface --network-bridge
+                              --personality -i --image --tmpfs --volatile --network-macvlan --kill-signal --template --notify-ready --root-hash
+                              --chdir --pivot-root --property --private-users --network-namespace-path --network-ipvlan --network-veth-extra
+                              --network-zone -p --port --system-call-filter --overlay --overlay-ro --settings'
         )
 
         _init_completion || return
 
         if __contains_word "$prev" ${OPTS[ARG]}; then
                 case $prev in
-                        --directory|-D)
+                        --directory|-D|--template)
                                 compopt -o nospace
                                 comps=$(compgen -S/ -A directory -- "$cur" )
                         ;;
                         --user|-u)
                                 comps=$( __get_users )
                         ;;
-                        --uuid)
+                        --uuid|--root-hash)
                                 comps=''
                         ;;
                         --capability)
@@ -85,7 +91,7 @@ _systemd_nspawn() {
                                        CAP_SYS_CHROOT CAP_SYS_NICE CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_SYS_TTY_CONFIG'
                         ;;
                         --link-journal)
-                                comps='no auto guest host'
+                                comps='no auto guest try-guest host try-host'
                         ;;
                         --bind|--bind-ro)
                                 compopt -o nospace
@@ -101,7 +107,7 @@ _systemd_nspawn() {
                         --slice|-S)
                                 comps=$( __get_slices )
                         ;;
-                        --setenv)
+                        --setenv|-E)
                                 comps=$( __get_env )
                         ;;
                         --selinux-context|-Z)
@@ -131,6 +137,22 @@ _systemd_nspawn() {
                         --image|-i)
                                 compopt -o nospace
                                 comps=$( compgen -A file -- "$cur" )
+                        ;;
+                        --kill-signal)
+                                _signals
+                                return
+                        ;;
+                        --notify-ready)
+                                comps='yes no'
+                        ;;
+                        --private-users)
+                                comps='yes no pick'
+                        ;;
+                        --network-namespace-path)
+                                comps=$( compgen -A file -- "$cur" )
+                        ;;
+                        --settings)
+                                comps='yes no override trusted'
                         ;;
                 esac
                 COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

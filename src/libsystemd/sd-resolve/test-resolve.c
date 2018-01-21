@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,18 +19,22 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <string.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
-#include <stdio.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <resolv.h>
-#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
 
-#include "socket-util.h"
 #include "sd-resolve.h"
-#include "resolve-util.h"
+
+#include "alloc-util.h"
 #include "macro.h"
+#include "socket-util.h"
+#include "string-util.h"
+
+#define TEST_TIMEOUT_USEC (20*USEC_PER_SEC)
 
 static int getaddrinfo_handler(sd_resolve_query *q, int ret, const struct addrinfo *ai, void *userdata) {
         const struct addrinfo *i;
@@ -63,64 +66,13 @@ static int getnameinfo_handler(sd_resolve_query *q, int ret, const char *host, c
                 return 0;
         }
 
-        printf("Host: %s -- Serv: %s\n", strna(host), strna(serv));
-        return 0;
-}
-
-static int res_handler(sd_resolve_query *q, int ret, unsigned char *answer, void *userdata) {
-        int qdcount, ancount, len;
-        const unsigned char *pos = answer + sizeof(HEADER);
-        unsigned char *end = answer + ret;
-        HEADER *head = (HEADER *) answer;
-        char name[256];
-        assert_se(q);
-
-        if (ret < 0) {
-                log_error("res_query() error: %s %i", strerror(errno), errno);
-                return 0;
-        }
-
-        if (ret == 0) {
-                log_error("No reply for SRV lookup");
-                return 0;
-        }
-
-        qdcount = ntohs(head->qdcount);
-        ancount = ntohs(head->ancount);
-
-        printf("%d answers for srv lookup:\n", ancount);
-
-        /* Ignore the questions */
-        while (qdcount-- > 0 && (len = dn_expand(answer, end, pos, name, 255)) >= 0) {
-                assert_se(len >= 0);
-                pos += len + QFIXEDSZ;
-        }
-
-        /* Parse the answers */
-        while (ancount-- > 0 && (len = dn_expand(answer, end, pos, name, 255)) >= 0) {
-                /* Ignore the initial string */
-                uint16_t pref, weight, port;
-                assert_se(len >= 0);
-                pos += len;
-                /* Ignore type, ttl, class and dlen */
-                pos += 10;
-
-                GETSHORT(pref, pos);
-                GETSHORT(weight, pos);
-                GETSHORT(port, pos);
-                len = dn_expand(answer, end, pos, name, 255);
-                printf("\tpreference: %2d weight: %2d port: %d host: %s\n",
-                       pref, weight, port, name);
-
-                pos += len;
-        }
-
+        printf("Host: %s — Serv: %s\n", strna(host), strna(serv));
         return 0;
 }
 
 int main(int argc, char *argv[]) {
-        _cleanup_resolve_query_unref_ sd_resolve_query *q1 = NULL, *q2 = NULL, *q3 = NULL;
-        _cleanup_resolve_unref_ sd_resolve *resolve = NULL;
+        _cleanup_(sd_resolve_query_unrefp) sd_resolve_query *q1 = NULL, *q2 = NULL;
+        _cleanup_(sd_resolve_unrefp) sd_resolve *resolve = NULL;
         int r = 0;
 
         struct addrinfo hints = {
@@ -150,17 +102,20 @@ int main(int argc, char *argv[]) {
         if (r < 0)
                 log_error_errno(r, "sd_resolve_getnameinfo(): %m");
 
-        /* Make a res_query() call */
-        r = sd_resolve_res_query(resolve, &q3, "_xmpp-client._tcp.gmail.com", C_IN, T_SRV, res_handler, NULL);
-        if (r < 0)
-                log_error_errno(r, "sd_resolve_res_query(): %m");
+        /* Wait until all queries are completed */
+        for (;;) {
+                r = sd_resolve_wait(resolve, TEST_TIMEOUT_USEC);
+                if (r == 0)
+                        break;
+                if (r == -ETIMEDOUT) {
+                        /* Let's catch time-outs here, so that we can run safely in a CI that has no reliable DNS. Note
+                         * that we invoke exit() directly here, as the stuck NSS call will not allow us to exit
+                         * cleanly. */
 
-        /* Wait until the three queries are completed */
-        while (sd_resolve_query_is_done(q1) == 0 ||
-               sd_resolve_query_is_done(q2) == 0 ||
-               sd_resolve_query_is_done(q3) == 0) {
-
-                r = sd_resolve_wait(resolve, (uint64_t) -1);
+                        log_notice_errno(r, "sd_resolve_wait() timed out, but that's OK");
+                        exit(EXIT_SUCCESS);
+                        break;
+                }
                 if (r < 0) {
                         log_error_errno(r, "sd_resolve_wait(): %m");
                         assert_not_reached("sd_resolve_wait() failed");

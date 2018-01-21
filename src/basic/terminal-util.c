@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,25 +18,44 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/inotify.h>
+#include <sys/socket.h>
+#include <sys/sysmacros.h>
+#include <sys/time.h>
+#include <linux/kd.h>
+#include <linux/tiocl.h>
+#include <linux/vt.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <time.h>
-#include <assert.h>
-#include <poll.h>
-#include <linux/vt.h>
-#include <linux/tiocl.h>
-#include <linux/kd.h>
 
+#include "alloc-util.h"
+#include "env-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
+#include "io-util.h"
+#include "log.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "socket-util.h"
+#include "stat-util.h"
+#include "string-util.h"
+#include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
-#include "process-util.h"
 #include "util.h"
-#include "fileio.h"
 #include "path-util.h"
 
 static volatile unsigned cached_columns = 0;
@@ -44,11 +64,11 @@ static volatile unsigned cached_lines = 0;
 int chvt(int vt) {
         _cleanup_close_ int fd;
 
-        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0)
                 return -errno;
 
-        if (vt < 0) {
+        if (vt <= 0) {
                 int tiocl[2] = {
                         TIOCL_GETKMSGREDIRECT,
                         0
@@ -112,7 +132,7 @@ int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
 
         errno = 0;
         if (!fgets(line, sizeof(line), f))
-                return errno ? -errno : -EIO;
+                return errno > 0 ? -errno : -EIO;
 
         truncate_nl(line);
 
@@ -126,32 +146,39 @@ int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
         return 0;
 }
 
-int ask_char(char *ret, const char *replies, const char *text, ...) {
+#define DEFAULT_ASK_REFRESH_USEC (2*USEC_PER_SEC)
+
+int ask_char(char *ret, const char *replies, const char *fmt, ...) {
         int r;
 
         assert(ret);
         assert(replies);
-        assert(text);
+        assert(fmt);
 
         for (;;) {
                 va_list ap;
                 char c;
                 bool need_nl = true;
 
-                if (on_tty())
-                        fputs(ANSI_HIGHLIGHT_ON, stdout);
+                if (colors_enabled())
+                        fputs(ANSI_HIGHLIGHT, stdout);
 
-                va_start(ap, text);
-                vprintf(text, ap);
+                putchar('\r');
+
+                va_start(ap, fmt);
+                vprintf(fmt, ap);
                 va_end(ap);
 
-                if (on_tty())
-                        fputs(ANSI_HIGHLIGHT_OFF, stdout);
+                if (colors_enabled())
+                        fputs(ANSI_NORMAL, stdout);
 
                 fflush(stdout);
 
-                r = read_one_char(stdin, &c, USEC_INFINITY, &need_nl);
+                r = read_one_char(stdin, &c, DEFAULT_ASK_REFRESH_USEC, &need_nl);
                 if (r < 0) {
+
+                        if (r == -ETIMEDOUT)
+                                continue;
 
                         if (r == -EBADMSG) {
                                 puts("Bad input, please try again.");
@@ -182,21 +209,21 @@ int ask_string(char **ret, const char *text, ...) {
                 char line[LINE_MAX];
                 va_list ap;
 
-                if (on_tty())
-                        fputs(ANSI_HIGHLIGHT_ON, stdout);
+                if (colors_enabled())
+                        fputs(ANSI_HIGHLIGHT, stdout);
 
                 va_start(ap, text);
                 vprintf(text, ap);
                 va_end(ap);
 
-                if (on_tty())
-                        fputs(ANSI_HIGHLIGHT_OFF, stdout);
+                if (colors_enabled())
+                        fputs(ANSI_NORMAL, stdout);
 
                 fflush(stdout);
 
                 errno = 0;
                 if (!fgets(line, sizeof(line), stdin))
-                        return errno ? -errno : -EIO;
+                        return errno > 0 ? -errno : -EIO;
 
                 if (!endswith(line, "\n"))
                         putchar('\n');
@@ -230,14 +257,14 @@ int reset_terminal_fd(int fd, bool switch_to_text) {
          * interfere with that. */
 
         /* Disable exclusive mode, just in case */
-        ioctl(fd, TIOCNXCL);
+        (void) ioctl(fd, TIOCNXCL);
 
         /* Switch to text mode */
         if (switch_to_text)
-                ioctl(fd, KDSETMODE, KD_TEXT);
+                (void) ioctl(fd, KDSETMODE, KD_TEXT);
 
-        /* Enable console unicode mode */
-        ioctl(fd, KDSKBMODE, K_UNICODE);
+        /* Set default keyboard mode */
+        (void) vt_reset_keyboard(fd);
 
         if (tcgetattr(fd, &termios) < 0) {
                 r = -errno;
@@ -276,7 +303,7 @@ int reset_terminal_fd(int fd, bool switch_to_text) {
 
 finish:
         /* Just in case, flush all crap out */
-        tcflush(fd, TCIOFLUSH);
+        (void) tcflush(fd, TCIOFLUSH);
 
         return r;
 }
@@ -284,7 +311,11 @@ finish:
 int reset_terminal(const char *name) {
         _cleanup_close_ int fd = -1;
 
-        fd = open_terminal(name, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        /* We open the terminal with O_NONBLOCK here, to ensure we
+         * don't block on carrier if this is a terminal with carrier
+         * configured. */
+
+        fd = open_terminal(name, O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0)
                 return fd;
 
@@ -304,7 +335,8 @@ int open_terminal(const char *name, int mode) {
          * https://bugs.launchpad.net/ubuntu/+source/linux/+bug/554172/comments/245
          */
 
-        assert(!(mode & O_CREAT));
+        if (mode & O_CREAT)
+                return -EINVAL;
 
         for (;;) {
                 fd = open(name, mode, 0);
@@ -323,12 +355,7 @@ int open_terminal(const char *name, int mode) {
         }
 
         r = isatty(fd);
-        if (r < 0) {
-                safe_close(fd);
-                return -errno;
-        }
-
-        if (!r) {
+        if (r == 0) {
                 safe_close(fd);
                 return -ENOTTY;
         }
@@ -407,15 +434,14 @@ int acquire_terminal(
 
                 assert_se(sigaction(SIGHUP, &sa_old, NULL) == 0);
 
-                /* Sometimes it makes sense to ignore TIOCSCTTY
+                /* Sometimes, it makes sense to ignore TIOCSCTTY
                  * returning EPERM, i.e. when very likely we already
                  * are have this controlling terminal. */
                 if (r < 0 && r == -EPERM && ignore_tiocstty_eperm)
                         r = 0;
 
-                if (r < 0 && (force || fail || r != -EPERM)) {
+                if (r < 0 && (force || fail || r != -EPERM))
                         goto fail;
-                }
 
                 if (r >= 0)
                         break;
@@ -438,7 +464,7 @@ int acquire_terminal(
                                         goto fail;
                                 }
 
-                                r = fd_wait_for_event(fd, POLLIN, ts + timeout - n);
+                                r = fd_wait_for_event(notify, POLLIN, ts + timeout - n);
                                 if (r < 0)
                                         goto fail;
 
@@ -450,7 +476,7 @@ int acquire_terminal(
 
                         l = read(notify, &buffer, sizeof(buffer));
                         if (l < 0) {
-                                if (errno == EINTR || errno == EAGAIN)
+                                if (IN_SET(errno, EINTR, EAGAIN))
                                         continue;
 
                                 r = -errno;
@@ -476,10 +502,6 @@ int acquire_terminal(
 
         safe_close(notify);
 
-        r = reset_terminal_fd(fd, true);
-        if (r < 0)
-                log_warning_errno(r, "Failed to reset terminal: %m");
-
         return fd;
 
 fail:
@@ -499,7 +521,7 @@ int release_terminal(void) {
         struct sigaction sa_old;
         int r = 0;
 
-        fd = open("/dev/tty", O_RDWR|O_NOCTTY|O_NDELAY|O_CLOEXEC);
+        fd = open("/dev/tty", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0)
                 return -errno;
 
@@ -527,7 +549,7 @@ int terminal_vhangup_fd(int fd) {
 int terminal_vhangup(const char *name) {
         _cleanup_close_ int fd;
 
-        fd = open_terminal(name, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal(name, O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0)
                 return fd;
 
@@ -535,14 +557,17 @@ int terminal_vhangup(const char *name) {
 }
 
 int vt_disallocate(const char *name) {
-        int fd, r;
+        _cleanup_close_ int fd = -1;
+        const char *e, *n;
         unsigned u;
+        int r;
 
         /* Deallocate the VT if possible. If not possible
          * (i.e. because it is the active one), at least clear it
          * entirely (including the scrollback buffer) */
 
-        if (!startswith(name, "/dev/"))
+        e = path_startswith(name, "/dev/");
+        if (!e)
                 return -EINVAL;
 
         if (!tty_is_vc(name)) {
@@ -558,15 +583,14 @@ int vt_disallocate(const char *name) {
                            "\033[H"    /* move home */
                            "\033[2J",  /* clear screen */
                            10, false);
-                safe_close(fd);
-
                 return 0;
         }
 
-        if (!startswith(name, "/dev/tty"))
+        n = startswith(e, "tty");
+        if (!n)
                 return -EINVAL;
 
-        r = safe_atou(name+8, &u);
+        r = safe_atou(n, &u);
         if (r < 0)
                 return r;
 
@@ -574,12 +598,12 @@ int vt_disallocate(const char *name) {
                 return -EINVAL;
 
         /* Try to deallocate */
-        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0)
                 return fd;
 
         r = ioctl(fd, VT_DISALLOCATE, u);
-        safe_close(fd);
+        fd = safe_close(fd);
 
         if (r >= 0)
                 return 0;
@@ -598,30 +622,7 @@ int vt_disallocate(const char *name) {
                    "\033[H"   /* move home */
                    "\033[3J", /* clear screen including scrollback, requires Linux 2.6.40 */
                    10, false);
-        safe_close(fd);
-
         return 0;
-}
-
-void warn_melody(void) {
-        _cleanup_close_ int fd = -1;
-
-        fd = open("/dev/console", O_WRONLY|O_CLOEXEC|O_NOCTTY);
-        if (fd < 0)
-                return;
-
-        /* Yeah, this is synchronous. Kinda sucks. But well... */
-
-        ioctl(fd, KIOCSOUND, (int)(1193180/440));
-        usleep(125*USEC_PER_MSEC);
-
-        ioctl(fd, KIOCSOUND, (int)(1193180/220));
-        usleep(125*USEC_PER_MSEC);
-
-        ioctl(fd, KIOCSOUND, (int)(1193180/220));
-        usleep(125*USEC_PER_MSEC);
-
-        ioctl(fd, KIOCSOUND, 0);
 }
 
 int make_console_stdio(void) {
@@ -633,89 +634,15 @@ int make_console_stdio(void) {
         if (fd < 0)
                 return log_error_errno(fd, "Failed to acquire terminal: %m");
 
+        r = reset_terminal_fd(fd, true);
+        if (r < 0)
+                log_warning_errno(r, "Failed to reset terminal, ignoring: %m");
+
         r = make_stdio(fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to duplicate terminal fd: %m");
 
         return 0;
-}
-
-int status_vprintf(const char *status, bool ellipse, bool ephemeral, const char *format, va_list ap) {
-        static const char status_indent[] = "         "; /* "[" STATUS "] " */
-        _cleanup_free_ char *s = NULL;
-        _cleanup_close_ int fd = -1;
-        struct iovec iovec[6] = {};
-        int n = 0;
-        static bool prev_ephemeral;
-
-        assert(format);
-
-        /* This is independent of logging, as status messages are
-         * optional and go exclusively to the console. */
-
-        if (vasprintf(&s, format, ap) < 0)
-                return log_oom();
-
-        fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
-        if (fd < 0)
-                return fd;
-
-        if (ellipse) {
-                char *e;
-                size_t emax, sl;
-                int c;
-
-                c = fd_columns(fd);
-                if (c <= 0)
-                        c = 80;
-
-                sl = status ? sizeof(status_indent)-1 : 0;
-
-                emax = c - sl - 1;
-                if (emax < 3)
-                        emax = 3;
-
-                e = ellipsize(s, emax, 50);
-                if (e) {
-                        free(s);
-                        s = e;
-                }
-        }
-
-        if (prev_ephemeral)
-                IOVEC_SET_STRING(iovec[n++], "\r" ANSI_ERASE_TO_END_OF_LINE);
-        prev_ephemeral = ephemeral;
-
-        if (status) {
-                if (!isempty(status)) {
-                        IOVEC_SET_STRING(iovec[n++], "[");
-                        IOVEC_SET_STRING(iovec[n++], status);
-                        IOVEC_SET_STRING(iovec[n++], "] ");
-                } else
-                        IOVEC_SET_STRING(iovec[n++], status_indent);
-        }
-
-        IOVEC_SET_STRING(iovec[n++], s);
-        if (!ephemeral)
-                IOVEC_SET_STRING(iovec[n++], "\n");
-
-        if (writev(fd, iovec, n) < 0)
-                return -errno;
-
-        return 0;
-}
-
-int status_printf(const char *status, bool ellipse, bool ephemeral, const char *format, ...) {
-        va_list ap;
-        int r;
-
-        assert(format);
-
-        va_start(ap, format);
-        r = status_vprintf(status, ellipse, ephemeral, format, ap);
-        va_end(ap);
-
-        return r;
 }
 
 bool tty_is_vc(const char *tty) {
@@ -727,10 +654,7 @@ bool tty_is_vc(const char *tty) {
 bool tty_is_console(const char *tty) {
         assert(tty);
 
-        if (startswith(tty, "/dev/"))
-                tty += 5;
-
-        return streq(tty, "console");
+        return streq(skip_dev_prefix(tty), "console");
 }
 
 int vtnr_from_tty(const char *tty) {
@@ -738,8 +662,7 @@ int vtnr_from_tty(const char *tty) {
 
         assert(tty);
 
-        if (startswith(tty, "/dev/"))
-                tty += 5;
+        tty = skip_dev_prefix(tty);
 
         if (!startswith(tty, "tty") )
                 return -EINVAL;
@@ -790,13 +713,70 @@ char *resolve_dev_console(char **active) {
         return tty;
 }
 
+int get_kernel_consoles(char ***consoles) {
+        _cleanup_strv_free_ char **con = NULL;
+        _cleanup_free_ char *line = NULL;
+        const char *active;
+        int r;
+
+        assert(consoles);
+
+        r = read_one_line_file("/sys/class/tty/console/active", &line);
+        if (r < 0)
+                return r;
+
+        active = line;
+        for (;;) {
+                _cleanup_free_ char *tty = NULL;
+                char *path;
+
+                r = extract_first_word(&active, &tty, NULL, 0);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                if (streq(tty, "tty0")) {
+                        tty = mfree(tty);
+                        r = read_one_line_file("/sys/class/tty/tty0/active", &tty);
+                        if (r < 0)
+                                return r;
+                }
+
+                path = strappend("/dev/", tty);
+                if (!path)
+                        return -ENOMEM;
+
+                if (access(path, F_OK) < 0) {
+                        log_debug_errno(errno, "Console device %s is not accessible, skipping: %m", path);
+                        free(path);
+                        continue;
+                }
+
+                r = strv_consume(&con, path);
+                if (r < 0)
+                        return r;
+        }
+
+        if (strv_isempty(con)) {
+                log_debug("No devices found for system console");
+
+                r = strv_extend(&con, "/dev/console");
+                if (r < 0)
+                        return r;
+        }
+
+        *consoles = con;
+        con = NULL;
+        return 0;
+}
+
 bool tty_is_vc_resolve(const char *tty) {
         _cleanup_free_ char *active = NULL;
 
         assert(tty);
 
-        if (startswith(tty, "/dev/"))
-                tty += 5;
+        tty = skip_dev_prefix(tty);
 
         if (streq(tty, "console")) {
                 tty = resolve_dev_console(&active);
@@ -808,9 +788,7 @@ bool tty_is_vc_resolve(const char *tty) {
 }
 
 const char *default_term_for_tty(const char *tty) {
-        assert(tty);
-
-        return tty_is_vc_resolve(tty) ? "TERM=linux" : "TERM=vt220";
+        return tty && tty_is_vc_resolve(tty) ? "linux" : "vt220";
 }
 
 int fd_columns(int fd) {
@@ -897,33 +875,30 @@ bool on_tty(void) {
 }
 
 int make_stdio(int fd) {
-        int r, s, t;
+        int r = 0;
 
         assert(fd >= 0);
 
-        r = dup2(fd, STDIN_FILENO);
-        s = dup2(fd, STDOUT_FILENO);
-        t = dup2(fd, STDERR_FILENO);
+        if (dup2(fd, STDIN_FILENO) < 0 && r >= 0)
+                r = -errno;
+        if (dup2(fd, STDOUT_FILENO) < 0 && r >= 0)
+                r = -errno;
+        if (dup2(fd, STDERR_FILENO) < 0 && r >= 0)
+                r = -errno;
 
         if (fd >= 3)
                 safe_close(fd);
 
-        if (r < 0 || s < 0 || t < 0)
-                return -errno;
+        /* Explicitly unset O_CLOEXEC, since if fd was < 3, then dup2() was a NOP and the bit hence possibly set. */
+        stdio_unset_cloexec();
 
-        /* Explicitly unset O_CLOEXEC, since if fd was < 3, then
-         * dup2() was a NOP and the bit hence possibly set. */
-        fd_cloexec(STDIN_FILENO, false);
-        fd_cloexec(STDOUT_FILENO, false);
-        fd_cloexec(STDERR_FILENO, false);
-
-        return 0;
+        return r;
 }
 
 int make_null_stdio(void) {
         int null_fd;
 
-        null_fd = open("/dev/null", O_RDWR|O_NOCTTY);
+        null_fd = open("/dev/null", O_RDWR|O_NOCTTY|O_CLOEXEC);
         if (null_fd < 0)
                 return -errno;
 
@@ -942,11 +917,9 @@ int getttyname_malloc(int fd, char **ret) {
 
                 r = ttyname_r(fd, path, sizeof(path));
                 if (r == 0) {
-                        const char *p;
                         char *c;
 
-                        p = startswith(path, "/dev/");
-                        c = strdup(p ?: path);
+                        c = strdup(skip_dev_prefix(path));
                         if (!c)
                                 return -ENOMEM;
 
@@ -1018,7 +991,7 @@ int get_ctty_devnr(pid_t pid, dev_t *d) {
 }
 
 int get_ctty(pid_t pid, dev_t *_devnr, char **r) {
-        char fn[sizeof("/dev/char/")-1 + 2*DECIMAL_STR_MAX(unsigned) + 1 + 1], *b = NULL;
+        char fn[STRLEN("/dev/char/") + 2*DECIMAL_STR_MAX(unsigned) + 1 + 1], *b = NULL;
         _cleanup_free_ char *s = NULL;
         const char *p;
         dev_t devnr;
@@ -1067,6 +1040,226 @@ int get_ctty(pid_t pid, dev_t *_devnr, char **r) {
         *r = b;
         if (_devnr)
                 *_devnr = devnr;
+
+        return 0;
+}
+
+int ptsname_malloc(int fd, char **ret) {
+        size_t l = 100;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        for (;;) {
+                char *c;
+
+                c = new(char, l);
+                if (!c)
+                        return -ENOMEM;
+
+                if (ptsname_r(fd, c, l) == 0) {
+                        *ret = c;
+                        return 0;
+                }
+                if (errno != ERANGE) {
+                        free(c);
+                        return -errno;
+                }
+
+                free(c);
+                l *= 2;
+        }
+}
+
+int ptsname_namespace(int pty, char **ret) {
+        int no = -1, r;
+
+        /* Like ptsname(), but doesn't assume that the path is
+         * accessible in the local namespace. */
+
+        r = ioctl(pty, TIOCGPTN, &no);
+        if (r < 0)
+                return -errno;
+
+        if (no < 0)
+                return -EIO;
+
+        if (asprintf(ret, "/dev/pts/%i", no) < 0)
+                return -ENOMEM;
+
+        return 0;
+}
+
+int openpt_in_namespace(pid_t pid, int flags) {
+        _cleanup_close_ int pidnsfd = -1, mntnsfd = -1, usernsfd = -1, rootfd = -1;
+        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        pid_t child;
+        int r;
+
+        assert(pid > 0);
+
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &usernsfd, &rootfd);
+        if (r < 0)
+                return r;
+
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+                return -errno;
+
+        r = safe_fork("(sd-openpt)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &child);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                int master;
+
+                pair[0] = safe_close(pair[0]);
+
+                r = namespace_enter(pidnsfd, mntnsfd, -1, usernsfd, rootfd);
+                if (r < 0)
+                        _exit(EXIT_FAILURE);
+
+                master = posix_openpt(flags|O_NOCTTY|O_CLOEXEC);
+                if (master < 0)
+                        _exit(EXIT_FAILURE);
+
+                if (unlockpt(master) < 0)
+                        _exit(EXIT_FAILURE);
+
+                if (send_one_fd(pair[1], master, 0) < 0)
+                        _exit(EXIT_FAILURE);
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        pair[1] = safe_close(pair[1]);
+
+        r = wait_for_terminate_and_check("(sd-openpt)", child, 0);
+        if (r < 0)
+                return r;
+        if (r != EXIT_SUCCESS)
+                return -EIO;
+
+        return receive_one_fd(pair[0], 0);
+}
+
+int open_terminal_in_namespace(pid_t pid, const char *name, int mode) {
+        _cleanup_close_ int pidnsfd = -1, mntnsfd = -1, usernsfd = -1, rootfd = -1;
+        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        pid_t child;
+        int r;
+
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &usernsfd, &rootfd);
+        if (r < 0)
+                return r;
+
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+                return -errno;
+
+        r = safe_fork("(sd-terminal)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &child);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                int master;
+
+                pair[0] = safe_close(pair[0]);
+
+                r = namespace_enter(pidnsfd, mntnsfd, -1, usernsfd, rootfd);
+                if (r < 0)
+                        _exit(EXIT_FAILURE);
+
+                master = open_terminal(name, mode|O_NOCTTY|O_CLOEXEC);
+                if (master < 0)
+                        _exit(EXIT_FAILURE);
+
+                if (send_one_fd(pair[1], master, 0) < 0)
+                        _exit(EXIT_FAILURE);
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        pair[1] = safe_close(pair[1]);
+
+        r = wait_for_terminate_and_check("(sd-terminal)", child, 0);
+        if (r < 0)
+                return r;
+        if (r != EXIT_SUCCESS)
+                return -EIO;
+
+        return receive_one_fd(pair[0], 0);
+}
+
+static bool getenv_terminal_is_dumb(void) {
+        const char *e;
+
+        e = getenv("TERM");
+        if (!e)
+                return true;
+
+        return streq(e, "dumb");
+}
+
+bool terminal_is_dumb(void) {
+        if (!on_tty())
+                return true;
+
+        return getenv_terminal_is_dumb();
+}
+
+bool colors_enabled(void) {
+        static int enabled = -1;
+
+        if (_unlikely_(enabled < 0)) {
+                int val;
+
+                val = getenv_bool("SYSTEMD_COLORS");
+                if (val >= 0)
+                        enabled = val;
+                else if (getpid_cached() == 1)
+                        /* PID1 outputs to the console without holding it open all the time */
+                        enabled = !getenv_terminal_is_dumb();
+                else
+                        enabled = !terminal_is_dumb();
+        }
+
+        return enabled;
+}
+
+bool underline_enabled(void) {
+        static int enabled = -1;
+
+        if (enabled < 0) {
+
+                /* The Linux console doesn't support underlining, turn it off, but only there. */
+
+                if (!colors_enabled())
+                        enabled = false;
+                else
+                        enabled = !streq_ptr(getenv("TERM"), "linux");
+        }
+
+        return enabled;
+}
+
+int vt_default_utf8(void) {
+        _cleanup_free_ char *b = NULL;
+        int r;
+
+        /* Read the default VT UTF8 setting from the kernel */
+
+        r = read_one_line_file("/sys/module/vt/parameters/default_utf8", &b);
+        if (r < 0)
+                return r;
+
+        return parse_boolean(b);
+}
+
+int vt_reset_keyboard(int fd) {
+        int kb;
+
+        /* If we can't read the default, then default to unicode. It's 2017 after all. */
+        kb = vt_default_utf8() != 0 ? K_UNICODE : K_XLATE;
+
+        if (ioctl(fd, KDSKBMODE, kb) < 0)
+                return -errno;
 
         return 0;
 }

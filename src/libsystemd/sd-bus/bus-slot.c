@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,9 +19,12 @@
 ***/
 
 #include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-control.h"
 #include "bus-objects.h"
 #include "bus-slot.h"
+#include "string-util.h"
 
 sd_bus_slot *bus_slot_allocate(
                 sd_bus *bus,
@@ -54,7 +56,9 @@ sd_bus_slot *bus_slot_allocate(
 }
 
 _public_ sd_bus_slot* sd_bus_slot_ref(sd_bus_slot *slot) {
-        assert_return(slot, NULL);
+
+        if (!slot)
+                return NULL;
 
         assert(slot->n_ref > 0);
 
@@ -77,7 +81,7 @@ void bus_slot_disconnect(sd_bus_slot *slot) {
                 if (slot->reply_callback.cookie != 0)
                         ordered_hashmap_remove(slot->bus->reply_callbacks, &slot->reply_callback.cookie);
 
-                if (slot->reply_callback.timeout != 0)
+                if (slot->reply_callback.timeout_usec != 0)
                         prioq_remove(slot->bus->reply_callbacks_prioq, &slot->reply_callback, &slot->reply_callback.prioq_idx);
 
                 break;
@@ -90,12 +94,17 @@ void bus_slot_disconnect(sd_bus_slot *slot) {
         case BUS_MATCH_CALLBACK:
 
                 if (slot->match_added)
-                        bus_remove_match_internal(slot->bus, slot->match_callback.match_string, slot->match_callback.cookie);
+                        (void) bus_remove_match_internal(slot->bus, slot->match_callback.match_string);
+
+                if (slot->match_callback.install_slot) {
+                        bus_slot_disconnect(slot->match_callback.install_slot);
+                        slot->match_callback.install_slot = sd_bus_slot_unref(slot->match_callback.install_slot);
+                }
 
                 slot->bus->match_callbacks_modified = true;
                 bus_match_remove(&slot->bus->match_callbacks, &slot->match_callback);
 
-                free(slot->match_callback.match_string);
+                slot->match_callback.match_string = mfree(slot->match_callback.match_string);
 
                 break;
 
@@ -170,7 +179,7 @@ void bus_slot_disconnect(sd_bus_slot *slot) {
                         }
                 }
 
-                free(slot->node_vtable.interface);
+                slot->node_vtable.interface = mfree(slot->node_vtable.interface);
 
                 if (slot->node_vtable.node) {
                         LIST_REMOVE(vtables, slot->node_vtable.node->vtables, &slot->node_vtable);
@@ -203,15 +212,13 @@ _public_ sd_bus_slot* sd_bus_slot_unref(sd_bus_slot *slot) {
         assert(slot->n_ref > 0);
 
         if (slot->n_ref > 1) {
-                slot->n_ref --;
+                slot->n_ref--;
                 return NULL;
         }
 
         bus_slot_disconnect(slot);
         free(slot->description);
-        free(slot);
-
-        return NULL;
+        return mfree(slot);
 }
 
 _public_ sd_bus* sd_bus_slot_get_bus(sd_bus_slot *slot) {
@@ -273,7 +280,7 @@ _public_ int sd_bus_slot_set_description(sd_bus_slot *slot, const char *descript
         return free_and_strdup(&slot->description, description);
 }
 
-_public_ int sd_bus_slot_get_description(sd_bus_slot *slot, char **description) {
+_public_ int sd_bus_slot_get_description(sd_bus_slot *slot, const char **description) {
         assert_return(slot, -EINVAL);
         assert_return(description, -EINVAL);
         assert_return(slot->description, -ENXIO);

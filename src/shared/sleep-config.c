@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,28 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
 #include "conf-parser.h"
-#include "sleep-config.h"
+#include "def.h"
+#include "env-util.h"
+#include "fd-util.h"
 #include "fileio.h"
 #include "log.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "sleep-config.h"
+#include "string-util.h"
 #include "strv.h"
-#include "util.h"
 
-#define USE(x, y) do{ (x) = (y); (y) = NULL; } while(0)
+#define USE(x, y) do { (x) = (y); (y) = NULL; } while (0)
 
 int parse_sleep_config(const char *verb, char ***_modes, char ***_states) {
 
@@ -48,10 +59,10 @@ int parse_sleep_config(const char *verb, char ***_modes, char ***_states) {
                 {}
         };
 
-        config_parse_many(PKGSYSCONFDIR "/sleep.conf",
-                          CONF_DIRS_NULSTR("systemd/sleep.conf"),
-                          "Sleep\0", config_item_table_lookup, items,
-                          false, NULL);
+        (void) config_parse_many_nulstr(PKGSYSCONFDIR "/sleep.conf",
+                                        CONF_PATHS_NULSTR("systemd/sleep.conf.d"),
+                                        "Sleep\0", config_item_table_lookup, items,
+                                        CONFIG_PARSE_WARN, NULL);
 
         if (streq(verb, "suspend")) {
                 /* empty by default */
@@ -222,11 +233,14 @@ static bool enough_memory_for_hibernation(void) {
         size_t size = 0, used = 0;
         int r;
 
+        if (getenv_bool("SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK") > 0)
+                return true;
+
         r = hibernation_partition_size(&size, &used);
         if (r < 0)
                 return false;
 
-        r = get_status_field("/proc/meminfo", "\nActive(anon):", &active);
+        r = get_proc_field("/proc/meminfo", "Active(anon)", WHITESPACE, &active);
         if (r < 0) {
                 log_error_errno(r, "Failed to retrieve Active(anon) from /proc/meminfo: %m");
                 return false;

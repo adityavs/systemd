@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,9 +20,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#if ! ENABLE_EFI
+#include <errno.h>
+#endif
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "sd-id128.h"
+
 #include "time-util.h"
 
 #define EFI_VENDOR_LOADER SD_ID128_MAKE(4a,67,b0,82,0a,4c,41,cf,b6,c7,44,0b,29,bb,8c,4f)
@@ -32,7 +37,7 @@
 #define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x0000000000000002
 #define EFI_VARIABLE_RUNTIME_ACCESS     0x0000000000000004
 
-#ifdef ENABLE_EFI
+#if ENABLE_EFI
 
 bool is_efi_boot(void);
 bool is_efi_secure_boot(void);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,19 +20,22 @@
 
 #include <errno.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
-#include "util.h"
-#include "strv.h"
+#include "alloc-util.h"
+#include "bus-util.h"
 #include "def.h"
-#include "virt.h"
 #include "env-util.h"
 #include "fileio-label.h"
-#include "bus-util.h"
-#include "event-util.h"
-#include "selinux-util.h"
 #include "hostname-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "selinux-util.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
+#include "virt.h"
 
 #define VALID_DEPLOYMENT_CHARS (DIGITS LETTERS "-.:")
 
@@ -63,10 +65,8 @@ static void context_reset(Context *c) {
 
         assert(c);
 
-        for (p = 0; p < _PROP_MAX; p++) {
-                free(c->data[p]);
-                c->data[p] = NULL;
-        }
+        for (p = 0; p < _PROP_MAX; p++)
+                c->data[p] = mfree(c->data[p]);
 }
 
 static void context_free(Context *c) {
@@ -96,7 +96,7 @@ static int context_read_data(Context *c) {
         if (!c->data[PROP_HOSTNAME])
                 return -ENOMEM;
 
-        r = read_hostname_config("/etc/hostname", &c->data[PROP_STATIC_HOSTNAME]);
+        r = read_etc_hostname(NULL, &c->data[PROP_STATIC_HOSTNAME]);
         if (r < 0 && r != -ENOENT)
                 return r;
 
@@ -114,12 +114,11 @@ static int context_read_data(Context *c) {
                            "PRETTY_NAME", &c->data[PROP_OS_PRETTY_NAME],
                            "CPE_NAME", &c->data[PROP_OS_CPE_NAME],
                            NULL);
-        if (r == -ENOENT) {
+        if (r == -ENOENT)
                 r = parse_env_file("/usr/lib/os-release", NEWLINE,
                                    "PRETTY_NAME", &c->data[PROP_OS_PRETTY_NAME],
                                    "CPE_NAME", &c->data[PROP_OS_CPE_NAME],
                                    NULL);
-        }
 
         if (r < 0 && r != -ENOENT)
                 return r;
@@ -135,6 +134,7 @@ static bool valid_chassis(const char *chassis) {
                         "container\0"
                         "desktop\0"
                         "laptop\0"
+                        "convertible\0"
                         "server\0"
                         "tablet\0"
                         "handset\0"
@@ -150,29 +150,74 @@ static bool valid_deployment(const char *deployment) {
 }
 
 static const char* fallback_chassis(void) {
-        int r;
         char *type;
         unsigned t;
-        int v;
+        int v, r;
 
-        v = detect_virtualization(NULL);
-
-        if (v == VIRTUALIZATION_VM)
+        v = detect_virtualization();
+        if (VIRTUALIZATION_IS_VM(v))
                 return "vm";
-        if (v == VIRTUALIZATION_CONTAINER)
+        if (VIRTUALIZATION_IS_CONTAINER(v))
                 return "container";
 
-        r = read_one_line_file("/sys/firmware/acpi/pm_profile", &type);
+        r = read_one_line_file("/sys/class/dmi/id/chassis_type", &type);
         if (r < 0)
-                goto try_dmi;
+                goto try_acpi;
 
         r = safe_atou(type, &t);
         free(type);
         if (r < 0)
-                goto try_dmi;
+                goto try_acpi;
 
-        /* We only list the really obvious cases here as the ACPI data
-         * is not really super reliable.
+        /* We only list the really obvious cases here. The DMI data is unreliable enough, so let's not do any
+           additional guesswork on top of that.
+
+           See the SMBIOS Specification 3.0 section 7.4.1 for details about the values listed here:
+
+           https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.0.0.pdf
+         */
+
+        switch (t) {
+
+        case 0x3: /* Desktop */
+        case 0x4: /* Low Profile Desktop */
+        case 0x6: /* Mini Tower */
+        case 0x7: /* Tower */
+                return "desktop";
+
+        case 0x8: /* Portable */
+        case 0x9: /* Laptop */
+        case 0xA: /* Notebook */
+        case 0xE: /* Sub Notebook */
+                return "laptop";
+
+        case 0xB: /* Hand Held */
+                return "handset";
+
+        case 0x11: /* Main Server Chassis */
+        case 0x1C: /* Blade */
+        case 0x1D: /* Blade Enclosure */
+                return "server";
+
+        case 0x1E: /* Tablet */
+                return "tablet";
+
+        case 0x1F: /* Convertible */
+        case 0x20: /* Detachable */
+                return "convertible";
+        }
+
+try_acpi:
+        r = read_one_line_file("/sys/firmware/acpi/pm_profile", &type);
+        if (r < 0)
+                return NULL;
+
+        r = safe_atou(type, &t);
+        free(type);
+        if (r < 0)
+                return NULL;
+
+        /* We only list the really obvious cases here as the ACPI data is not really super reliable.
          *
          * See the ACPI 5.0 Spec Section 5.2.9.1 for details:
          *
@@ -181,63 +226,21 @@ static const char* fallback_chassis(void) {
 
         switch(t) {
 
-        case 1:
-        case 3:
-        case 6:
+        case 1: /* Desktop */
+        case 3: /* Workstation */
+        case 6: /* Appliance PC */
                 return "desktop";
 
-        case 2:
+        case 2: /* Mobile */
                 return "laptop";
 
-        case 4:
-        case 5:
-        case 7:
+        case 4: /* Enterprise Server */
+        case 5: /* SOHO Server */
+        case 7: /* Performance Server */
                 return "server";
 
-        case 8:
+        case 8: /* Tablet */
                 return "tablet";
-        }
-
-try_dmi:
-        r = read_one_line_file("/sys/class/dmi/id/chassis_type", &type);
-        if (r < 0)
-                return NULL;
-
-        r = safe_atou(type, &t);
-        free(type);
-        if (r < 0)
-                return NULL;
-
-        /* We only list the really obvious cases here. The DMI data is
-           unreliable enough, so let's not do any additional guesswork
-           on top of that.
-
-           See the SMBIOS Specification 2.7.1 section 7.4.1 for
-           details about the values listed here:
-
-           http://www.dmtf.org/sites/default/files/standards/documents/DSP0134_2.7.1.pdf
-         */
-
-        switch (t) {
-
-        case 0x3:
-        case 0x4:
-        case 0x6:
-        case 0x7:
-                return "desktop";
-
-        case 0x8:
-        case 0x9:
-        case 0xA:
-        case 0xE:
-                return "laptop";
-
-        case 0xB:
-                return "handset";
-
-        case 0x11:
-        case 0x1C:
-                return "server";
         }
 
         return NULL;
@@ -286,7 +289,7 @@ static int context_update_kernel_hostname(Context *c) {
 
         /* ... and the ultimate fallback */
         else
-                hn = "localhost";
+                hn = FALLBACK_HOSTNAME;
 
         if (sethostname_idempotent(hn) < 0)
                 return -errno;
@@ -338,7 +341,7 @@ static int context_write_data_machine_info(Context *c) {
                         continue;
                 }
 
-                t = strjoin(name[p], "=", c->data[p], NULL);
+                t = strjoin(name[p], "=", c->data[p]);
                 if (!t)
                         return -ENOMEM;
 
@@ -422,9 +425,9 @@ static int method_set_hostname(sd_bus_message *m, void *userdata, sd_bus_error *
                 name = c->data[PROP_STATIC_HOSTNAME];
 
         if (isempty(name))
-                name = "localhost";
+                name = FALLBACK_HOSTNAME;
 
-        if (!hostname_is_valid(name))
+        if (!hostname_is_valid(name, false))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid hostname '%s'", name);
 
         if (streq_ptr(name, c->data[PROP_HOSTNAME]))
@@ -434,6 +437,7 @@ static int method_set_hostname(sd_bus_message *m, void *userdata, sd_bus_error *
                         m,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.hostname1.set-hostname",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -453,7 +457,7 @@ static int method_set_hostname(sd_bus_message *m, void *userdata, sd_bus_error *
         r = context_update_kernel_hostname(c);
         if (r < 0) {
                 log_error_errno(r, "Failed to set host name: %m");
-                return sd_bus_error_set_errnof(error, r, "Failed to set hostname: %s", strerror(-r));
+                return sd_bus_error_set_errnof(error, r, "Failed to set hostname: %m");
         }
 
         log_info("Changed host name to '%s'", strna(c->data[PROP_HOSTNAME]));
@@ -476,8 +480,7 @@ static int method_set_static_hostname(sd_bus_message *m, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        if (isempty(name))
-                name = NULL;
+        name = empty_to_null(name);
 
         if (streq_ptr(name, c->data[PROP_STATIC_HOSTNAME]))
                 return sd_bus_reply_method_return(m, NULL);
@@ -486,6 +489,7 @@ static int method_set_static_hostname(sd_bus_message *m, void *userdata, sd_bus_
                         m,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.hostname1.set-static-hostname",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -495,13 +499,12 @@ static int method_set_static_hostname(sd_bus_message *m, void *userdata, sd_bus_
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        if (isempty(name)) {
-                free(c->data[PROP_STATIC_HOSTNAME]);
-                c->data[PROP_STATIC_HOSTNAME] = NULL;
-        } else {
+        if (isempty(name))
+                c->data[PROP_STATIC_HOSTNAME] = mfree(c->data[PROP_STATIC_HOSTNAME]);
+        else {
                 char *h;
 
-                if (!hostname_is_valid(name))
+                if (!hostname_is_valid(name, false))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid static hostname '%s'", name);
 
                 h = strdup(name);
@@ -515,13 +518,13 @@ static int method_set_static_hostname(sd_bus_message *m, void *userdata, sd_bus_
         r = context_update_kernel_hostname(c);
         if (r < 0) {
                 log_error_errno(r, "Failed to set host name: %m");
-                return sd_bus_error_set_errnof(error, r, "Failed to set hostname: %s", strerror(-r));
+                return sd_bus_error_set_errnof(error, r, "Failed to set hostname: %m");
         }
 
         r = context_write_data_static_hostname(c);
         if (r < 0) {
                 log_error_errno(r, "Failed to write static host name: %m");
-                return sd_bus_error_set_errnof(error, r, "Failed to set static hostname: %s", strerror(-r));
+                return sd_bus_error_set_errnof(error, r, "Failed to set static hostname: %m");
         }
 
         log_info("Changed static host name to '%s'", strna(c->data[PROP_STATIC_HOSTNAME]));
@@ -543,8 +546,7 @@ static int set_machine_info(Context *c, sd_bus_message *m, int prop, sd_bus_mess
         if (r < 0)
                 return r;
 
-        if (isempty(name))
-                name = NULL;
+        name = empty_to_null(name);
 
         if (streq_ptr(name, c->data[prop]))
                 return sd_bus_reply_method_return(m, NULL);
@@ -557,6 +559,7 @@ static int set_machine_info(Context *c, sd_bus_message *m, int prop, sd_bus_mess
                         m,
                         CAP_SYS_ADMIN,
                         prop == PROP_PRETTY_HOSTNAME ? "org.freedesktop.hostname1.set-static-hostname" : "org.freedesktop.hostname1.set-machine-info",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -566,10 +569,9 @@ static int set_machine_info(Context *c, sd_bus_message *m, int prop, sd_bus_mess
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        if (isempty(name)) {
-                free(c->data[prop]);
-                c->data[prop] = NULL;
-        } else {
+        if (isempty(name))
+                c->data[prop] = mfree(c->data[prop]);
+        else {
                 char *h;
 
                 /* The icon name might ultimately be used as file
@@ -597,7 +599,7 @@ static int set_machine_info(Context *c, sd_bus_message *m, int prop, sd_bus_mess
         r = context_write_data_machine_info(c);
         if (r < 0) {
                 log_error_errno(r, "Failed to write machine info: %m");
-                return sd_bus_error_set_errnof(error, r, "Failed to write machine info: %s", strerror(-r));
+                return sd_bus_error_set_errnof(error, r, "Failed to write machine info: %m");
         }
 
         log_info("Changed %s to '%s'",
@@ -663,7 +665,7 @@ static const sd_bus_vtable hostname_vtable[] = {
 };
 
 static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         assert(c);
@@ -678,9 +680,9 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to register object: %m");
 
-        r = sd_bus_request_name(bus, "org.freedesktop.hostname1", 0);
+        r = sd_bus_request_name_async(bus, NULL, "org.freedesktop.hostname1", 0, NULL, NULL);
         if (r < 0)
-                return log_error_errno(r, "Failed to register name: %m");
+                return log_error_errno(r, "Failed to request name: %m");
 
         r = sd_bus_attach_event(bus, event, 0);
         if (r < 0)
@@ -694,8 +696,8 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
 
 int main(int argc, char *argv[]) {
         Context context = {};
-        _cleanup_event_unref_ sd_event *event = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         log_set_target(LOG_TARGET_AUTO);
@@ -703,13 +705,7 @@ int main(int argc, char *argv[]) {
         log_open();
 
         umask(0022);
-        mac_selinux_init("/etc");
-
-        if (argc != 1) {
-                log_error("This program takes no arguments.");
-                r = -EINVAL;
-                goto finish;
-        }
+        mac_selinux_init();
 
         if (argc != 1) {
                 log_error("This program takes no arguments.");

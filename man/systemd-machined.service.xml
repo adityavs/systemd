@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2013 Zbigniew Jędrzejewski-Szmek
@@ -71,7 +73,7 @@
     names.</para>
 
     <para>See the
-    <ulink url="http://www.freedesktop.org/wiki/Software/systemd/machined">
+    <ulink url="https://www.freedesktop.org/wiki/Software/systemd/machined">
     machined D-Bus API Documentation</ulink> for information about the
     APIs <filename>systemd-machined</filename> provides.</para>
   </refsect1>

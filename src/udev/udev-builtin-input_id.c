@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * expose input properties via udev
  *
@@ -21,15 +22,19 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <unistd.h>
 #include <string.h>
-#include <errno.h>
+#include <unistd.h>
 #include <linux/limits.h>
 #include <linux/input.h>
 
+#include "fd-util.h"
+#include "missing.h"
+#include "stdio-util.h"
+#include "string-util.h"
 #include "udev.h"
 #include "util.h"
 
@@ -40,6 +45,17 @@
 #define BIT(x)  (1UL<<OFF(x))
 #define LONG(x) ((x)/BITS_PER_LONG)
 #define test_bit(bit, array)    ((array[LONG(bit)] >> OFF(bit)) & 1)
+
+struct range {
+        unsigned start;
+        unsigned end;
+};
+
+/* key code ranges above BTN_MISC (start is inclusive, stop is exclusive)*/
+static const struct range high_key_blocks[] = {
+        { KEY_OK, BTN_DPAD_UP },
+        { KEY_ALS_TOGGLE, BTN_TRIGGER_HAPPY }
+};
 
 static inline int abs_size_mm(const struct input_absinfo *absinfo) {
         /* Resolution is defined to be in units/mm for ABS_X/Y */
@@ -62,8 +78,8 @@ static void extract_info(struct udev_device *dev, const char *devpath, bool test
         if (xabsinfo.resolution <= 0 || yabsinfo.resolution <= 0)
                 return;
 
-        snprintf(width, sizeof(width), "%d", abs_size_mm(&xabsinfo));
-        snprintf(height, sizeof(height), "%d", abs_size_mm(&yabsinfo));
+        xsprintf(width, "%d", abs_size_mm(&xabsinfo));
+        xsprintf(height, "%d", abs_size_mm(&yabsinfo));
 
         udev_builtin_add_property(dev, test, "ID_INPUT_WIDTH_MM", width);
         udev_builtin_add_property(dev, test, "ID_INPUT_HEIGHT_MM", height);
@@ -86,10 +102,9 @@ static void get_cap_mask(struct udev_device *dev,
         unsigned long val;
 
         v = udev_device_get_sysattr_value(pdev, attr);
-        if (!v)
-                v = "";
+        v = strempty(v);
 
-        snprintf(text, sizeof(text), "%s", v);
+        xsprintf(text, "%s", v);
         log_debug("%s raw kernel attribute: %s", attr, text);
 
         memzero(bitmask, bitmask_size);
@@ -111,7 +126,8 @@ static void get_cap_mask(struct udev_device *dev,
 
         if (test) {
                 /* printf pattern with the right unsigned long number of hex chars */
-                snprintf(text, sizeof(text), "  bit %%4u: %%0%zulX\n", 2 * sizeof(unsigned long));
+                xsprintf(text, "  bit %%4u: %%0%zulX\n",
+                         2 * sizeof(unsigned long));
                 log_debug("%s decoded bit map:", attr);
                 val = bitmask_size / sizeof (unsigned long);
                 /* skip over leading zeros */
@@ -133,6 +149,7 @@ static bool test_pointers(struct udev_device *dev,
                           const unsigned long* bitmask_rel,
                           const unsigned long* bitmask_props,
                           bool test) {
+        int button, axis;
         bool has_abs_coordinates = false;
         bool has_rel_coordinates = false;
         bool has_mt_coordinates = false;
@@ -168,29 +185,27 @@ static bool test_pointers(struct udev_device *dev,
         is_pointing_stick = test_bit(INPUT_PROP_POINTING_STICK, bitmask_props);
         stylus_or_pen = test_bit(BTN_STYLUS, bitmask_key) || test_bit(BTN_TOOL_PEN, bitmask_key);
         finger_but_no_pen = test_bit(BTN_TOOL_FINGER, bitmask_key) && !test_bit(BTN_TOOL_PEN, bitmask_key);
-        has_mouse_button = test_bit(BTN_LEFT, bitmask_key);
+        for (button = BTN_MOUSE; button < BTN_JOYSTICK && !has_mouse_button; button++)
+                has_mouse_button = test_bit(button, bitmask_key);
         has_rel_coordinates = test_bit(EV_REL, bitmask_ev) && test_bit(REL_X, bitmask_rel) && test_bit(REL_Y, bitmask_rel);
         has_mt_coordinates = test_bit(ABS_MT_POSITION_X, bitmask_abs) && test_bit(ABS_MT_POSITION_Y, bitmask_abs);
 
         /* unset has_mt_coordinates if devices claims to have all abs axis */
-        if(has_mt_coordinates && test_bit(ABS_MT_SLOT, bitmask_abs) && test_bit(ABS_MT_SLOT - 1, bitmask_abs))
+        if (has_mt_coordinates && test_bit(ABS_MT_SLOT, bitmask_abs) && test_bit(ABS_MT_SLOT - 1, bitmask_abs))
                 has_mt_coordinates = false;
         is_direct = test_bit(INPUT_PROP_DIRECT, bitmask_props);
         has_touch = test_bit(BTN_TOUCH, bitmask_key);
         /* joysticks don't necessarily have buttons; e. g.
          * rudders/pedals are joystick-like, but buttonless; they have
-         * other fancy axes */
-        has_joystick_axes_or_buttons = test_bit(BTN_TRIGGER, bitmask_key) ||
-                                       test_bit(BTN_A, bitmask_key) ||
-                                       test_bit(BTN_1, bitmask_key) ||
-                                       test_bit(ABS_RX, bitmask_abs) ||
-                                       test_bit(ABS_RY, bitmask_abs) ||
-                                       test_bit(ABS_RZ, bitmask_abs) ||
-                                       test_bit(ABS_THROTTLE, bitmask_abs) ||
-                                       test_bit(ABS_RUDDER, bitmask_abs) ||
-                                       test_bit(ABS_WHEEL, bitmask_abs) ||
-                                       test_bit(ABS_GAS, bitmask_abs) ||
-                                       test_bit(ABS_BRAKE, bitmask_abs);
+         * other fancy axes. Others have buttons only but no axes. */
+        for (button = BTN_JOYSTICK; button < BTN_DIGI && !has_joystick_axes_or_buttons; button++)
+                has_joystick_axes_or_buttons = test_bit(button, bitmask_key);
+        for (button = BTN_TRIGGER_HAPPY1; button <= BTN_TRIGGER_HAPPY40 && !has_joystick_axes_or_buttons; button++)
+                has_joystick_axes_or_buttons = test_bit(button, bitmask_key);
+        for (button = BTN_DPAD_UP; button <= BTN_DPAD_RIGHT && !has_joystick_axes_or_buttons; button++)
+                has_joystick_axes_or_buttons = test_bit(button, bitmask_key);
+        for (axis = ABS_RX; axis < ABS_PRESSURE && !has_joystick_axes_or_buttons; axis++)
+                has_joystick_axes_or_buttons = test_bit(axis, bitmask_abs);
 
         if (has_abs_coordinates) {
                 if (stylus_or_pen)
@@ -201,15 +216,26 @@ static bool test_pointers(struct udev_device *dev,
                         /* This path is taken by VMware's USB mouse, which has
                          * absolute axes, but no touch/pressure button. */
                         is_mouse = true;
-                else if (has_touch)
+                else if (has_touch || is_direct)
                         is_touchscreen = true;
                 else if (has_joystick_axes_or_buttons)
                         is_joystick = true;
+        } else if (has_joystick_axes_or_buttons) {
+                is_joystick = true;
         }
-        if (has_mt_coordinates && is_direct)
-                is_touchscreen = true;
 
-        if (has_rel_coordinates && has_mouse_button)
+        if (has_mt_coordinates) {
+                if (stylus_or_pen)
+                        is_tablet = true;
+                else if (finger_but_no_pen && !is_direct)
+                        is_touchpad = true;
+                else if (has_touch || is_direct)
+                        is_touchscreen = true;
+        }
+
+        if (has_mouse_button &&
+            (has_rel_coordinates ||
+            !has_abs_coordinates)) /* mouse buttons and no axis */
                 is_mouse = true;
 
         if (is_pointing_stick)
@@ -250,13 +276,16 @@ static bool test_key(struct udev_device *dev,
                 found |= bitmask_key[i];
                 log_debug("test_key: checking bit block %lu for any keys; found=%i", (unsigned long)i*BITS_PER_LONG, found > 0);
         }
-        /* If there are no keys in the lower block, check the higher block */
+        /* If there are no keys in the lower block, check the higher blocks */
         if (!found) {
-                for (i = KEY_OK; i < BTN_TRIGGER_HAPPY; ++i) {
-                        if (test_bit(i, bitmask_key)) {
-                                log_debug("test_key: Found key %x in high block", i);
-                                found = 1;
-                                break;
+                unsigned block;
+                for (block = 0; block < (sizeof(high_key_blocks) / sizeof(struct range)); ++block) {
+                        for (i = high_key_blocks[block].start; i < high_key_blocks[block].end; ++i) {
+                                if (test_bit(i, bitmask_key)) {
+                                        log_debug("test_key: Found key %x in high block", i);
+                                        found = 1;
+                                        break;
+                                }
                         }
                 }
         }
@@ -313,6 +342,9 @@ static int builtin_input_id(struct udev_device *dev, int argc, char *argv[], boo
                 if (!is_pointer && !is_key && test_bit(EV_REL, bitmask_ev) &&
                     (test_bit(REL_WHEEL, bitmask_rel) || test_bit(REL_HWHEEL, bitmask_rel)))
                         udev_builtin_add_property(dev, test, "ID_INPUT_KEY", "1");
+                if (test_bit(EV_SW, bitmask_ev))
+                        udev_builtin_add_property(dev, test, "ID_INPUT_SWITCH", "1");
+
         }
 
         devnode = udev_device_get_devnode(dev);

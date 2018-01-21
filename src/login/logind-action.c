@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,15 +20,18 @@
 
 #include <unistd.h>
 
-#include "conf-parser.h"
-#include "special.h"
-#include "sleep-config.h"
-#include "bus-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-util.h"
+#include "conf-parser.h"
+#include "format-util.h"
 #include "logind-action.h"
-#include "formats-util.h"
 #include "process-util.h"
+#include "sleep-config.h"
+#include "special.h"
+#include "string-table.h"
 #include "terminal-util.h"
+#include "user-util.h"
 
 int manager_handle_action(
                 Manager *m,
@@ -58,7 +60,7 @@ int manager_handle_action(
                 [HANDLE_HYBRID_SLEEP] = SPECIAL_HYBRID_SLEEP_TARGET
         };
 
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         InhibitWhat inhibit_operation;
         Inhibitor *offending = NULL;
         bool supported;
@@ -123,7 +125,7 @@ int manager_handle_action(
                 return -EALREADY;
         }
 
-        inhibit_operation = handle == HANDLE_SUSPEND || handle == HANDLE_HIBERNATE || handle == HANDLE_HYBRID_SLEEP ? INHIBIT_SLEEP : INHIBIT_SHUTDOWN;
+        inhibit_operation = IN_SET(handle, HANDLE_SUSPEND, HANDLE_HIBERNATE, HANDLE_HYBRID_SLEEP) ? INHIBIT_SLEEP : INHIBIT_SHUTDOWN;
 
         /* If the actual operation is inhibited, warn and fail */
         if (!ignore_inhibited &&
@@ -147,7 +149,6 @@ int manager_handle_action(
                           offending->uid, strna(u),
                           offending->pid, strna(comm));
 
-                warn_melody();
                 return -EPERM;
         }
 

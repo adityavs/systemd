@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -102,7 +104,18 @@
   </refsect1>
 
   <refsect1>
+    <title>Signal safety</title>
+
+    <para><function>sd_journal_stream_fd()</function> is "async signal safe" in the meaning of
+    <citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+    </para>
+  </refsect1>
+
+  <refsect1>
     <title>Notes</title>
+
+    <para>Function <function>sd_journal_stream_fd()</function> is thread-safe and may be called
+    from multiple threads.</para>
 
     <para>The <function>sd_journal_stream_fd()</function> interface is
     available as a shared library, which can be compiled and linked to

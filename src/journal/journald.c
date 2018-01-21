@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,16 +20,16 @@
 
 #include <unistd.h>
 
-#include "systemd/sd-messages.h"
-#include "systemd/sd-daemon.h"
+#include "sd-daemon.h"
+#include "sd-messages.h"
 
+#include "format-util.h"
 #include "journal-authenticate.h"
-#include "journald-server.h"
 #include "journald-kmsg.h"
+#include "journald-server.h"
 #include "journald-syslog.h"
-
+#include "process-util.h"
 #include "sigbus.h"
-#include "formats-util.h"
 
 int main(int argc, char *argv[]) {
         Server server;
@@ -54,16 +53,20 @@ int main(int argc, char *argv[]) {
         if (r < 0)
                 goto finish;
 
-        server_vacuum(&server);
-        server_flush_to_var(&server);
+        server_vacuum(&server, false);
+        server_flush_to_var(&server, true);
         server_flush_dev_kmsg(&server);
 
-        log_debug("systemd-journald running as pid "PID_FMT, getpid());
-        server_driver_message(&server, SD_MESSAGE_JOURNAL_START, "Journal started");
+        log_debug("systemd-journald running as pid "PID_FMT, getpid_cached());
+        server_driver_message(&server, 0,
+                              "MESSAGE_ID=" SD_MESSAGE_JOURNAL_START_STR,
+                              LOG_MESSAGE("Journal started"),
+                              NULL);
 
-        sd_notify(false,
-                  "READY=1\n"
-                  "STATUS=Processing requests...");
+        /* Make sure to send the usage message *after* flushing the
+         * journal so entries from the runtime journals are ordered
+         * before this message. See #4190 for some details. */
+        server_space_usage_message(&server, NULL);
 
         for (;;) {
                 usec_t t = USEC_INFINITY, n;
@@ -82,7 +85,7 @@ int main(int argc, char *argv[]) {
                         if (server.oldest_file_usec + server.max_retention_usec < n) {
                                 log_info("Retention time reached.");
                                 server_rotate(&server);
-                                server_vacuum(&server);
+                                server_vacuum(&server, false);
                                 continue;
                         }
 
@@ -90,7 +93,7 @@ int main(int argc, char *argv[]) {
                         t = server.oldest_file_usec + server.max_retention_usec - n;
                 }
 
-#ifdef HAVE_GCRYPT
+#if HAVE_GCRYPT
                 if (server.system_journal) {
                         usec_t u;
 
@@ -113,14 +116,13 @@ int main(int argc, char *argv[]) {
                 server_maybe_warn_forward_syslog_missed(&server);
         }
 
-        log_debug("systemd-journald stopped as pid "PID_FMT, getpid());
-        server_driver_message(&server, SD_MESSAGE_JOURNAL_STOP, "Journal stopped");
+        log_debug("systemd-journald stopped as pid "PID_FMT, getpid_cached());
+        server_driver_message(&server, 0,
+                              "MESSAGE_ID=" SD_MESSAGE_JOURNAL_STOP_STR,
+                              LOG_MESSAGE("Journal stopped"),
+                              NULL);
 
 finish:
-        sd_notify(false,
-                  "STOPPING=1\n"
-                  "STATUS=Shutting down...");
-
         server_done(&server);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,13 +21,15 @@
 #include <errno.h>
 #include <string.h>
 
-#include "util.h"
-#include "bus-util.h"
-#include "strv.h"
+#include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-label.h"
-#include "logind.h"
+#include "bus-util.h"
 #include "logind-seat.h"
+#include "logind.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
 
 static int property_get_active_session(
                 sd_bus *bus,
@@ -204,6 +205,7 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
                         message,
                         CAP_KILL,
                         "org.freedesktop.login1.manage",
+                        NULL,
                         false,
                         UID_INVALID,
                         &s->manager->polkit_registry,
@@ -305,7 +307,7 @@ const sd_bus_vtable seat_vtable[] = {
         SD_BUS_PROPERTY("CanMultiSession", "b", property_get_can_multi_session, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("CanTTY", "b", property_get_can_tty, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("CanGraphical", "b", property_get_can_graphical, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("Sessions", "a(so)", property_get_sessions, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("Sessions", "a(so)", property_get_sessions, 0, 0),
         SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -331,28 +333,15 @@ int seat_object_find(sd_bus *bus, const char *path, const char *interface, void 
         assert(m);
 
         if (streq(path, "/org/freedesktop/login1/seat/self")) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
                 sd_bus_message *message;
-                Session *session;
-                const char *name;
 
                 message = sd_bus_get_current_message(bus);
                 if (!message)
                         return 0;
 
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_SESSION|SD_BUS_CREDS_AUGMENT, &creds);
+                r = manager_get_seat_from_creds(m, message, NULL, error, &seat);
                 if (r < 0)
                         return r;
-
-                r = sd_bus_creds_get_session(creds, &name);
-                if (r < 0)
-                        return r;
-
-                session = hashmap_get(m->sessions, name);
-                if (!session)
-                        return 0;
-
-                seat = session->seat;
         } else {
                 _cleanup_free_ char *e = NULL;
                 const char *p;
@@ -366,10 +355,9 @@ int seat_object_find(sd_bus *bus, const char *path, const char *interface, void 
                         return -ENOMEM;
 
                 seat = hashmap_get(m->seats, e);
+                if (!seat)
+                        return 0;
         }
-
-        if (!seat)
-                return 0;
 
         *found = seat;
         return 1;
@@ -413,7 +401,7 @@ int seat_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***
 
         message = sd_bus_get_current_message(bus);
         if (message) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
                 const char *name;
                 Session *session;
 

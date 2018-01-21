@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,17 +19,25 @@
 ***/
 
 #include <errno.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdio_ext.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "sd-messages.h"
-#include "logind-seat.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "format-util.h"
 #include "logind-acl.h"
-#include "util.h"
+#include "logind-seat.h"
 #include "mkdir.h"
-#include "formats-util.h"
+#include "parse-util.h"
+#include "stdio-util.h"
+#include "string-util.h"
 #include "terminal-util.h"
+#include "util.h"
 
 Seat *seat_new(Manager *m, const char *id) {
         Seat *s;
@@ -43,18 +50,15 @@ Seat *seat_new(Manager *m, const char *id) {
                 return NULL;
 
         s->state_file = strappend("/run/systemd/seats/", id);
-        if (!s->state_file) {
-                free(s);
-                return NULL;
-        }
+        if (!s->state_file)
+                return mfree(s);
 
         s->id = basename(s->state_file);
         s->manager = m;
 
         if (hashmap_put(m->seats, s->id, s) < 0) {
                 free(s->state_file);
-                free(s);
-                return NULL;
+                return mfree(s);
         }
 
         return s;
@@ -91,15 +95,16 @@ int seat_save(Seat *s) {
         if (!s->started)
                 return 0;
 
-        r = mkdir_safe_label("/run/systemd/seats", 0755, 0, 0);
+        r = mkdir_safe_label("/run/systemd/seats", 0755, 0, 0, false);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         r = fopen_temporary(s->state_file, &f, &temp_path);
         if (r < 0)
-                goto finish;
+                goto fail;
 
-        fchmod(fileno(f), 0644);
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
@@ -141,19 +146,24 @@ int seat_save(Seat *s) {
                                 i->sessions_by_seat_next ? ' ' : '\n');
         }
 
-        fflush(f);
+        r = fflush_and_check(f);
+        if (r < 0)
+                goto fail;
 
-        if (ferror(f) || rename(temp_path, s->state_file) < 0) {
+        if (rename(temp_path, s->state_file) < 0) {
                 r = -errno;
-                unlink(s->state_file);
-                unlink(temp_path);
+                goto fail;
         }
 
-finish:
-        if (r < 0)
-                log_error_errno(r, "Failed to save seat data %s: %m", s->state_file);
+        return 0;
 
-        return r;
+fail:
+        (void) unlink(s->state_file);
+
+        if (temp_path)
+                (void) unlink(temp_path);
+
+        return log_error_errno(r, "Failed to save seat data %s: %m", s->state_file);
 }
 
 int seat_load(Seat *s) {
@@ -170,7 +180,7 @@ static int vt_allocate(unsigned int vtnr) {
 
         assert(vtnr >= 1);
 
-        snprintf(p, sizeof(p), "/dev/tty%u", vtnr);
+        xsprintf(p, "/dev/tty%u", vtnr);
         fd = open_terminal(p, O_RDWR|O_NOCTTY|O_CLOEXEC);
         if (fd < 0)
                 return -errno;
@@ -269,7 +279,7 @@ int seat_set_active(Seat *s, Session *session) {
 int seat_switch_to(Seat *s, unsigned int num) {
         /* Public session positions skip 0 (there is only F1-F12). Maybe it
          * will get reassigned in the future, so return error for now. */
-        if (!num)
+        if (num == 0)
                 return -EINVAL;
 
         if (num >= s->position_count || !s->positions[num]) {
@@ -286,12 +296,12 @@ int seat_switch_to(Seat *s, unsigned int num) {
 int seat_switch_to_next(Seat *s) {
         unsigned int start, i;
 
-        if (!s->position_count)
+        if (s->position_count == 0)
                 return -EINVAL;
 
         start = 1;
-        if (s->active && s->active->pos > 0)
-                start = s->active->pos;
+        if (s->active && s->active->position > 0)
+                start = s->active->position;
 
         for (i = start + 1; i < s->position_count; ++i)
                 if (s->positions[i])
@@ -307,12 +317,12 @@ int seat_switch_to_next(Seat *s) {
 int seat_switch_to_previous(Seat *s) {
         unsigned int start, i;
 
-        if (!s->position_count)
+        if (s->position_count == 0)
                 return -EINVAL;
 
         start = 1;
-        if (s->active && s->active->pos > 0)
-                start = s->active->pos;
+        if (s->active && s->active->position > 0)
+                start = s->active->position;
 
         for (i = start - 1; i > 0; --i)
                 if (s->positions[i])
@@ -372,7 +382,8 @@ int seat_read_active_vt(Seat *s) {
         if (!seat_has_vts(s))
                 return 0;
 
-        lseek(s->manager->console_active_fd, SEEK_SET, 0);
+        if (lseek(s->manager->console_active_fd, SEEK_SET, 0) < 0)
+                return log_error_errno(errno, "lseek on console_active_fd failed: %m");
 
         k = read(s->manager->console_active_fd, t, sizeof(t)-1);
         if (k <= 0) {
@@ -389,10 +400,8 @@ int seat_read_active_vt(Seat *s) {
         }
 
         r = safe_atou(t+3, &vtnr);
-        if (r < 0) {
-                log_error("Failed to parse VT number %s", t+3);
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse VT number \"%s\": %m", t+3);
 
         if (!vtnr) {
                 log_error("VT number invalid: %s", t+3);
@@ -409,7 +418,7 @@ int seat_start(Seat *s) {
                 return 0;
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_SEAT_START),
+                   "MESSAGE_ID=" SD_MESSAGE_SEAT_START_STR,
                    "SEAT_ID=%s", s->id,
                    LOG_MESSAGE("New seat %s.", s->id),
                    NULL);
@@ -437,7 +446,7 @@ int seat_stop(Seat *s, bool force) {
 
         if (s->started)
                 log_struct(LOG_INFO,
-                           LOG_MESSAGE_ID(SD_MESSAGE_SEAT_STOP),
+                           "MESSAGE_ID=" SD_MESSAGE_SEAT_STOP_STR,
                            "SEAT_ID=%s", s->id,
                            LOG_MESSAGE("Removed seat %s.", s->id),
                            NULL);
@@ -472,21 +481,21 @@ int seat_stop_sessions(Seat *s, bool force) {
 
 void seat_evict_position(Seat *s, Session *session) {
         Session *iter;
-        unsigned int pos = session->pos;
+        unsigned int pos = session->position;
 
-        session->pos = 0;
+        session->position = 0;
 
-        if (!pos)
+        if (pos == 0)
                 return;
 
         if (pos < s->position_count && s->positions[pos] == session) {
                 s->positions[pos] = NULL;
 
                 /* There might be another session claiming the same
-                 * position (eg., during gdm->session transition), so lets look
+                 * position (eg., during gdm->session transition), so let's look
                  * for it and set it on the free slot. */
                 LIST_FOREACH(sessions_by_seat, iter, s->sessions) {
-                        if (iter->pos == pos) {
+                        if (iter->position == pos && session_get_state(iter) != SESSION_CLOSING) {
                                 s->positions[pos] = iter;
                                 break;
                         }
@@ -504,15 +513,15 @@ void seat_claim_position(Seat *s, Session *session, unsigned int pos) {
 
         seat_evict_position(s, session);
 
-        session->pos = pos;
-        if (pos > 0 && !s->positions[pos])
+        session->position = pos;
+        if (pos > 0)
                 s->positions[pos] = session;
 }
 
 static void seat_assign_position(Seat *s, Session *session) {
         unsigned int pos;
 
-        if (session->pos > 0)
+        if (session->position > 0)
                 return;
 
         for (pos = 1; pos < s->position_count; ++pos)
@@ -533,8 +542,6 @@ int seat_attach_session(Seat *s, Session *session) {
         session->seat = s;
         LIST_PREPEND(sessions_by_seat, s->sessions, session);
         seat_assign_position(s, session);
-
-        seat_send_changed(s, "Sessions", NULL);
 
         /* On seats with VTs, the VT logic defines which session is active. On
          * seats without VTs, we automatically activate new sessions. */
@@ -659,8 +666,7 @@ static bool seat_name_valid_char(char c) {
                 (c >= 'a' && c <= 'z') ||
                 (c >= 'A' && c <= 'Z') ||
                 (c >= '0' && c <= '9') ||
-                c == '-' ||
-                c == '_';
+                IN_SET(c, '-', '_');
 }
 
 bool seat_name_is_valid(const char *name) {

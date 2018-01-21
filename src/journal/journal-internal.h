@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,18 +20,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <sys/types.h>
 
-#include "systemd/sd-id128.h"
-
-#include "journal-def.h"
-#include "list.h"
-#include "hashmap.h"
-#include "set.h"
-#include "journal-file.h"
+#include "sd-id128.h"
 #include "sd-journal.h"
+
+#include "hashmap.h"
+#include "journal-def.h"
+#include "journal-file.h"
+#include "list.h"
+#include "set.h"
 
 typedef struct Match Match;
 typedef struct Location Location;
@@ -84,6 +83,8 @@ struct Directory {
 };
 
 struct sd_journal {
+        int toplevel_fd;
+
         char *path;
         char *prefix;
 
@@ -103,32 +104,41 @@ struct sd_journal {
         unsigned current_invalidate_counter, last_invalidate_counter;
         usec_t last_process_usec;
 
+        /* Iterating through unique fields and their data values */
         char *unique_field;
         JournalFile *unique_file;
         uint64_t unique_offset;
 
+        /* Iterating through known fields */
+        JournalFile *fields_file;
+        uint64_t fields_offset;
+        uint64_t fields_hash_table_index;
+        char *fields_buffer;
+        size_t fields_buffer_allocated;
+
         int flags;
 
-        bool on_network;
-        bool no_new_files;
-        bool unique_file_lost; /* File we were iterating over got
-                                  removed, and there were no more
-                                  files, so sd_j_enumerate_unique
-                                  will return a value equal to 0. */
+        bool on_network:1;
+        bool no_new_files:1;
+        bool no_inotify:1;
+        bool unique_file_lost:1; /* File we were iterating over got
+                                    removed, and there were no more
+                                    files, so sd_j_enumerate_unique
+                                    will return a value equal to 0. */
+        bool fields_file_lost:1;
+        bool has_runtime_files:1;
+        bool has_persistent_files:1;
 
         size_t data_threshold;
 
         Hashmap *directories_by_path;
         Hashmap *directories_by_wd;
 
-        Set *errors;
+        Hashmap *errors;
 };
 
 char *journal_make_match_string(sd_journal *j);
 void journal_print_header(sd_journal *j);
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(sd_journal*, sd_journal_close);
-#define _cleanup_journal_close_ _cleanup_(sd_journal_closep)
 
 #define JOURNAL_FOREACH_DATA_RETVAL(j, data, l, retval)                     \
         for (sd_journal_restart_data(j); ((retval) = sd_journal_enumerate_data((j), &(data), &(l))) > 0; )

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,11 +18,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "systemd/sd-journal.h"
+#include "sd-journal.h"
 
 #include "log.h"
-#include "util.h"
+#include "parse-util.h"
 #include "rm-rf.h"
+#include "util.h"
 
 int main(int argc, char *argv[]) {
         sd_journal *j;

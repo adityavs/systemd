@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
+
 /***
   This file is part of systemd.
 
@@ -18,11 +21,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#pragma once
-
 #include "libudev.h"
-#include "libudev-private.h"
 #include "sd-device.h"
+
+#include "libudev-private.h"
 
 /**
  * udev_device:

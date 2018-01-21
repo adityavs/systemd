@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,24 +18,27 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/epoll.h>
 #include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-bus.h"
+#include "sd-daemon.h"
 
-#include "util.h"
-#include "log.h"
-#include "list.h"
-#include "initreq.h"
-#include "special.h"
-#include "bus-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-util.h"
 #include "def.h"
-#include "formats-util.h"
+#include "fd-util.h"
+#include "format-util.h"
+#include "initreq.h"
+#include "list.h"
+#include "log.h"
+#include "special.h"
+#include "util.h"
+#include "process-util.h"
 
 #define SERVER_FD_MAX 16
 #define TIMEOUT_MSEC ((int) (DEFAULT_EXIT_USEC/USEC_PER_MSEC))
@@ -99,7 +101,7 @@ static const char *translate_runlevel(int runlevel, bool *isolate) {
 
 static void change_runlevel(Server *s, int runlevel) {
         const char *target;
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *mode;
         bool isolate = false;
         int r;
@@ -210,8 +212,7 @@ static int fifo_process(Fifo *f) {
                 if (errno == EAGAIN)
                         return 0;
 
-                log_warning_errno(errno, "Failed to read from fifo: %m");
-                return -errno;
+                return log_warning_errno(errno, "Failed to read from fifo: %m");
         }
 
         f->bytes_read += l;
@@ -269,8 +270,8 @@ static int server_init(Server *s, unsigned n_sockets) {
 
         s->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
         if (s->epoll_fd < 0) {
-                r = -errno;
-                log_error_errno(errno, "Failed to create epoll object: %m");
+                r = log_error_errno(errno,
+                                    "Failed to create epoll object: %m");
                 goto fail;
         }
 
@@ -315,10 +316,10 @@ static int server_init(Server *s, unsigned n_sockets) {
                 f->fd = fd;
                 LIST_PREPEND(fifo, s->fifos, f);
                 f->server = s;
-                s->n_fifos ++;
+                s->n_fifos++;
         }
 
-        r = bus_open_system_systemd(&s->bus);
+        r = bus_connect_system_systemd(&s->bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to get D-Bus connection: %m");
                 r = -EIO;
@@ -389,7 +390,7 @@ int main(int argc, char *argv[]) {
         if (server_init(&server, (unsigned) n) < 0)
                 return EXIT_FAILURE;
 
-        log_debug("systemd-initctl running as pid "PID_FMT, getpid());
+        log_debug("systemd-initctl running as pid "PID_FMT, getpid_cached());
 
         sd_notify(false,
                   "READY=1\n"
@@ -399,13 +400,10 @@ int main(int argc, char *argv[]) {
                 struct epoll_event event;
                 int k;
 
-                if ((k = epoll_wait(server.epoll_fd,
-                                    &event, 1,
-                                    TIMEOUT_MSEC)) < 0) {
-
+                k = epoll_wait(server.epoll_fd, &event, 1, TIMEOUT_MSEC);
+                if (k < 0) {
                         if (errno == EINTR)
                                 continue;
-
                         log_error_errno(errno, "epoll_wait() failed: %m");
                         goto fail;
                 }
@@ -419,7 +417,7 @@ int main(int argc, char *argv[]) {
 
         r = EXIT_SUCCESS;
 
-        log_debug("systemd-initctl stopped as pid "PID_FMT, getpid());
+        log_debug("systemd-initctl stopped as pid "PID_FMT, getpid_cached());
 
 fail:
         sd_notify(false,

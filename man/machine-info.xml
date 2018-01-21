@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
@@ -120,11 +122,12 @@
         chassis types are defined:
         <literal>desktop</literal>,
         <literal>laptop</literal>,
+        <literal>convertible</literal>,
         <literal>server</literal>,
         <literal>tablet</literal>,
         <literal>handset</literal>,
         <literal>watch</literal>, and
-        <literal>embedded</literal>
+        <literal>embedded</literal>,
         as well as the special chassis types
         <literal>vm</literal> and
         <literal>container</literal> for

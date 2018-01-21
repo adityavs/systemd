@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,6 +20,7 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "hashmap.h"
 #include "macro.h"
 #include "set.h"
 #include "unit-name.h"
@@ -34,29 +34,24 @@ int write_drop_in(const char *dir, const char *unit, unsigned level,
 int write_drop_in_format(const char *dir, const char *unit, unsigned level,
                          const char *name, const char *format, ...) _printf_(5, 6);
 
-/**
- * This callback will be called for each directory entry @entry,
- * with @filepath being the full path to the entry.
- *
- * If return value is negative, loop will be aborted.
- */
-typedef int (*dependency_consumer_t)(UnitDependency dependency,
-                                     const char *entry,
-                                     const char* filepath,
-                                     void *arg);
-
-int unit_file_process_dir(
-                Set * unit_path_cache,
-                const char *unit_path,
-                const char *name,
-                const char *suffix,
-                UnitDependency dependency,
-                dependency_consumer_t consumer,
-                void *arg,
-                char ***strv);
-
 int unit_file_find_dropin_paths(
+                const char *original_root,
+                char **lookup_path,
+                Set *unit_path_cache,
+                const char *dir_suffix,
+                const char *file_suffix,
+                Set *names,
+                char ***paths);
+
+static inline int unit_file_find_dropin_conf_paths(
+                const char *original_root,
                 char **lookup_path,
                 Set *unit_path_cache,
                 Set *names,
-                char ***paths);
+                char ***paths) {
+        return unit_file_find_dropin_paths(original_root,
+                                           lookup_path,
+                                           unit_path_cache,
+                                           ".d", ".conf",
+                                           names, paths);
+}

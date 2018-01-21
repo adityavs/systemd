@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,34 +18,40 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
 #include <errno.h>
-#include <string.h>
 #include <getopt.h>
 #include <locale.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "sd-bus.h"
-#include "bus-util.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
-#include "log.h"
-#include "util.h"
-#include "macro.h"
-#include "pager.h"
-#include "build.h"
-#include "strv.h"
-#include "unit-name.h"
-#include "sysfs-show.h"
-#include "logs-show.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
-#include "spawn-polkit-agent.h"
-#include "verbs.h"
+#include "log.h"
+#include "logs-show.h"
+#include "macro.h"
+#include "pager.h"
+#include "parse-util.h"
 #include "process-util.h"
-#include "terminal-util.h"
+#include "sigbus.h"
 #include "signal-util.h"
+#include "spawn-polkit-agent.h"
+#include "strv.h"
+#include "sysfs-show.h"
+#include "terminal-util.h"
+#include "unit-name.h"
+#include "user-util.h"
+#include "util.h"
+#include "verbs.h"
 
 static char **arg_property = NULL;
 static bool arg_all = false;
+static bool arg_value = false;
 static bool arg_full = false;
 static bool arg_no_pager = false;
 static bool arg_legend = true;
@@ -58,39 +63,45 @@ static bool arg_ask_password = true;
 static unsigned arg_lines = 10;
 static OutputMode arg_output = OUTPUT_SHORT;
 
-static void pager_open_if_enabled(void) {
-
-        if (arg_no_pager)
-                return;
-
-        pager_open(false);
-}
-
-static void polkit_agent_open_if_enabled(void) {
-
-        /* Open the polkit agent as a child process if necessary */
-
-        if (!arg_ask_password)
-                return;
-
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
-                return;
-
-        polkit_agent_open();
-}
-
 static OutputFlags get_output_flags(void) {
 
         return
                 arg_all * OUTPUT_SHOW_ALL |
-                arg_full * OUTPUT_FULL_WIDTH |
-                (!on_tty() || pager_have()) * OUTPUT_FULL_WIDTH |
-                on_tty() * OUTPUT_COLOR;
+                (arg_full || !on_tty() || pager_have()) * OUTPUT_FULL_WIDTH |
+                colors_enabled() * OUTPUT_COLOR;
+}
+
+static int get_session_path(sd_bus *bus, const char *session_id, sd_bus_error *error, char **path) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        int r;
+        char *ans;
+
+        r = sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.login1",
+                        "/org/freedesktop/login1",
+                        "org.freedesktop.login1.Manager",
+                        "GetSession",
+                        error, &reply,
+                        "s", session_id);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_read(reply, "o", &ans);
+        if (r < 0)
+                return r;
+
+        ans = strdup(ans);
+        if (!ans)
+                return -ENOMEM;
+
+        *path = ans;
+        return 0;
 }
 
 static int list_sessions(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *id, *user, *seat, *object;
         sd_bus *bus = userdata;
         unsigned k = 0;
@@ -100,7 +111,7 @@ static int list_sessions(int argc, char *argv[], void *userdata) {
         assert(bus);
         assert(argv);
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         r = sd_bus_call_method(
                         bus,
@@ -120,10 +131,38 @@ static int list_sessions(int argc, char *argv[], void *userdata) {
                 return bus_log_parse_error(r);
 
         if (arg_legend)
-                printf("%10s %10s %-16s %-16s\n", "SESSION", "UID", "USER", "SEAT");
+                printf("%10s %10s %-16s %-16s %-16s\n", "SESSION", "UID", "USER", "SEAT", "TTY");
 
         while ((r = sd_bus_message_read(reply, "(susso)", &id, &uid, &user, &seat, &object)) > 0) {
-                printf("%10s %10u %-16s %-16s\n", id, (unsigned) uid, user, seat);
+                _cleanup_(sd_bus_error_free) sd_bus_error error2 = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply2 = NULL;
+                _cleanup_free_ char *path = NULL;
+                const char *tty = NULL;
+
+                r = get_session_path(bus, id, &error2, &path);
+                if (r < 0)
+                        log_warning("Failed to get session path: %s", bus_error_message(&error, r));
+                else {
+                        r = sd_bus_get_property(
+                                        bus,
+                                        "org.freedesktop.login1",
+                                        path,
+                                        "org.freedesktop.login1.Session",
+                                        "TTY",
+                                        &error2,
+                                        &reply2,
+                                        "s");
+                        if (r < 0)
+                                log_warning("Failed to get TTY for session %s: %s",
+                                            id, bus_error_message(&error2, r));
+                        else {
+                                r = sd_bus_message_read(reply2, "s", &tty);
+                                if (r < 0)
+                                        return bus_log_parse_error(r);
+                        }
+                }
+
+                printf("%10s %10"PRIu32" %-16s %-16s %-16s\n", id, uid, user, seat, strna(tty));
                 k++;
         }
         if (r < 0)
@@ -136,8 +175,8 @@ static int list_sessions(int argc, char *argv[], void *userdata) {
 }
 
 static int list_users(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *user, *object;
         sd_bus *bus = userdata;
         unsigned k = 0;
@@ -147,7 +186,7 @@ static int list_users(int argc, char *argv[], void *userdata) {
         assert(bus);
         assert(argv);
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         r = sd_bus_call_method(
                         bus,
@@ -170,7 +209,7 @@ static int list_users(int argc, char *argv[], void *userdata) {
                 printf("%10s %-16s\n", "UID", "USER");
 
         while ((r = sd_bus_message_read(reply, "(uso)", &uid, &user, &object)) > 0) {
-                printf("%10u %-16s\n", (unsigned) uid, user);
+                printf("%10"PRIu32" %-16s\n", uid, user);
                 k++;
         }
         if (r < 0)
@@ -183,17 +222,16 @@ static int list_users(int argc, char *argv[], void *userdata) {
 }
 
 static int list_seats(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *seat, *object;
         sd_bus *bus = userdata;
         unsigned k = 0;
         int r;
-
         assert(bus);
         assert(argv);
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         r = sd_bus_call_method(
                         bus,
@@ -229,41 +267,19 @@ static int list_seats(int argc, char *argv[], void *userdata) {
 }
 
 static int show_unit_cgroup(sd_bus *bus, const char *interface, const char *unit, pid_t leader) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_free_ char *path = NULL;
-        const char *cgroup;
-        int r;
+        _cleanup_free_ char *cgroup = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         unsigned c;
+        int r;
 
         assert(bus);
         assert(unit);
 
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
-                return 0;
-
-        path = unit_dbus_path_from_name(unit);
-        if (!path)
-                return -ENOMEM;
-
-        r = sd_bus_get_property(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        path,
-                        interface,
-                        "ControlGroup",
-                        &error, &reply, "s");
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_read(reply, "s", &cgroup);
+        r = show_cgroup_get_unit_path_and_warn(bus, unit, &cgroup);
         if (r < 0)
                 return r;
 
         if (isempty(cgroup))
-                return 0;
-
-        if (cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, cgroup, false) != 0 && leader <= 0)
                 return 0;
 
         c = columns();
@@ -272,7 +288,21 @@ static int show_unit_cgroup(sd_bus *bus, const char *interface, const char *unit
         else
                 c = 0;
 
-        show_cgroup_and_extra(SYSTEMD_CGROUP_CONTROLLER, cgroup, "\t\t  ", c, false, &leader, leader > 0, get_output_flags());
+        r = unit_show_processes(bus, unit, cgroup, "\t\t  ", c, get_output_flags(), &error);
+        if (r == -EBADR) {
+
+                if (arg_transport == BUS_TRANSPORT_REMOTE)
+                        return 0;
+
+                /* Fallback for older systemd versions where the GetUnitProcesses() call is not yet available */
+
+                if (cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, cgroup) != 0 && leader <= 0)
+                        return 0;
+
+                show_cgroup_and_extra(SYSTEMD_CGROUP_CONTROLLER, cgroup, "\t\t  ", c, &leader, leader > 0, get_output_flags());
+        } else if (r < 0)
+                return log_error_errno(r, "Failed to dump process list: %s", bus_error_message(&error, r));
+
         return 0;
 }
 
@@ -285,7 +315,7 @@ typedef struct SessionStatusInfo {
         char *seat;
         char *tty;
         char *display;
-        bool remote;
+        int remote;
         char *remote_host;
         char *remote_user;
         char *service;
@@ -299,6 +329,7 @@ typedef struct SessionStatusInfo {
 
 typedef struct UserStatusInfo {
         uid_t uid;
+        int linger;
         char *name;
         struct dual_timestamp timestamp;
         char *state;
@@ -364,7 +395,7 @@ static int prop_map_first_of_struct(sd_bus *bus, const char *member, sd_bus_mess
         if (r < 0)
                 return r;
 
-        if (contents[0] == 's' || contents[0] == 'o') {
+        if (IN_SET(contents[0], 's', 'o')) {
                 const char *s;
                 char **p = (char **) userdata;
 
@@ -372,11 +403,9 @@ static int prop_map_first_of_struct(sd_bus *bus, const char *member, sd_bus_mess
                 if (r < 0)
                         return r;
 
-                free(*p);
-                *p = strdup(s);
-
-                if (!*p)
-                        return -ENOMEM;
+                r = free_and_strdup(p, s);
+                if (r < 0)
+                        return r;
         } else {
                 r = sd_bus_message_read_basic(m, contents[0], userdata);
                 if (r < 0)
@@ -441,14 +470,15 @@ static int print_session_status_info(sd_bus *bus, const char *path, bool *new_li
                 {}
         };
 
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         char since1[FORMAT_TIMESTAMP_RELATIVE_MAX], *s1;
         char since2[FORMAT_TIMESTAMP_MAX], *s2;
         _cleanup_(session_status_info_clear) SessionStatusInfo i = {};
         int r;
 
-        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &i);
+        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &error, &i);
         if (r < 0)
-                return log_error_errno(r, "Could not get properties: %m");
+                return log_error_errno(r, "Could not get properties: %s", bus_error_message(&error, r));
 
         if (*new_line)
                 printf("\n");
@@ -458,9 +488,9 @@ static int print_session_status_info(sd_bus *bus, const char *path, bool *new_li
         printf("%s - ", strna(i.id));
 
         if (i.name)
-                printf("%s (%u)\n", i.name, (unsigned) i.uid);
+                printf("%s (%"PRIu32")\n", i.name, i.uid);
         else
-                printf("%u\n", (unsigned) i.uid);
+                printf("%"PRIu32"\n", i.uid);
 
         s1 = format_timestamp_relative(since1, sizeof(since1), i.timestamp.realtime);
         s2 = format_timestamp(since2, sizeof(since2), i.timestamp.realtime);
@@ -473,7 +503,7 @@ static int print_session_status_info(sd_bus *bus, const char *path, bool *new_li
         if (i.leader > 0) {
                 _cleanup_free_ char *t = NULL;
 
-                printf("\t  Leader: %u", (unsigned) i.leader);
+                printf("\t  Leader: %"PRIu32, i.leader);
 
                 get_process_comm(i.leader, &t);
                 if (t)
@@ -559,6 +589,7 @@ static int print_user_status_info(sd_bus *bus, const char *path, bool *new_line)
 
         static const struct bus_properties_map map[]  = {
                 { "Name",               "s",     NULL,                     offsetof(UserStatusInfo, name)                },
+                { "Linger",             "b",     NULL,                     offsetof(UserStatusInfo, linger)              },
                 { "Slice",              "s",     NULL,                     offsetof(UserStatusInfo, slice)               },
                 { "State",              "s",     NULL,                     offsetof(UserStatusInfo, state)               },
                 { "UID",                "u",     NULL,                     offsetof(UserStatusInfo, uid)                 },
@@ -569,14 +600,15 @@ static int print_user_status_info(sd_bus *bus, const char *path, bool *new_line)
                 {}
         };
 
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         char since1[FORMAT_TIMESTAMP_RELATIVE_MAX], *s1;
         char since2[FORMAT_TIMESTAMP_MAX], *s2;
         _cleanup_(user_status_info_clear) UserStatusInfo i = {};
         int r;
 
-        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &i);
+        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &error, &i);
         if (r < 0)
-                return log_error_errno(r, "Could not get properties: %m");
+                return log_error_errno(r, "Could not get properties: %s", bus_error_message(&error, r));
 
         if (*new_line)
                 printf("\n");
@@ -584,9 +616,9 @@ static int print_user_status_info(sd_bus *bus, const char *path, bool *new_line)
         *new_line = true;
 
         if (i.name)
-                printf("%s (%u)\n", i.name, (unsigned) i.uid);
+                printf("%s (%"PRIu32")\n", i.name, i.uid);
         else
-                printf("%u\n", (unsigned) i.uid);
+                printf("%"PRIu32"\n", i.uid);
 
         s1 = format_timestamp_relative(since1, sizeof(since1), i.timestamp.realtime);
         s2 = format_timestamp(since2, sizeof(since2), i.timestamp.realtime);
@@ -603,15 +635,15 @@ static int print_user_status_info(sd_bus *bus, const char *path, bool *new_line)
                 char **l;
                 printf("\tSessions:");
 
-                STRV_FOREACH(l, i.sessions) {
-                        if (streq_ptr(*l, i.display))
-                                printf(" *%s", *l);
-                        else
-                                printf(" %s", *l);
-                }
+                STRV_FOREACH(l, i.sessions)
+                        printf(" %s%s",
+                               streq_ptr(*l, i.display) ? "*" : "",
+                               *l);
 
                 printf("\n");
         }
+
+        printf("\t  Linger: %s\n", yes_no(i.linger));
 
         if (i.slice) {
                 printf("\t    Unit: %s\n", i.slice);
@@ -643,12 +675,13 @@ static int print_seat_status_info(sd_bus *bus, const char *path, bool *new_line)
                 {}
         };
 
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(seat_status_info_clear) SeatStatusInfo i = {};
         int r;
 
-        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &i);
+        r = bus_map_all_properties(bus, "org.freedesktop.login1", path, map, &error, &i);
         if (r < 0)
-                return log_error_errno(r, "Could not get properties: %m");
+                return log_error_errno(r, "Could not get properties: %s", bus_error_message(&error, r));
 
         if (*new_line)
                 printf("\n");
@@ -682,70 +715,223 @@ static int print_seat_status_info(sd_bus *bus, const char *path, bool *new_line)
 
                 printf("\t Devices:\n");
 
-                show_sysfs(i.id, "\t\t  ", c);
+                show_sysfs(i.id, "\t\t  ", c, get_output_flags());
+        }
+
+        return 0;
+}
+
+#define property(name, fmt, ...)                                        \
+        do {                                                            \
+                if (arg_value)                                          \
+                        printf(fmt "\n", __VA_ARGS__);                  \
+                else                                                    \
+                        printf("%s=" fmt "\n", name, __VA_ARGS__);      \
+        } while (0)
+
+static int print_property(const char *name, sd_bus_message *m, const char *contents) {
+        int r;
+
+        assert(name);
+        assert(m);
+        assert(contents);
+
+        if (arg_property && !strv_find(arg_property, name))
+                /* skip what we didn't read */
+                return sd_bus_message_skip(m, contents);
+
+        switch (contents[0]) {
+
+        case SD_BUS_TYPE_STRUCT_BEGIN:
+
+                if (contents[1] == SD_BUS_TYPE_STRING && STR_IN_SET(name, "Display", "Seat", "ActiveSession")) {
+                        const char *s;
+
+                        r = sd_bus_message_read(m, "(so)", &s, NULL);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        if (arg_all || !isempty(s))
+                                property(name, "%s", s);
+
+                        return 0;
+
+                } else if (contents[1] == SD_BUS_TYPE_UINT32 && streq(name, "User")) {
+                        uint32_t uid;
+
+                        r = sd_bus_message_read(m, "(uo)", &uid, NULL);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        if (!uid_is_valid(uid)) {
+                                log_error("Invalid user ID: " UID_FMT, uid);
+                                return -EINVAL;
+                        }
+
+                        property(name, UID_FMT, uid);
+                        return 0;
+                }
+
+                break;
+
+        case SD_BUS_TYPE_ARRAY:
+
+                if (contents[1] == SD_BUS_TYPE_STRUCT_BEGIN && streq(name, "Sessions")) {
+                        const char *s;
+                        bool space = false;
+
+                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(so)");
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        if (!arg_value)
+                                printf("%s=", name);
+
+                        while ((r = sd_bus_message_read(m, "(so)", &s, NULL)) > 0) {
+                                printf("%s%s", space ? " " : "", s);
+                                space = true;
+                        }
+
+                        if (space || !arg_value)
+                                printf("\n");
+
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        r = sd_bus_message_exit_container(m);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        return 0;
+                }
+
+                break;
+        }
+
+        r = bus_print_property(name, m, arg_value, arg_all);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (r == 0) {
+                r = sd_bus_message_skip(m, contents);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                if (arg_all)
+                        printf("%s=[unprintable]\n", name);
         }
 
         return 0;
 }
 
 static int show_properties(sd_bus *bus, const char *path, bool *new_line) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
+
+        assert(bus);
+        assert(path);
+        assert(new_line);
+
+        r = sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.login1",
+                        path,
+                        "org.freedesktop.DBus.Properties",
+                        "GetAll",
+                        &error,
+                        &reply,
+                        "s", "");
+        if (r < 0)
+                return log_error_errno(r, "Failed to get properties: %s", bus_error_message(&error, r));
+
+        r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "{sv}");
+        if (r < 0)
+                return bus_log_parse_error(r);
 
         if (*new_line)
                 printf("\n");
 
         *new_line = true;
 
-        r = bus_print_all_properties(bus, "org.freedesktop.login1", path, arg_property, arg_all);
-        if (r < 0)
-                log_error_errno(r, "Could not get properties: %m");
+        while ((r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
+                const char *name, *contents;
 
-        return r;
+                r = sd_bus_message_read(reply, "s", &name);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                r = sd_bus_message_peek_type(reply, NULL, &contents);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_VARIANT, contents);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                r = print_property(name, reply, contents);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_exit_container(reply);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                r = sd_bus_message_exit_container(reply);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+        }
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        r = sd_bus_message_exit_container(reply);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        return 0;
 }
 
 static int show_session(int argc, char *argv[], void *userdata) {
         bool properties, new_line = false;
         sd_bus *bus = userdata;
         int r, i;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_free_ char *path = NULL;
 
         assert(bus);
         assert(argv);
 
         properties = !strstr(argv[0], "status");
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         if (argc <= 1) {
-                /* If not argument is specified inspect the manager
-                 * itself */
+                const char *session, *p = "/org/freedesktop/login1/session/self";
+
                 if (properties)
+                        /* If no argument is specified inspect the manager itself */
                         return show_properties(bus, "/org/freedesktop/login1", &new_line);
 
                 /* And in the pretty case, show data of the calling session */
-                return print_session_status_info(bus, "/org/freedesktop/login1/session/self", &new_line);
+                session = getenv("XDG_SESSION_ID");
+                if (session) {
+                        r = get_session_path(bus, session, &error, &path);
+                        if (r < 0) {
+                                log_error("Failed to get session path: %s", bus_error_message(&error, r));
+                                return r;
+                        }
+                        p = path;
+                }
+
+                return print_session_status_info(bus, p, &new_line);
         }
 
         for (i = 1; i < argc; i++) {
-                _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_bus_message_unref_ sd_bus_message * reply = NULL;
-                const char *path = NULL;
-
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.login1",
-                                "/org/freedesktop/login1",
-                                "org.freedesktop.login1.Manager",
-                                "GetSession",
-                                &error, &reply,
-                                "s", argv[i]);
+                r = get_session_path(bus, argv[i], &error, &path);
                 if (r < 0) {
-                        log_error("Failed to get session: %s", bus_error_message(&error, r));
+                        log_error("Failed to get session path: %s", bus_error_message(&error, r));
                         return r;
                 }
-
-                r = sd_bus_message_read(reply, "o", &path);
-                if (r < 0)
-                        return bus_log_parse_error(r);
 
                 if (properties)
                         r = show_properties(bus, path, &new_line);
@@ -769,7 +955,7 @@ static int show_user(int argc, char *argv[], void *userdata) {
 
         properties = !strstr(argv[0], "status");
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         if (argc <= 1) {
                 /* If not argument is specified inspect the manager
@@ -781,8 +967,8 @@ static int show_user(int argc, char *argv[], void *userdata) {
         }
 
         for (i = 1; i < argc; i++) {
-                _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_bus_message_unref_ sd_bus_message * reply = NULL;
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message * reply = NULL;
                 const char *path = NULL;
                 uid_t uid;
 
@@ -829,7 +1015,7 @@ static int show_seat(int argc, char *argv[], void *userdata) {
 
         properties = !strstr(argv[0], "status");
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
 
         if (argc <= 1) {
                 /* If not argument is specified inspect the manager
@@ -841,8 +1027,8 @@ static int show_seat(int argc, char *argv[], void *userdata) {
         }
 
         for (i = 1; i < argc; i++) {
-                _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_bus_message_unref_ sd_bus_message * reply = NULL;
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message * reply = NULL;
                 const char *path = NULL;
 
                 r = sd_bus_call_method(
@@ -875,7 +1061,7 @@ static int show_seat(int argc, char *argv[], void *userdata) {
 }
 
 static int activate(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         char *short_argv[3];
         int r, i;
@@ -883,15 +1069,14 @@ static int activate(int argc, char *argv[], void *userdata) {
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (argc < 2) {
-                /* No argument? Let's convert this into the empty
-                 * session name, which the calls will then resolve to
-                 * the caller's session. */
+                /* No argument? Let's either use $XDG_SESSION_ID (if specified), or an empty
+                 * session name, in which case logind will try to guess our session. */
 
                 short_argv[0] = argv[0];
-                short_argv[1] = (char*) "";
+                short_argv[1] = getenv("XDG_SESSION_ID") ?: (char*) "";
                 short_argv[2] = NULL;
 
                 argv = short_argv;
@@ -921,14 +1106,14 @@ static int activate(int argc, char *argv[], void *userdata) {
 }
 
 static int kill_session(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r, i;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (!arg_kill_who)
                 arg_kill_who = "all";
@@ -953,7 +1138,7 @@ static int kill_session(int argc, char *argv[], void *userdata) {
 }
 
 static int enable_linger(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         char* short_argv[3];
         bool b;
@@ -962,11 +1147,14 @@ static int enable_linger(int argc, char *argv[], void *userdata) {
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         b = streq(argv[0], "enable-linger");
 
         if (argc < 2) {
+                /* No argument? Let's use an empty user name,
+                 * then logind will use our user. */
+
                 short_argv[0] = argv[0];
                 short_argv[1] = (char*) "";
                 short_argv[2] = NULL;
@@ -1003,14 +1191,14 @@ static int enable_linger(int argc, char *argv[], void *userdata) {
 }
 
 static int terminate_user(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r, i;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (i = 1; i < argc; i++) {
                 uid_t uid;
@@ -1037,14 +1225,14 @@ static int terminate_user(int argc, char *argv[], void *userdata) {
 }
 
 static int kill_user(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r, i;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (!arg_kill_who)
                 arg_kill_who = "all";
@@ -1074,14 +1262,14 @@ static int kill_user(int argc, char *argv[], void *userdata) {
 }
 
 static int attach(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r, i;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (i = 2; i < argc; i++) {
 
@@ -1104,14 +1292,14 @@ static int attach(int argc, char *argv[], void *userdata) {
 }
 
 static int flush_devices(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call_method(
                         bus,
@@ -1128,14 +1316,14 @@ static int flush_devices(int argc, char *argv[], void *userdata) {
 }
 
 static int lock_sessions(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call_method(
                         bus,
@@ -1152,14 +1340,14 @@ static int lock_sessions(int argc, char *argv[], void *userdata) {
 }
 
 static int terminate_seat(int argc, char *argv[], void *userdata) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r, i;
 
         assert(bus);
         assert(argv);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (i = 1; i < argc; i++) {
 
@@ -1193,12 +1381,15 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -M --machine=CONTAINER   Operate on local container\n"
                "  -p --property=NAME       Show only properties by this name\n"
                "  -a --all                 Show all properties, including empty ones\n"
+               "     --value               When showing properties, only print the value\n"
                "  -l --full                Do not ellipsize output\n"
                "     --kill-who=WHO        Who to send signal to\n"
                "  -s --signal=SIGNAL       Which signal to send\n"
                "  -n --lines=INTEGER       Number of journal entries to show\n"
-               "  -o --output=STRING       Change journal output mode (short, short-monotonic,\n"
-               "                           verbose, export, json, json-pretty, json-sse, cat)\n\n"
+               "  -o --output=STRING       Change journal output mode (short, short-precise,\n"
+               "                             short-iso, short-iso-precise, short-full,\n"
+               "                             short-monotonic, short-unix, verbose, export,\n"
+               "                             json, json-pretty, json-sse, cat)\n"
                "Session Commands:\n"
                "  list-sessions            List sessions\n"
                "  session-status [ID...]   Show session status\n"
@@ -1234,6 +1425,7 @@ static int parse_argv(int argc, char *argv[]) {
 
         enum {
                 ARG_VERSION = 0x100,
+                ARG_VALUE,
                 ARG_NO_PAGER,
                 ARG_NO_LEGEND,
                 ARG_KILL_WHO,
@@ -1245,6 +1437,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "version",         no_argument,       NULL, ARG_VERSION         },
                 { "property",        required_argument, NULL, 'p'                 },
                 { "all",             no_argument,       NULL, 'a'                 },
+                { "value",           no_argument,       NULL, ARG_VALUE           },
                 { "full",            no_argument,       NULL, 'l'                 },
                 { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
                 { "no-legend",       no_argument,       NULL, ARG_NO_LEGEND       },
@@ -1272,9 +1465,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case 'p': {
                         r = strv_extend(&arg_property, optarg);
@@ -1290,6 +1481,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case 'a':
                         arg_all = true;
+                        break;
+
+                case ARG_VALUE:
+                        arg_value = true;
                         break;
 
                 case 'l':
@@ -1389,18 +1584,19 @@ static int loginctl_main(int argc, char *argv[], sd_bus *bus) {
 }
 
 int main(int argc, char *argv[]) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");
         log_parse_environment();
         log_open();
+        sigbus_install();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 goto finish;
 
-        r = bus_open_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to create bus connection: %m");
                 goto finish;
@@ -1411,6 +1607,9 @@ int main(int argc, char *argv[]) {
         r = loginctl_main(argc, argv, bus);
 
 finish:
+        /* make sure we terminate the bus connection first, and then close the
+         * pager, see issue #3543 for the details. */
+        sd_bus_flush_close_unref(bus);
         pager_close();
         polkit_agent_close();
 

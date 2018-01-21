@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,11 +18,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "unit.h"
-#include "timer.h"
-#include "dbus-timer.h"
+#include "alloc-util.h"
 #include "bus-util.h"
+#include "dbus-timer.h"
+#include "dbus-util.h"
 #include "strv.h"
+#include "timer.h"
+#include "unit.h"
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_result, timer_result, TimerResult);
 
@@ -145,28 +146,14 @@ static int property_get_next_elapse_monotonic(
                 sd_bus_error *error) {
 
         Timer *t = userdata;
-        usec_t x;
 
         assert(bus);
         assert(reply);
         assert(t);
 
-        if (t->next_elapse_monotonic_or_boottime <= 0)
-                x = 0;
-        else if (t->wake_system) {
-                usec_t a, b;
-
-                a = now(CLOCK_MONOTONIC);
-                b = now(CLOCK_BOOTTIME);
-
-                if (t->next_elapse_monotonic_or_boottime + a > b)
-                        x = t->next_elapse_monotonic_or_boottime + a - b;
-                else
-                        x = 0;
-        } else
-                x = t->next_elapse_monotonic_or_boottime;
-
-        return sd_bus_message_append(reply, "t", x);
+        return sd_bus_message_append(reply, "t",
+                                     (uint64_t) usec_shift_clock(t->next_elapse_monotonic_or_boottime,
+                                                                 TIMER_MONOTONIC_CLOCK(t), CLOCK_MONOTONIC));
 }
 
 const sd_bus_vtable bus_timer_vtable[] = {
@@ -179,8 +166,10 @@ const sd_bus_vtable bus_timer_vtable[] = {
         BUS_PROPERTY_DUAL_TIMESTAMP("LastTriggerUSec", offsetof(Timer, last_trigger), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Timer, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("AccuracyUSec", "t", bus_property_get_usec, offsetof(Timer, accuracy_usec), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RandomizedDelayUSec", "t", bus_property_get_usec, offsetof(Timer, random_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Persistent", "b", bus_property_get_bool, offsetof(Timer, persistent), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("WakeSystem", "b", bus_property_get_bool, offsetof(Timer, wake_system), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RemainAfterElapse", "b", bus_property_get_bool, offsetof(Timer, remain_after_elapse), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_VTABLE_END
 };
 
@@ -188,16 +177,142 @@ static int bus_timer_set_transient_property(
                 Timer *t,
                 const char *name,
                 sd_bus_message *message,
-                UnitSetPropertiesMode mode,
+                UnitWriteFlags flags,
                 sd_bus_error *error) {
 
+        Unit *u = UNIT(t);
         int r;
 
         assert(t);
         assert(name);
         assert(message);
 
-        if (STR_IN_SET(name,
+        flags |= UNIT_PRIVATE;
+
+        if (streq(name, "AccuracyUSec"))
+                return bus_set_transient_usec(u, name, &t->accuracy_usec, message, flags, error);
+
+        if (streq(name, "AccuracySec")) {
+                log_notice("Client is using obsolete AccuracySec= transient property, please use AccuracyUSec= instead.");
+                return bus_set_transient_usec(u, "AccuracyUSec", &t->accuracy_usec, message, flags, error);
+        }
+
+        if (streq(name, "RandomizedDelayUSec"))
+                return bus_set_transient_usec(u, name, &t->random_usec, message, flags, error);
+
+        if (streq(name, "WakeSystem"))
+                return bus_set_transient_bool(u, name, &t->wake_system, message, flags, error);
+
+        if (streq(name, "Persistent"))
+                return bus_set_transient_bool(u, name, &t->persistent, message, flags, error);
+
+        if (streq(name, "RemainAfterElapse"))
+                return bus_set_transient_bool(u, name, &t->remain_after_elapse, message, flags, error);
+
+        if (streq(name, "TimersMonotonic")) {
+                const char *base_name;
+                usec_t usec = 0;
+                bool empty = true;
+
+                r = sd_bus_message_enter_container(message, 'a', "(st)");
+                if (r < 0)
+                        return r;
+
+                while ((r = sd_bus_message_read(message, "(st)", &base_name, &usec)) > 0) {
+                        TimerBase b;
+
+                        b = timer_base_from_string(base_name);
+                        if (b < 0 || b == TIMER_CALENDAR)
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid timer base: %s", base_name);
+
+                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                                char ts[FORMAT_TIMESPAN_MAX];
+                                TimerValue *v;
+
+                                unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "%s=%s", base_name,
+                                                    format_timespan(ts, sizeof(ts), usec, USEC_PER_MSEC));
+
+                                v = new0(TimerValue, 1);
+                                if (!v)
+                                        return -ENOMEM;
+
+                                v->base = b;
+                                v->value = usec;
+
+                                LIST_PREPEND(value, t->values, v);
+                        }
+
+                        empty = false;
+                }
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags) && empty) {
+                        timer_free_values(t);
+                        unit_write_setting(u, flags, name, "OnActiveSec=");
+                }
+
+                return 1;
+
+        } else if (streq(name, "TimersCalendar")) {
+                const char *base_name, *str;
+                bool empty = true;
+
+                r = sd_bus_message_enter_container(message, 'a', "(ss)");
+                if (r < 0)
+                        return r;
+
+                while ((r = sd_bus_message_read(message, "(ss)", &base_name, &str)) > 0) {
+                        _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
+                        TimerBase b;
+
+                        b = timer_base_from_string(base_name);
+                        if (b != TIMER_CALENDAR)
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid timer base: %s", base_name);
+
+                        r = calendar_spec_from_string(str, &c);
+                        if (r == -EINVAL)
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid calendar spec: %s", str);
+                        if (r < 0)
+                                return r;
+
+                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                                TimerValue *v;
+
+                                unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "%s=%s", base_name, str);
+
+                                v = new0(TimerValue, 1);
+                                if (!v)
+                                        return -ENOMEM;
+
+                                v->base = b;
+                                v->calendar_spec = c;
+                                c = NULL;
+
+                                LIST_PREPEND(value, t->values, v);
+                        }
+
+                        empty = false;
+                }
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags) && empty) {
+                        timer_free_values(t);
+                        unit_write_setting(u, flags, name, "OnCalendar=");
+                }
+
+                return 1;
+
+        } else if (STR_IN_SET(name,
                        "OnActiveSec",
                        "OnBootSec",
                        "OnStartupSec",
@@ -206,27 +321,30 @@ static int bus_timer_set_transient_property(
 
                 TimerValue *v;
                 TimerBase b = _TIMER_BASE_INVALID;
-                usec_t u = 0;
+                usec_t usec = 0;
+
+                log_notice("Client is using obsolete %s= transient property, please use TimersMonotonic= instead.", name);
 
                 b = timer_base_from_string(name);
                 if (b < 0)
-                        return -EINVAL;
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unknown timer base");
 
-                r = sd_bus_message_read(message, "t", &u);
+                r = sd_bus_message_read(message, "t", &usec);
                 if (r < 0)
                         return r;
 
-                if (mode != UNIT_CHECK) {
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         char time[FORMAT_TIMESPAN_MAX];
 
-                        unit_write_drop_in_private_format(UNIT(t), mode, name, "%s=%s\n", name, format_timespan(time, sizeof(time), u, USEC_PER_MSEC));
+                        unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "%s=%s", name,
+                                            format_timespan(time, sizeof(time), usec, USEC_PER_MSEC));
 
                         v = new0(TimerValue, 1);
                         if (!v)
                                 return -ENOMEM;
 
                         v->base = b;
-                        v->value = u;
+                        v->value = usec;
 
                         LIST_PREPEND(value, t->values, v);
                 }
@@ -236,67 +354,36 @@ static int bus_timer_set_transient_property(
         } else if (streq(name, "OnCalendar")) {
 
                 TimerValue *v;
-                CalendarSpec *c = NULL;
+                _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
                 const char *str;
+
+                log_notice("Client is using obsolete %s= transient property, please use TimersCalendar= instead.", name);
 
                 r = sd_bus_message_read(message, "s", &str);
                 if (r < 0)
                         return r;
 
-                if (mode != UNIT_CHECK) {
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         r = calendar_spec_from_string(str, &c);
+                        if (r == -EINVAL)
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid calendar spec");
                         if (r < 0)
                                 return r;
 
-                        unit_write_drop_in_private_format(UNIT(t), mode, name, "%s=%s\n", name, str);
+                        unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "%s=%s", name, str);
 
                         v = new0(TimerValue, 1);
-                        if (!v) {
-                                if (c)
-                                        calendar_spec_free(c);
+                        if (!v)
                                 return -ENOMEM;
-                        }
 
                         v->base = TIMER_CALENDAR;
                         v->calendar_spec = c;
+                        c = NULL;
 
                         LIST_PREPEND(value, t->values, v);
                 }
 
                 return 1;
-
-        } else if (streq(name, "AccuracySec")) {
-
-                usec_t u = 0;
-
-                r = sd_bus_message_read(message, "t", &u);
-                if (r < 0)
-                        return r;
-
-                if (mode != UNIT_CHECK) {
-                        char time[FORMAT_TIMESPAN_MAX];
-
-                        t->accuracy_usec = u;
-                        unit_write_drop_in_private_format(UNIT(t), mode, name, "%s=%s\n", name, format_timespan(time, sizeof(time), u, USEC_PER_MSEC));
-                }
-
-                return 1;
-
-        } else if (streq(name, "WakeSystem")) {
-
-                int b;
-
-                r = sd_bus_message_read(message, "b", &b);
-                if (r < 0)
-                        return r;
-
-                if (mode != UNIT_CHECK) {
-                        t->wake_system = b;
-                        unit_write_drop_in_private_format(UNIT(t), mode, name, "%s=%s\n", name, yes_no(t->wake_system));
-                }
-
-                return 1;
-
         }
 
         return 0;
@@ -306,21 +393,17 @@ int bus_timer_set_property(
                 Unit *u,
                 const char *name,
                 sd_bus_message *message,
-                UnitSetPropertiesMode mode,
+                UnitWriteFlags mode,
                 sd_bus_error *error) {
 
         Timer *t = TIMER(u);
-        int r;
 
         assert(t);
         assert(name);
         assert(message);
 
-        if (u->transient && u->load_state == UNIT_STUB) {
-                r = bus_timer_set_transient_property(t, name, message, mode, error);
-                if (r != 0)
-                        return r;
-        }
+        if (u->transient && u->load_state == UNIT_STUB)
+                return bus_timer_set_transient_property(t, name, message, mode, error);
 
         return 0;
 }

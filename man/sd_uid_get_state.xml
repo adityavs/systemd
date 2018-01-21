@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
@@ -170,25 +172,51 @@
   </refsect1>
 
   <refsect1>
+    <title>Errors</title>
+
+    <para>Returned errors may indicate the following problems:</para>
+
+    <variablelist>
+
+      <varlistentry>
+        <term><constant>-ENODATA</constant></term>
+
+        <listitem><para>The given field is not specified for the described
+        user.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-ENXIO</constant></term>
+
+        <listitem><para>The specified seat is unknown.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-EINVAL</constant></term>
+
+        <listitem><para>An input parameter was invalid (out of range,
+        or NULL, where that is not accepted). This is also returned if
+        the passed user ID is 0xFFFF or 0xFFFFFFFF, which are
+        undefined on Linux.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>-ENOMEM</constant></term>
+
+        <listitem><para>Memory allocation failed.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
     <title>Notes</title>
 
     <para>Functions described here are available as a shared library,
     and can be compiled and linked to using the
     <constant>libsystemd</constant> <citerefentry project='die-net'><refentrytitle>pkg-config</refentrytitle><manvolnum>1</manvolnum></citerefentry>
     entry.</para>
-  </refsect1>
-
-  <refsect1>
-    <title>History</title>
-
-    <para><function>sd_uid_get_state()</function>,
-    <function>sd_uid_is_on_seat()</function>,
-    <function>sd_uid_get_sessions()</function>, and
-    <function>sd_uid_get_seats()</function> functions were added in
-    systemd-31.</para>
-
-    <para><function>sd_uid_get_display()</function> was added in
-    systemd-213.</para>
   </refsect1>
 
   <refsect1>

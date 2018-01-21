@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,12 +18,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "mkdir.h"
-#include "fileio.h"
 #include "libudev.h"
-#include "udev-util.h"
+
+#include "alloc-util.h"
 #include "def.h"
+#include "escape.h"
+#include "fileio.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "proc-cmdline.h"
+#include "string-util.h"
+#include "udev-util.h"
+#include "util.h"
 
 static struct udev_device *find_pci_or_platform_parent(struct udev_device *device) {
         struct udev_device *parent;
@@ -163,7 +168,7 @@ static bool validate_device(struct udev *udev, struct udev_device *device) {
                         continue;
 
                 v = udev_device_get_sysattr_value(other, "type");
-                if (!streq_ptr(v, "platform") && !streq_ptr(v, "firmware"))
+                if (!STRPTR_IN_SET(v, "platform", "firmware"))
                         continue;
 
                 /* OK, so there's another backlight device, and it's a
@@ -317,7 +322,7 @@ int main(int argc, char *argv[]) {
         errno = 0;
         device = udev_device_new_from_subsystem_sysname(udev, ss, sysname);
         if (!device) {
-                if (errno != 0)
+                if (errno > 0)
                         log_error_errno(errno, "Failed to get backlight or LED device '%s:%s': %m", ss, sysname);
                 else
                         log_oom();
@@ -353,9 +358,9 @@ int main(int argc, char *argv[]) {
                         return EXIT_FAILURE;
                 }
 
-                saved = strjoin("/var/lib/systemd/backlight/", escaped_path_id, ":", escaped_ss, ":", escaped_sysname, NULL);
+                saved = strjoin("/var/lib/systemd/backlight/", escaped_path_id, ":", escaped_ss, ":", escaped_sysname);
         } else
-                saved = strjoin("/var/lib/systemd/backlight/", escaped_ss, ":", escaped_sysname, NULL);
+                saved = strjoin("/var/lib/systemd/backlight/", escaped_ss, ":", escaped_sysname);
 
         if (!saved) {
                 log_oom();
@@ -375,7 +380,7 @@ int main(int argc, char *argv[]) {
                 _cleanup_free_ char *value = NULL;
                 const char *clamp;
 
-                if (!shall_restore_state())
+                if (shall_restore_state() == 0)
                         return EXIT_SUCCESS;
 
                 if (!validate_device(udev, device))
@@ -415,7 +420,7 @@ int main(int argc, char *argv[]) {
                         return EXIT_FAILURE;
                 }
 
-                r = write_string_file(saved, value);
+                r = write_string_file(saved, value, WRITE_STRING_FILE_CREATE);
                 if (r < 0) {
                         log_error_errno(r, "Failed to write %s: %m", saved);
                         return EXIT_FAILURE;

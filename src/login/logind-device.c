@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,8 +20,9 @@
 
 #include <string.h>
 
-#include "util.h"
+#include "alloc-util.h"
 #include "logind-device.h"
+#include "util.h"
 
 Device* device_new(Manager *m, const char *sysfs, bool master) {
         Device *d;
@@ -35,15 +35,12 @@ Device* device_new(Manager *m, const char *sysfs, bool master) {
                 return NULL;
 
         d->sysfs = strdup(sysfs);
-        if (!d->sysfs) {
-                free(d);
-                return NULL;
-        }
+        if (!d->sysfs)
+                return mfree(d);
 
         if (hashmap_put(m->devices, d->sysfs, d) < 0) {
                 free(d->sysfs);
-                free(d);
-                return NULL;
+                return mfree(d);
         }
 
         d->manager = m;

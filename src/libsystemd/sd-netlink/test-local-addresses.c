@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "af-list.h"
+#include "alloc-util.h"
 #include "in-addr-util.h"
 #include "local-addresses.h"
-#include "af-list.h"
 
 static void print_local_addresses(struct local_address *a, unsigned n) {
         unsigned i;
@@ -44,9 +44,8 @@ int main(int argc, char *argv[]) {
 
         printf("Local Addresses:\n");
         print_local_addresses(a, (unsigned) n);
-        free(a);
+        a = mfree(a);
 
-        a = NULL;
         n = local_gateways(NULL, 0, AF_UNSPEC, &a);
         assert_se(n >= 0);
 

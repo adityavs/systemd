@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2014 Lennart Poettering
@@ -45,7 +47,7 @@
 
   <refnamediv>
     <refname>systemd-escape</refname>
-    <refpurpose>Escape strings for usage in system unit names</refpurpose>
+    <refpurpose>Escape strings for usage in systemd unit names</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -64,15 +66,18 @@
     used to escape and to undo escaping of strings.</para>
 
     <para>The command takes any number of strings on the command line,
-    and will process them individually, one after the other. It will
+    and will process them individually, one after another. It will
     output them separated by spaces to stdout.</para>
 
-    <para>By default this command will escape the strings passed,
+    <para>By default, this command will escape the strings passed,
     unless <option>--unescape</option> is passed which results in the
-    inverse operation being applied. If <option>--mangle</option> a
-    special mode of escaping is applied instead, which assumes a
-    string to be already escaped but will escape everything that
+    inverse operation being applied. If <option>--mangle</option> is given, a
+    special mode of escaping is applied instead, which assumes the
+    string is already escaped but will escape everything that
     appears obviously non-escaped.</para>
+
+    <para>For details on the escaping and unescaping algorithms see the relevant section in
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
   </refsect1>
 
   <refsect1>
@@ -86,8 +91,8 @@
 
         <listitem><para>Appends the specified unit type suffix to the
         escaped string. Takes one of the unit types supported by
-        systemd, such as <literal>.service</literal> or
-        <literal>.mount</literal>. May not be used in conjunction with
+        systemd, such as <literal>service</literal> or
+        <literal>mount</literal>. May not be used in conjunction with
         <option>--template=</option>, <option>--unescape</option> or
         <option>--mangle</option>.</para></listitem>
       </varlistentry>
@@ -97,7 +102,7 @@
 
         <listitem><para>Inserts the escaped strings in a unit name
         template. Takes a unit name template such as
-        <filename>foobar@.service</filename> May not be used in
+        <filename>foobar@.service</filename>. May not be used in
         conjunction with <option>--suffix=</option>,
         <option>--unescape</option> or
         <option>--mangle</option>.</para></listitem>
@@ -107,10 +112,12 @@
         <term><option>--path</option></term>
         <term><option>-p</option></term>
 
-        <listitem><para>When escaping or unescaping a string, assume
-        it refers to a file system path. This enables special
-        processing of the initial <literal>/</literal> of the
-        path.</para></listitem>
+        <listitem><para>When escaping or unescaping a string, assume it refers to a file system path. This eliminates
+        leading, trailing or duplicate <literal>/</literal> characters and rejects <literal>.</literal> and
+        <literal>..</literal> path components. This is particularly useful for generating strings suitable for
+        unescaping with the <literal>%f</literal> specifier in unit files, see
+        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -143,7 +150,7 @@
   <refsect1>
     <title>Examples</title>
 
-    <para>Escape a single string:</para>
+    <para>To escape a single string:</para>
     <programlisting>$ systemd-escape 'Hallöchen, Meister'
 Hall\xc3\xb6chen\x2c\x20Meister</programlisting>
 
@@ -155,7 +162,7 @@ Hallöchen, Meister</programlisting>
     <programlisting>$ systemd-escape -p --suffix=mount "/tmp//waldi/foobar/"
 tmp-waldi-foobar.mount</programlisting>
 
-    <para>To generate instance names of three strings</para>
+    <para>To generate instance names of three strings:</para>
     <programlisting>$ systemd-escape --template=systemd-nspawn@.service 'My Container 1' 'containerb' 'container/III'
 systemd-nspawn@My\x20Container\x201.service systemd-nspawn@containerb.service systemd-nspawn@container-III.service</programlisting>
   </refsect1>
@@ -171,6 +178,7 @@ systemd-nspawn@My\x20Container\x201.service systemd-nspawn@containerb.service sy
     <title>See Also</title>
     <para>
       <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
     </para>
   </refsect1>

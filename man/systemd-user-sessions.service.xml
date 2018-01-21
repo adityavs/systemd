@@ -2,6 +2,8 @@
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -57,9 +59,9 @@
     <para><filename>systemd-user-sessions.service</filename> is a
     service that controls user logins through
     <citerefentry project='man-pages'><refentrytitle>pam_nologin</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
-    After basic system initialization is complete it removes
+    After basic system initialization is complete, it removes
     <filename>/run/nologin</filename>, thus permitting logins. Before
-    system shutdown it creates <filename>/run/nologin</filename>, thus
+    system shutdown, it creates <filename>/run/nologin</filename>, thus
     prohibiting further logins.</para>
   </refsect1>
 

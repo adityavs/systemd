@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,14 +21,23 @@
 ***/
 
 #include "sd-event.h"
-#include "sd-resolve.h"
 #include "sd-network.h"
+#include "sd-resolve.h"
+
 #include "list.h"
 #include "ratelimit.h"
+#include "time-util.h"
 
 typedef struct Manager Manager;
 
 #include "timesyncd-server.h"
+
+/*
+ * "A client MUST NOT under any conditions use a poll interval less
+ * than 15 seconds."
+ */
+#define NTP_POLL_INTERVAL_MIN_USEC      (32 * USEC_PER_SEC)
+#define NTP_POLL_INTERVAL_MAX_USEC      (2048 * USEC_PER_SEC)
 
 struct Manager {
         sd_event *event;
@@ -38,6 +46,8 @@ struct Manager {
         LIST_HEAD(ServerName, system_servers);
         LIST_HEAD(ServerName, link_servers);
         LIST_HEAD(ServerName, fallback_servers);
+
+        bool have_fallbacks:1;
 
         RateLimit ratelimit;
         bool exhausted_servers;
@@ -66,6 +76,8 @@ struct Manager {
         /* poll timer */
         sd_event_source *event_timer;
         usec_t poll_interval_usec;
+        usec_t poll_interval_min_usec;
+        usec_t poll_interval_max_usec;
         bool poll_resync;
 
         /* history data */
@@ -75,6 +87,7 @@ struct Manager {
         } samples[8];
         unsigned int samples_idx;
         double samples_jitter;
+        usec_t max_root_distance_usec;
 
         /* last change */
         bool jumped;

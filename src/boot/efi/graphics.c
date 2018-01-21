@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /*
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -20,8 +19,8 @@
 #include <efi.h>
 #include <efilib.h>
 
-#include "util.h"
 #include "graphics.h"
+#include "util.h"
 
 EFI_STATUS graphics_mode(BOOLEAN on) {
         #define EFI_CONSOLE_CONTROL_PROTOCOL_GUID \
@@ -67,10 +66,9 @@ EFI_STATUS graphics_mode(BOOLEAN on) {
         EFI_STATUS err;
 
         err = LibLocateProtocol(&ConsoleControlProtocolGuid, (VOID **)&ConsoleControl);
-        if (EFI_ERROR(err)) {
+        if (EFI_ERROR(err))
                 /* console control protocol is nonstandard and might not exist. */
                 return err == EFI_NOT_FOUND ? EFI_SUCCESS : err;
-        }
 
         /* check current mode */
         err = uefi_call_wrapper(ConsoleControl->GetMode, 4, ConsoleControl, &current, &uga_exists, &stdin_locked);

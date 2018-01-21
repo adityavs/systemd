@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,32 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
-#include <string.h>
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#include "util.h"
-#include "utf8.h"
-#include "virt.h"
+#include "sd-id128.h"
+
+#include "alloc-util.h"
+#include "dirent-util.h"
 #include "efivars.h"
+#include "fd-util.h"
+#include "io-util.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "stdio-util.h"
+#include "time-util.h"
+#include "utf8.h"
+#include "util.h"
+#include "virt.h"
 
-#ifdef ENABLE_EFI
+#if ENABLE_EFI
 
 #define LOAD_OPTION_ACTIVE            0x00000001
 #define MEDIA_DEVICE_PATH                   0x04
@@ -70,10 +85,10 @@ bool is_efi_boot(void) {
 }
 
 static int read_flag(const char *varname) {
-        int r;
         _cleanup_free_ void *v = NULL;
-        size_t s;
         uint8_t b;
+        size_t s;
+        int r;
 
         r = efi_get_variable(EFI_VENDOR_GLOBAL, varname, NULL, &v, &s);
         if (r < 0)
@@ -83,8 +98,7 @@ static int read_flag(const char *varname) {
                 return -EINVAL;
 
         b = *(uint8_t *)v;
-        r = b > 0;
-        return r;
+        return b > 0;
 }
 
 bool is_efi_secure_boot(void) {
@@ -96,36 +110,52 @@ bool is_efi_secure_boot_setup_mode(void) {
 }
 
 int efi_reboot_to_firmware_supported(void) {
-        int r;
-        size_t s;
-        uint64_t b;
         _cleanup_free_ void *v = NULL;
+        uint64_t b;
+        size_t s;
+        int r;
 
-        if (!is_efi_boot() || detect_container(NULL) > 0)
+        if (!is_efi_boot() || detect_container() > 0)
                 return -EOPNOTSUPP;
 
         r = efi_get_variable(EFI_VENDOR_GLOBAL, "OsIndicationsSupported", NULL, &v, &s);
+        if (r == -ENOENT) /* variable doesn't exist? it's not supported then */
+                return -EOPNOTSUPP;
         if (r < 0)
                 return r;
-        else if (s != sizeof(uint64_t))
+        if (s != sizeof(uint64_t))
                 return -EINVAL;
 
-        b = *(uint64_t *)v;
-        b &= EFI_OS_INDICATIONS_BOOT_TO_FW_UI;
-        return b > 0 ? 0 : -EOPNOTSUPP;
+        b = *(uint64_t*) v;
+        if (!(b & EFI_OS_INDICATIONS_BOOT_TO_FW_UI))
+                return -EOPNOTSUPP; /* bit unset? it's not supported then */
+
+        return 0;
 }
 
 static int get_os_indications(uint64_t *os_indication) {
-        int r;
-        size_t s;
         _cleanup_free_ void *v = NULL;
+        size_t s;
+        int r;
 
         r = efi_reboot_to_firmware_supported();
         if (r < 0)
                 return r;
 
         r = efi_get_variable(EFI_VENDOR_GLOBAL, "OsIndications", NULL, &v, &s);
-        if (r < 0)
+        if (r == -ENOENT) {
+                /* Some firmware implementations that do support
+                 * OsIndications and report that with
+                 * OsIndicationsSupported will remove the
+                 * OsIndications variable when it is unset. Let's
+                 * pretend it's 0 then, to hide this implementation
+                 * detail. Note that this call will return -ENOENT
+                 * then only if the support for OsIndications is
+                 * missing entirely, as determined by
+                 * efi_reboot_to_firmware_supported() above. */
+                *os_indication = 0;
+                return 0;
+        } else if (r < 0)
                 return r;
         else if (s != sizeof(uint64_t))
                 return -EINVAL;
@@ -243,6 +273,7 @@ int efi_set_variable(
         _cleanup_close_ int fd = -1;
 
         assert(name);
+        assert(value || size == 0);
 
         if (asprintf(&p,
                      "/sys/firmware/efi/efivars/%s-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",

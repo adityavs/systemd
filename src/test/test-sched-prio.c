@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,10 +20,14 @@
 
 #include <sched.h>
 
-#include "manager.h"
 #include "macro.h"
+#include "manager.h"
+#include "rm-rf.h"
+#include "test-helper.h"
+#include "tests.h"
 
 int main(int argc, char *argv[]) {
+        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
         Manager *m = NULL;
         Unit *idle_ok, *idle_bad, *rr_ok, *rr_bad, *rr_sched;
         Service *ser;
@@ -32,11 +35,18 @@ int main(int argc, char *argv[]) {
         FDSet *fdset = NULL;
         int r;
 
+        r = enter_cgroup_subroot();
+        if (r == -ENOMEDIUM) {
+                log_notice_errno(r, "Skipping test: cgroupfs not available");
+                return EXIT_TEST_SKIP;
+        }
+
         /* prepare the test */
-        assert_se(set_unit_path(TEST_DIR) >= 0);
-        r = manager_new(MANAGER_USER, true, &m);
-        if (IN_SET(r, -EPERM, -EACCES, -EADDRINUSE, -EHOSTDOWN, -ENOENT)) {
-                printf("Skipping test: manager_new: %s", strerror(-r));
+        assert_se(set_unit_path(get_testdata_dir("")) >= 0);
+        assert_se(runtime_dir = setup_fake_runtime_dir());
+        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_MINIMAL, &m);
+        if (MANAGER_SKIP_TEST(r)) {
+                log_notice_errno(r, "Skipping test: manager_new: %m");
                 return EXIT_TEST_SKIP;
         }
         assert_se(r >= 0);

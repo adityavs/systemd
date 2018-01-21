@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,14 +20,59 @@
 
 #include <stdlib.h>
 
-#include "manager.h"
+#include "alloc-util.h"
+#include "analyze-verify.h"
+#include "bus-error.h"
 #include "bus-util.h"
 #include "log.h"
-#include "strv.h"
+#include "manager.h"
 #include "pager.h"
-#include "analyze-verify.h"
+#include "path-util.h"
+#include "strv.h"
+#include "unit-name.h"
+
+static int prepare_filename(const char *filename, char **ret) {
+        int r;
+        const char *name;
+        _cleanup_free_ char *abspath = NULL;
+        _cleanup_free_ char *dir = NULL;
+        _cleanup_free_ char *with_instance = NULL;
+        char *c;
+
+        assert(filename);
+        assert(ret);
+
+        r = path_make_absolute_cwd(filename, &abspath);
+        if (r < 0)
+                return r;
+
+        name = basename(abspath);
+        if (!unit_name_is_valid(name, UNIT_NAME_ANY))
+                return -EINVAL;
+
+        if (unit_name_is_valid(name, UNIT_NAME_TEMPLATE)) {
+                r = unit_name_replace_instance(name, "i", &with_instance);
+                if (r < 0)
+                        return r;
+        }
+
+        dir = dirname_malloc(abspath);
+        if (!dir)
+                return -ENOMEM;
+
+        if (with_instance)
+                c = path_join(NULL, dir, with_instance);
+        else
+                c = path_join(NULL, dir, name);
+        if (!c)
+                return -ENOMEM;
+
+        *ret = c;
+        return 0;
+}
 
 static int generate_path(char **var, char **filenames) {
+        const char *old;
         char **filename;
 
         _cleanup_strv_free_ char **ans = NULL;
@@ -48,9 +92,19 @@ static int generate_path(char **var, char **filenames) {
 
         assert_se(strv_uniq(ans));
 
-        r = strv_extend(&ans, "");
-        if (r < 0)
-                return r;
+        /* First, prepend our directories. Second, if some path was specified, use that, and
+         * otherwise use the defaults. Any duplicates will be filtered out in path-lookup.c.
+         * Treat explicit empty path to mean that nothing should be appended.
+         */
+        old = getenv("SYSTEMD_UNIT_PATH");
+        if (!streq_ptr(old, "")) {
+                if (!old)
+                        old = ":";
+
+                r = strv_extend(&ans, old);
+                if (r < 0)
+                        return r;
+        }
 
         *var = strv_join(ans, ":");
         if (!*var)
@@ -93,7 +147,7 @@ static int verify_socket(Unit *u) {
 }
 
 static int verify_executable(Unit *u, ExecCommand *exec) {
-        if (exec == NULL)
+        if (!exec)
                 return 0;
 
         if (access(exec->path, X_OK) < 0)
@@ -161,21 +215,18 @@ static int verify_documentation(Unit *u, bool check_man) {
 }
 
 static int verify_unit(Unit *u, bool check_man) {
-        _cleanup_bus_error_free_ sd_bus_error err = SD_BUS_ERROR_NULL;
-        Job *j;
+        _cleanup_(sd_bus_error_free) sd_bus_error err = SD_BUS_ERROR_NULL;
         int r, k;
 
         assert(u);
 
-        if (log_get_max_level() >= LOG_DEBUG)
+        if (DEBUG_LOGGING)
                 unit_dump(u, stdout, "\t");
 
         log_unit_debug(u, "Creating %s/start job", u->id);
-        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, false, &err, &j);
-        if (sd_bus_error_is_set(&err))
-                log_unit_error(u, "Error: %s: %s", err.name, err.message);
+        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, &err, NULL);
         if (r < 0)
-                log_unit_error_errno(u, r, "Failed to create %s/start: %m", u->id);
+                log_unit_error_errno(u, r, "Failed to create %s/start: %s", u->id, bus_error_message(&err, r));
 
         k = verify_socket(u);
         if (k < 0 && r == 0)
@@ -192,19 +243,19 @@ static int verify_unit(Unit *u, bool check_man) {
         return r;
 }
 
-int verify_units(char **filenames, ManagerRunningAs running_as, bool check_man) {
-        _cleanup_bus_error_free_ sd_bus_error err = SD_BUS_ERROR_NULL;
+int verify_units(char **filenames, UnitFileScope scope, bool check_man, bool run_generators) {
+        _cleanup_(sd_bus_error_free) sd_bus_error err = SD_BUS_ERROR_NULL;
+        _cleanup_free_ char *var = NULL;
         Manager *m = NULL;
         FILE *serial = NULL;
         FDSet *fdset = NULL;
-
-        _cleanup_free_ char *var = NULL;
-
         char **filename;
         int r = 0, k;
 
         Unit *units[strv_length(filenames)];
         int i, count = 0;
+        const uint8_t flags = MANAGER_TEST_RUN_ENV_GENERATORS |
+                              run_generators * MANAGER_TEST_RUN_GENERATORS;
 
         if (strv_isempty(filenames))
                 return 0;
@@ -216,7 +267,7 @@ int verify_units(char **filenames, ManagerRunningAs running_as, bool check_man) 
 
         assert_se(set_unit_path(var) >= 0);
 
-        r = manager_new(running_as, true, &m);
+        r = manager_new(scope, flags, &m);
         if (r < 0)
                 return log_error_errno(r, "Failed to initialize manager: %m");
 
@@ -233,24 +284,25 @@ int verify_units(char **filenames, ManagerRunningAs running_as, bool check_man) 
         log_debug("Loading remaining units from the command line...");
 
         STRV_FOREACH(filename, filenames) {
-                char fname[UNIT_NAME_MAX + 2 + 1] = "./";
+                _cleanup_free_ char *prepared = NULL;
 
                 log_debug("Handling %s...", *filename);
 
-                /* manager_load_unit does not like pure basenames, so prepend
-                 * the local directory, but only for valid names. manager_load_unit
-                 * will print the error for other ones. */
-                if (!strchr(*filename, '/') && strlen(*filename) <= UNIT_NAME_MAX) {
-                        strncat(fname + 2, *filename, UNIT_NAME_MAX);
-                        k = manager_load_unit(m, NULL, fname, &err, &units[count]);
-                } else
-                        k = manager_load_unit(m, NULL, *filename, &err, &units[count]);
+                k = prepare_filename(*filename, &prepared);
+                if (k < 0) {
+                        log_error_errno(k, "Failed to prepare filename %s: %m", *filename);
+                        if (r == 0)
+                                r = k;
+                        continue;
+                }
+
+                k = manager_load_unit(m, NULL, prepared, &err, &units[count]);
                 if (k < 0) {
                         log_error_errno(k, "Failed to load %s: %m", *filename);
                         if (r == 0)
                                 r = k;
                 } else
-                        count ++;
+                        count++;
         }
 
         for (i = 0; i < count; i++) {

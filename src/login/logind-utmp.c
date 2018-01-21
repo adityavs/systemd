@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,20 +19,24 @@
 ***/
 
 #include <errno.h>
+#include <pwd.h>
 #include <string.h>
 #include <unistd.h>
-#include <pwd.h>
 
 #include "sd-messages.h"
-#include "strv.h"
-#include "special.h"
-#include "unit-name.h"
-#include "audit.h"
-#include "bus-util.h"
-#include "bus-error.h"
+
+#include "alloc-util.h"
+#include "audit-util.h"
 #include "bus-common-errors.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "format-util.h"
 #include "logind.h"
-#include "formats-util.h"
+#include "path-util.h"
+#include "special.h"
+#include "strv.h"
+#include "unit-name.h"
+#include "user-util.h"
 #include "utmp-wtmp.h"
 
 _const_ static usec_t when_wall(usec_t n, usec_t elapse) {
@@ -59,15 +62,19 @@ _const_ static usec_t when_wall(usec_t n, usec_t elapse) {
 }
 
 bool logind_wall_tty_filter(const char *tty, void *userdata) {
-
         Manager *m = userdata;
+        const char *p;
 
         assert(m);
 
-        if (!startswith(tty, "/dev/"))
+        if (!m->scheduled_shutdown_tty)
                 return true;
 
-        return !streq(tty + 5, m->scheduled_shutdown_tty);
+        p = path_startswith(tty, "/dev/");
+        if (!p)
+                return true;
+
+        return !streq(p, m->scheduled_shutdown_tty);
 }
 
 static int warn_wall(Manager *m, usec_t n) {
@@ -94,7 +101,7 @@ static int warn_wall(Manager *m, usec_t n) {
                 return 0;
         }
 
-        utmp_wall(l, lookup_uid(m->scheduled_shutdown_uid),
+        utmp_wall(l, uid_to_name(m->scheduled_shutdown_uid),
                   m->scheduled_shutdown_tty, logind_wall_tty_filter, m);
 
         return 1;

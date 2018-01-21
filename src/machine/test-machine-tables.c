@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd
 
@@ -18,7 +19,6 @@
 ***/
 
 #include "machine.h"
-
 #include "test-tables.h"
 
 int main(int argc, char **argv) {

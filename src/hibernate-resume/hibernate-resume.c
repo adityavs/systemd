@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,13 +18,14 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <errno.h>
+#include <stdio.h>
 #include <sys/stat.h>
 
+#include "alloc-util.h"
+#include "fileio.h"
 #include "log.h"
 #include "util.h"
-#include "fileio.h"
 
 int main(int argc, char *argv[]) {
         struct stat st;
@@ -65,7 +65,7 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = write_string_file("/sys/power/resume", major_minor);
+        r = write_string_file("/sys/power/resume", major_minor, WRITE_STRING_FILE_CREATE);
         if (r < 0) {
                 log_error_errno(r, "Failed to write '%s' to /sys/power/resume: %m", major_minor);
                 return EXIT_FAILURE;

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
 #include <string.h>
 
-#include "util.h"
 #include "errno-list.h"
+#include "macro.h"
 
 static const struct errno_name* lookup_errno(register const char *str,
-                                                 register unsigned int len);
+                                             register GPERF_LEN_TYPE len);
 
-#include "errno-to-name.h"
 #include "errno-from-name.h"
+#include "errno-to-name.h"
 
 const char *errno_to_name(int id) {
 
@@ -48,11 +48,8 @@ int errno_from_name(const char *name) {
 
         sc = lookup_errno(name, strlen(name));
         if (!sc)
-                return 0;
+                return -EINVAL;
 
+        assert(sc->id > 0);
         return sc->id;
-}
-
-int errno_max(void) {
-        return ELEMENTSOF(errno_names);
 }

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,16 +20,21 @@
 
 #include <errno.h>
 #include <sys/epoll.h>
-#include <libudev.h>
 
-#include "log.h"
-#include "unit-name.h"
+#include "libudev.h"
+
+#include "alloc-util.h"
 #include "dbus-device.h"
-#include "path-util.h"
-#include "udev-util.h"
-#include "unit.h"
-#include "swap.h"
 #include "device.h"
+#include "log.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "stat-util.h"
+#include "string-util.h"
+#include "swap.h"
+#include "udev-util.h"
+#include "unit-name.h"
+#include "unit.h"
 
 static const UnitActiveState state_translation_table[_DEVICE_STATE_MAX] = {
         [DEVICE_DEAD] = UNIT_INACTIVE,
@@ -60,8 +64,7 @@ static void device_unset_sysfs(Device *d) {
         else
                 hashmap_remove(devices, d->sysfs);
 
-        free(d->sysfs);
-        d->sysfs = NULL;
+        d->sysfs = mfree(d->sysfs);
 }
 
 static int device_set_sysfs(Device *d, const char *sysfs) {
@@ -110,10 +113,9 @@ static void device_init(Unit *u) {
          * indefinitely for plugged in devices, something which cannot
          * happen for the other units since their operations time out
          * anyway. */
-        u->job_timeout = u->manager->default_timeout_start_usec;
+        u->job_running_timeout = u->manager->default_timeout_start_usec;
 
         u->ignore_on_isolate = true;
-        u->ignore_on_snapshot = true;
 }
 
 static void device_done(Unit *u) {
@@ -238,7 +240,7 @@ static int device_update_description(Unit *u, struct udev_device *dev, const cha
                 if (label) {
                         _cleanup_free_ char *j;
 
-                        j = strjoin(model, " ", label, NULL);
+                        j = strjoin(model, " ", label);
                         if (j)
                                 r = unit_set_description(u, j);
                         else
@@ -255,38 +257,92 @@ static int device_update_description(Unit *u, struct udev_device *dev, const cha
 }
 
 static int device_add_udev_wants(Unit *u, struct udev_device *dev) {
-        const char *wants;
-        const char *word, *state;
-        size_t l;
+        const char *wants, *property;
         int r;
-        const char *property;
 
         assert(u);
         assert(dev);
 
-        property = u->manager->running_as == MANAGER_USER ? "MANAGER_USER_WANTS" : "SYSTEMD_WANTS";
+        property = MANAGER_IS_USER(u->manager) ? "SYSTEMD_USER_WANTS" : "SYSTEMD_WANTS";
+
         wants = udev_device_get_property_value(dev, property);
         if (!wants)
                 return 0;
 
-        FOREACH_WORD_QUOTED(word, l, wants, state) {
-                _cleanup_free_ char *n = NULL;
-                char e[l+1];
+        for (;;) {
+                _cleanup_free_ char *word = NULL, *k = NULL;
 
-                memcpy(e, word, l);
-                e[l] = 0;
-
-                r = unit_name_mangle(e, UNIT_NAME_NOGLOB, &n);
+                r = extract_first_word(&wants, &word, NULL, EXTRACT_QUOTES);
+                if (r == 0)
+                        return 0;
+                if (r == -ENOMEM)
+                        return log_oom();
                 if (r < 0)
-                        return log_unit_error_errno(u, r, "Failed to mangle unit name: %m");
+                        return log_unit_error_errno(u, r, "Failed to parse property %s with value %s: %m", property, wants);
 
-                r = unit_add_dependency_by_name(u, UNIT_WANTS, n, NULL, true);
+                if (unit_name_is_valid(word, UNIT_NAME_TEMPLATE) && DEVICE(u)->sysfs) {
+                        _cleanup_free_ char *escaped = NULL;
+
+                        /* If the unit name is specified as template, then automatically fill in the sysfs path of the
+                         * device as instance name, properly escaped. */
+
+                        r = unit_name_path_escape(DEVICE(u)->sysfs, &escaped);
+                        if (r < 0)
+                                return log_unit_error_errno(u, r, "Failed to escape %s: %m", DEVICE(u)->sysfs);
+
+                        r = unit_name_replace_instance(word, escaped, &k);
+                        if (r < 0)
+                                return log_unit_error_errno(u, r, "Failed to build %s instance of template %s: %m", escaped, word);
+                } else {
+                        /* If this is not a template, then let's mangle it so, that it becomes a valid unit name. */
+
+                        r = unit_name_mangle(word, UNIT_NAME_NOGLOB, &k);
+                        if (r < 0)
+                                return log_unit_error_errno(u, r, "Failed to mangle unit name \"%s\": %m", word);
+                }
+
+                r = unit_add_dependency_by_name(u, UNIT_WANTS, k, NULL, true, UNIT_DEPENDENCY_UDEV);
                 if (r < 0)
-                        return log_unit_error_errno(u, r, "Failed to add wants dependency: %m");
+                        return log_unit_error_errno(u, r, "Failed to add Wants= dependency: %m");
         }
-        if (!isempty(state))
-                log_unit_warning(u, "Property %s on %s has trailing garbage, ignoring.", property, strna(udev_device_get_syspath(dev)));
+}
 
+static bool device_is_bound_by_mounts(Device *d, struct udev_device *dev) {
+        const char *bound_by;
+        int r;
+
+        assert(d);
+        assert(dev);
+
+        bound_by = udev_device_get_property_value(dev, "SYSTEMD_MOUNT_DEVICE_BOUND");
+        if (bound_by) {
+                r = parse_boolean(bound_by);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse SYSTEMD_MOUNT_DEVICE_BOUND='%s' udev property of %s, ignoring: %m", bound_by, strna(d->sysfs));
+
+                d->bind_mounts = r > 0;
+        } else
+                d->bind_mounts = false;
+
+        return d->bind_mounts;
+}
+
+static int device_upgrade_mount_deps(Unit *u) {
+        Unit *other;
+        Iterator i;
+        void *v;
+        int r;
+
+        /* Let's upgrade Requires= to BindsTo= on us. (Used when SYSTEMD_MOUNT_DEVICE_BOUND is set) */
+
+        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REQUIRED_BY], i) {
+                if (other->type != UNIT_MOUNT)
+                        continue;
+
+                r = unit_add_dependency(other, UNIT_BINDS_TO, u, true, UNIT_DEPENDENCY_UDEV);
+                if (r < 0)
+                        return r;
+        }
         return 0;
 }
 
@@ -311,29 +367,34 @@ static int device_setup_unit(Manager *m, struct udev_device *dev, const char *pa
                 return log_error_errno(r, "Failed to generate unit name from device path: %m");
 
         u = manager_get_unit(m, e);
+        if (u) {
+                /* The device unit can still be present even if the device was unplugged: a mount unit can reference it hence
+                 * preventing the GC to have garbaged it. That's desired since the device unit may have a dependency on the
+                 * mount unit which was added during the loading of the later. */
+                if (dev && DEVICE(u)->state == DEVICE_PLUGGED) {
 
-        if (u &&
-            sysfs &&
-            DEVICE(u)->sysfs &&
-            !path_equal(DEVICE(u)->sysfs, sysfs)) {
-                log_unit_debug(u, "Device %s appeared twice with different sysfs paths %s and %s", e, DEVICE(u)->sysfs, sysfs);
-                return -EEXIST;
-        }
+                        /* This unit is in plugged state: we're sure it's attached to a device. */
+                        if (!path_equal(DEVICE(u)->sysfs, sysfs)) {
+                                log_unit_debug(u, "Dev %s appeared twice with different sysfs paths %s and %s",
+                                               e, DEVICE(u)->sysfs, sysfs);
+                                return -EEXIST;
+                        }
+                }
 
-        if (!u) {
+                delete = false;
+
+                /* Let's remove all dependencies generated due to udev properties. We'll readd whatever is configured
+                 * now below. */
+                unit_remove_dependencies(u, UNIT_DEPENDENCY_UDEV);
+        } else {
                 delete = true;
 
-                u = unit_new(m, sizeof(Device));
-                if (!u)
-                        return log_oom();
-
-                r = unit_add_name(u, e);
+                r = unit_new_for_name(m, sizeof(Device), e, &u);
                 if (r < 0)
                         goto fail;
 
                 unit_add_to_load_queue(u);
-        } else
-                delete = false;
+        }
 
         /* If this was created via some dependency and has not
          * actually been seen yet ->sysfs will not be
@@ -351,9 +412,13 @@ static int device_setup_unit(Manager *m, struct udev_device *dev, const char *pa
                         (void) device_add_udev_wants(u, dev);
         }
 
+        /* So the user wants the mount units to be bound to the device but a mount unit might has been seen by systemd
+         * before the device appears on its radar. In this case the device unit is partially initialized and includes
+         * the deps on the mount unit but at that time the "bind mounts" flag wasn't not present. Fix this up now. */
+        if (dev && device_is_bound_by_mounts(DEVICE(u), dev))
+                device_upgrade_mount_deps(u);
 
-        /* Note that this won't dispatch the load queue, the caller
-         * has to do that if needed and appropriate */
+        /* Note that this won't dispatch the load queue, the caller has to do that if needed and appropriate */
 
         unit_add_to_dbus_queue(u);
         return 0;
@@ -419,26 +484,22 @@ static int device_process_new(Manager *m, struct udev_device *dev) {
         /* Add additional units for all explicitly configured
          * aliases */
         alias = udev_device_get_property_value(dev, "SYSTEMD_ALIAS");
-        if (alias) {
-                const char *word, *state;
-                size_t l;
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
 
-                FOREACH_WORD_QUOTED(word, l, alias, state) {
-                        char e[l+1];
+                r = extract_first_word(&alias, &word, NULL, EXTRACT_QUOTES);
+                if (r == 0)
+                        return 0;
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to add parse SYSTEMD_ALIAS for %s: %m", sysfs);
 
-                        memcpy(e, word, l);
-                        e[l] = 0;
-
-                        if (path_is_absolute(e))
-                                (void) device_setup_unit(m, dev, e, false);
-                        else
-                                log_warning("SYSTEMD_ALIAS for %s is not an absolute path, ignoring: %s", sysfs, e);
-                }
-                if (!isempty(state))
-                        log_warning("SYSTEMD_ALIAS for %s has trailing garbage, ignoring.", sysfs);
+                if (path_is_absolute(word))
+                        (void) device_setup_unit(m, dev, word, false);
+                else
+                        log_warning("SYSTEMD_ALIAS for %s is not an absolute path, ignoring: %s", sysfs, word);
         }
-
-        return 0;
 }
 
 static void device_update_found_one(Device *d, bool add, DeviceFound found, bool now) {
@@ -456,6 +517,10 @@ static void device_update_found_one(Device *d, bool add, DeviceFound found, bool
         if (!now)
                 return;
 
+        /* Didn't exist before, but does now? if so, generate a new invocation ID for it */
+        if (previous == DEVICE_NOT_FOUND && d->found != DEVICE_NOT_FOUND)
+                (void) unit_acquire_invocation_id(UNIT(d));
+
         if (d->found & DEVICE_FOUND_UDEV)
                 /* When the device is known to udev we consider it
                  * plugged. */
@@ -465,16 +530,20 @@ static void device_update_found_one(Device *d, bool add, DeviceFound found, bool
                  * now referenced by the kernel, then we assume the
                  * kernel knows it now, and udev might soon too. */
                 device_set_state(d, DEVICE_TENTATIVE);
-        else
+        else {
                 /* If nobody sees the device, or if the device was
                  * previously seen by udev and now is only referenced
                  * from the kernel, then we consider the device is
                  * gone, the kernel just hasn't noticed it yet. */
+
                 device_set_state(d, DEVICE_DEAD);
+                device_unset_sysfs(d);
+        }
+
 }
 
 static int device_update_found_by_sysfs(Manager *m, const char *sysfs, bool add, DeviceFound found, bool now) {
-        Device *d, *l;
+        Device *d, *l, *n;
 
         assert(m);
         assert(sysfs);
@@ -483,7 +552,7 @@ static int device_update_found_by_sysfs(Manager *m, const char *sysfs, bool add,
                 return 0;
 
         l = hashmap_get(m->devices_by_sysfs, sysfs);
-        LIST_FOREACH(same_sysfs, d, l)
+        LIST_FOREACH_SAFE(same_sysfs, d, n, l)
                 device_update_found_one(d, add, found, now);
 
         return 0;
@@ -595,11 +664,10 @@ static void device_shutdown(Manager *m) {
                 m->udev_monitor = NULL;
         }
 
-        hashmap_free(m->devices_by_sysfs);
-        m->devices_by_sysfs = NULL;
+        m->devices_by_sysfs = hashmap_free(m->devices_by_sysfs);
 }
 
-static int device_enumerate(Manager *m) {
+static void device_enumerate(Manager *m) {
         _cleanup_udev_enumerate_unref_ struct udev_enumerate *e = NULL;
         struct udev_list_entry *item = NULL, *first = NULL;
         int r;
@@ -609,7 +677,7 @@ static int device_enumerate(Manager *m) {
         if (!m->udev_monitor) {
                 m->udev_monitor = udev_monitor_new_from_netlink(m->udev, "udev");
                 if (!m->udev_monitor) {
-                        r = -ENOMEM;
+                        log_oom();
                         goto fail;
                 }
 
@@ -619,37 +687,49 @@ static int device_enumerate(Manager *m) {
                 (void) udev_monitor_set_receive_buffer_size(m->udev_monitor, 128*1024*1024);
 
                 r = udev_monitor_filter_add_match_tag(m->udev_monitor, "systemd");
-                if (r < 0)
+                if (r < 0) {
+                        log_error_errno(r, "Failed to add udev tag match: %m");
                         goto fail;
+                }
 
                 r = udev_monitor_enable_receiving(m->udev_monitor);
-                if (r < 0)
+                if (r < 0) {
+                        log_error_errno(r, "Failed to enable udev event reception: %m");
                         goto fail;
+                }
 
                 r = sd_event_add_io(m->event, &m->udev_event_source, udev_monitor_get_fd(m->udev_monitor), EPOLLIN, device_dispatch_io, m);
-                if (r < 0)
+                if (r < 0) {
+                        log_error_errno(r, "Failed to watch udev file descriptor: %m");
                         goto fail;
+                }
 
                 (void) sd_event_source_set_description(m->udev_event_source, "device");
         }
 
         e = udev_enumerate_new(m->udev);
         if (!e) {
-                r = -ENOMEM;
+                log_oom();
                 goto fail;
         }
 
         r = udev_enumerate_add_match_tag(e, "systemd");
-        if (r < 0)
+        if (r < 0) {
+                log_error_errno(r, "Failed to create udev tag enumeration: %m");
                 goto fail;
+        }
 
         r = udev_enumerate_add_match_is_initialized(e);
-        if (r < 0)
+        if (r < 0) {
+                log_error_errno(r, "Failed to install initialization match into enumeration: %m");
                 goto fail;
+        }
 
         r = udev_enumerate_scan_devices(e);
-        if (r < 0)
+        if (r < 0) {
+                log_error_errno(r, "Failed to enumerate devices: %m");
                 goto fail;
+        }
 
         first = udev_enumerate_get_list_entry(e);
         udev_list_entry_foreach(item, first) {
@@ -672,13 +752,10 @@ static int device_enumerate(Manager *m) {
                 device_update_found_by_sysfs(m, sysfs, true, DEVICE_FOUND_UDEV, false);
         }
 
-        return 0;
+        return;
 
 fail:
-        log_error_errno(r, "Failed to enumerate devices: %m");
-
         device_shutdown(m);
-        return r;
 }
 
 static int device_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
@@ -718,6 +795,26 @@ static int device_dispatch_io(sd_event_source *source, int fd, uint32_t revents,
                 return 0;
         }
 
+        if (streq(action, "change"))  {
+                _cleanup_free_ char *e = NULL;
+                Unit *u;
+
+                r = unit_name_from_path(sysfs, ".device", &e);
+                if (r < 0)
+                        log_error_errno(r, "Failed to generate unit name from device path: %m");
+                else {
+                        u = manager_get_unit(m, e);
+                        if (u && UNIT_VTABLE(u)->active_state(u) == UNIT_ACTIVE) {
+                                r = manager_propagate_reload(m, u, JOB_REPLACE, NULL);
+                                if (r < 0)
+                                        log_error_errno(r, "Failed to propagate reload: %m");
+                        }
+                }
+        }
+
+        /* A change event can signal that a device is becoming ready, in particular if
+         * the device is using the SYSTEMD_READY logic in udev
+         * so we need to reach the else block of the follwing if, even for change events */
         if (streq(action, "remove"))  {
                 r = swap_process_device_remove(m, dev);
                 if (r < 0)
@@ -818,13 +915,13 @@ int device_found_node(Manager *m, const char *node, bool add, DeviceFound found,
         return device_update_found_by_name(m, node, add, found, now);
 }
 
-static const char* const device_state_table[_DEVICE_STATE_MAX] = {
-        [DEVICE_DEAD] = "dead",
-        [DEVICE_TENTATIVE] = "tentative",
-        [DEVICE_PLUGGED] = "plugged",
-};
+bool device_shall_be_bound_by(Unit *device, Unit *u) {
 
-DEFINE_STRING_TABLE_LOOKUP(device_state, DeviceState);
+        if (u->type != UNIT_MOUNT)
+                return false;
+
+        return DEVICE(device)->bind_mounts;
+}
 
 const UnitVTable device_vtable = {
         .object_size = sizeof(Device),
@@ -833,7 +930,7 @@ const UnitVTable device_vtable = {
                 "Device\0"
                 "Install\0",
 
-        .no_instances = true,
+        .gc_jobs = true,
 
         .init = device_init,
         .done = device_done,
@@ -849,7 +946,6 @@ const UnitVTable device_vtable = {
         .active_state = device_active_state,
         .sub_state_to_string = device_sub_state_to_string,
 
-        .bus_interface = "org.freedesktop.systemd1.Device",
         .bus_vtable = bus_device_vtable,
 
         .following = device_following,

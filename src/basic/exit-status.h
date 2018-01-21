@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,9 +22,17 @@
 
 #include <stdbool.h>
 
+#include "hashmap.h"
+#include "macro.h"
 #include "set.h"
 
-typedef enum ExitStatus {
+/* This defines pretty names for the LSB 'start' verb exit codes. Note that they shouldn't be confused with the LSB
+ * 'status' verb exit codes which are defined very differently. For details see:
+ *
+ * https://refspecs.linuxbase.org/LSB_5.0.0/LSB-Core-generic/LSB-Core-generic/iniscrptact.html
+ */
+
+enum {
         /* EXIT_SUCCESS defined by libc */
         /* EXIT_FAILURE defined by libc */
         EXIT_INVALIDARGUMENT = 2,
@@ -37,9 +44,7 @@ typedef enum ExitStatus {
 
         /* The LSB suggests that error codes >= 200 are "reserved". We
          * use them here under the assumption that they hence are
-         * unused by init scripts.
-         *
-         * http://refspecs.linuxfoundation.org/LSB_3.2.0/LSB-Core-generic/LSB-Core-generic/iniscrptact.html */
+         * unused by init scripts. */
 
         EXIT_CHDIR = 200,
         EXIT_NICE,
@@ -75,16 +80,20 @@ typedef enum ExitStatus {
         EXIT_APPARMOR_PROFILE,
         EXIT_ADDRESS_FAMILIES,
         EXIT_RUNTIME_DIRECTORY,
-        EXIT_MAKE_STARTER,
+        _EXIT_RESERVED2, /* used to be used by kdbus, don't reuse */
         EXIT_CHOWN,
-        EXIT_BUS_ENDPOINT,
         EXIT_SMACK_PROCESS_LABEL,
-} ExitStatus;
+        EXIT_KEYRING,
+        EXIT_STATE_DIRECTORY,
+        EXIT_CACHE_DIRECTORY,
+        EXIT_LOGS_DIRECTORY, /* 240 */
+        EXIT_CONFIGURATION_DIRECTORY,
+};
 
 typedef enum ExitStatusLevel {
-        EXIT_STATUS_MINIMAL,
-        EXIT_STATUS_SYSTEMD,
-        EXIT_STATUS_LSB,
+        EXIT_STATUS_MINIMAL,   /* only cover libc EXIT_STATUS/EXIT_FAILURE */
+        EXIT_STATUS_SYSTEMD,   /* cover libc and systemd's own exit codes */
+        EXIT_STATUS_LSB,       /* cover libc, systemd's own and LSB exit codes */
         EXIT_STATUS_FULL = EXIT_STATUS_LSB
 } ExitStatusLevel;
 
@@ -93,10 +102,14 @@ typedef struct ExitStatusSet {
         Set *signal;
 } ExitStatusSet;
 
-const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) _const_;
+const char* exit_status_to_string(int status, ExitStatusLevel level) _const_;
 
-bool is_clean_exit(int code, int status, ExitStatusSet *success_status);
-bool is_clean_exit_lsb(int code, int status, ExitStatusSet *success_status);
+typedef enum ExitClean {
+        EXIT_CLEAN_DAEMON,
+        EXIT_CLEAN_COMMAND,
+} ExitClean;
+
+bool is_clean_exit(int code, int status, ExitClean clean, ExitStatusSet *success_status);
 
 void exit_status_set_free(ExitStatusSet *x);
 bool exit_status_set_is_empty(ExitStatusSet *x);

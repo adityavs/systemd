@@ -2,6 +2,8 @@
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -55,7 +57,7 @@
     <title>Description</title>
 
     <para><filename>systemd-modules-load.service</filename> is an
-    early-boot service that loads kernel modules based on static
+    early boot service that loads kernel modules based on static
     configuration.</para>
 
     <para>See
@@ -73,8 +75,8 @@
     <variablelist class='kernel-commandline-options'>
 
       <varlistentry>
-        <term><varname>modules-load=</varname></term>
-        <term><varname>rd.modules-load=</varname></term>
+        <term><varname>modules_load=</varname></term>
+        <term><varname>rd.modules_load=</varname></term>
 
         <listitem><para>Takes a comma-separated list of kernel modules
         to statically load during early boot. The option prefixed with

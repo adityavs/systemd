@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,12 +18,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
 #include <errno.h>
+#include <unistd.h>
 
-#include "log.h"
-#include "util.h"
 #include "fileio.h"
+#include "fileio-label.h"
+#include "log.h"
+#include "selinux-util.h"
+#include "string-util.h"
+#include "util.h"
 
 int main(int argc, char*argv[]) {
 
@@ -39,13 +41,14 @@ int main(int argc, char*argv[]) {
 
         umask(0022);
 
+        mac_selinux_init();
+
         if (streq(argv[1], "start")) {
                 int r = 0;
 
-                if (unlink("/run/nologin") < 0 && errno != ENOENT) {
-                        log_error_errno(errno, "Failed to remove /run/nologin file: %m");
-                        r = -errno;
-                }
+                if (unlink("/run/nologin") < 0 && errno != ENOENT)
+                        r = log_error_errno(errno,
+                                            "Failed to remove /run/nologin file: %m");
 
                 if (unlink("/etc/nologin") < 0 && errno != ENOENT) {
                         /* If the file doesn't exist and /etc simply
@@ -65,7 +68,7 @@ int main(int argc, char*argv[]) {
         } else if (streq(argv[1], "stop")) {
                 int r;
 
-                r = write_string_file_atomic("/run/nologin", "System is going down.");
+                r = write_string_file_atomic_label("/run/nologin", "System is going down.");
                 if (r < 0) {
                         log_error_errno(r, "Failed to create /run/nologin: %m");
                         return EXIT_FAILURE;
@@ -75,6 +78,8 @@ int main(int argc, char*argv[]) {
                 log_error("Unknown verb %s.", argv[1]);
                 return EXIT_FAILURE;
         }
+
+        mac_selinux_finish();
 
         return EXIT_SUCCESS;
 }

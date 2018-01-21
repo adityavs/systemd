@@ -3,6 +3,8 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -112,7 +114,7 @@
         <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
         Defaults to <literal>info</literal>. Note that this simply
         controls the default, individual lines may be logged with
-        different levels if they are prefixed accordingly. For details
+        different levels if they are prefixed accordingly. For details,
         see <option>--level-prefix=</option> below.</para></listitem>
       </varlistentry>
 

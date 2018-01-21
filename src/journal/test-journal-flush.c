@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,9 +21,12 @@
 #include <fcntl.h>
 
 #include "sd-journal.h"
-#include "macro.h"
+
+#include "alloc-util.h"
 #include "journal-file.h"
 #include "journal-internal.h"
+#include "macro.h"
+#include "string-util.h"
 
 int main(int argc, char *argv[]) {
         _cleanup_free_ char *fn = NULL;
@@ -37,7 +39,7 @@ int main(int argc, char *argv[]) {
         assert_se(mkdtemp(dn));
         fn = strappend(dn, "/test.journal");
 
-        r = journal_file_open(fn, O_CREAT|O_RDWR, 0644, false, false, NULL, NULL, NULL, &new_journal);
+        r = journal_file_open(-1, fn, O_CREAT|O_RDWR, 0644, false, false, NULL, NULL, NULL, NULL, &new_journal);
         assert_se(r >= 0);
 
         r = sd_journal_open(&j, 0);
@@ -65,7 +67,7 @@ int main(int argc, char *argv[]) {
 
         sd_journal_close(j);
 
-        journal_file_close(new_journal);
+        (void) journal_file_close(new_journal);
 
         unlink(fn);
         assert_se(rmdir(dn) == 0);

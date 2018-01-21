@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,18 +18,28 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <utmpx.h>
 #include <errno.h>
-#include <string.h>
-#include <sys/utsname.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <poll.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#include <utmpx.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "hostname-util.h"
 #include "macro.h"
 #include "path-util.h"
+#include "string-util.h"
 #include "terminal-util.h"
-#include "hostname-util.h"
+#include "time-util.h"
+#include "user-util.h"
+#include "util.h"
 #include "utmp-wtmp.h"
 
 int utmp_get_runlevel(int *runlevel, int *previous) {
@@ -204,12 +213,13 @@ _pure_ static const char *sanitize_id(const char *id) {
         return id + l - sizeof(((struct utmpx*) NULL)->ut_id);
 }
 
-int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line) {
+int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line, int ut_type, const char *user) {
         struct utmpx store = {
                 .ut_type = INIT_PROCESS,
                 .ut_pid = pid,
                 .ut_session = sid,
         };
+        int r;
 
         assert(id);
 
@@ -221,7 +231,26 @@ int utmp_put_init_process(const char *id, pid_t pid, pid_t sid, const char *line
         if (line)
                 strncpy(store.ut_line, basename(line), sizeof(store.ut_line));
 
-        return write_entry_both(&store);
+        r = write_entry_both(&store);
+        if (r < 0)
+                return r;
+
+        if (IN_SET(ut_type, LOGIN_PROCESS, USER_PROCESS)) {
+                store.ut_type = LOGIN_PROCESS;
+                r = write_entry_both(&store);
+                if (r < 0)
+                        return r;
+        }
+
+        if (ut_type == USER_PROCESS) {
+                store.ut_type = USER_PROCESS;
+                strncpy(store.ut_user, user, sizeof(store.ut_user)-1);
+                r = write_entry_both(&store);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
 int utmp_put_dead_process(const char *id, pid_t pid, int code, int status) {
@@ -396,7 +425,7 @@ int utmp_wall(
                 if (u->ut_type != USER_PROCESS || u->ut_user[0] == 0)
                         continue;
 
-                /* this access is fine, because strlen("/dev/") << 32 (UT_LINESIZE) */
+                /* this access is fine, because STRLEN("/dev/") << 32 (UT_LINESIZE) */
                 if (path_startswith(u->ut_line, "/dev/"))
                         path = u->ut_line;
                 else {

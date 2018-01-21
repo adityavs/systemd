@@ -1,684 +1,539 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-    This file is part of systemd.
+  This file is part of systemd.
 
-    Copyright (C) 2014 Tom Gundersen
-    Copyright (C) 2014 Susant Sahani
+  Copyright (C) 2014 Tom Gundersen
+  Copyright (C) 2014 Susant Sahani
 
-    systemd is free software; you can redistribute it and/or modify it
-    under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2.1 of the License, or
-    (at your option) any later version.
+  systemd is free software; you can redistribute it and/or modify it
+  under the terms of the GNU Lesser General Public License as published by
+  the Free Software Foundation; either version 2.1 of the License, or
+  (at your option) any later version.
 
-    systemd is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    Lesser General Public License for more details.
+  systemd is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+  Lesser General Public License for more details.
 
-    You should have received a copy of the GNU Lesser General Public License
-    along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  You should have received a copy of the GNU Lesser General Public License
+  along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
 #include <arpa/inet.h>
+#include <linux/sockios.h>
 
-#include "siphash24.h"
-#include "hashmap.h"
-
-#include "lldp-tlv.h"
-#include "lldp-port.h"
 #include "sd-lldp.h"
-#include "prioq.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "lldp-internal.h"
-#include "lldp-util.h"
+#include "lldp-neighbor.h"
+#include "lldp-network.h"
+#include "socket-util.h"
+#include "ether-addr-util.h"
 
-typedef enum LLDPAgentRXState {
-        LLDP_AGENT_RX_WAIT_PORT_OPERATIONAL = 4,
-        LLDP_AGENT_RX_DELETE_AGED_INFO,
-        LLDP_AGENT_RX_LLDP_INITIALIZE,
-        LLDP_AGENT_RX_WAIT_FOR_FRAME,
-        LLDP_AGENT_RX_RX_FRAME,
-        LLDP_AGENT_RX_DELETE_INFO,
-        LLDP_AGENT_RX_UPDATE_INFO,
-        _LLDP_AGENT_RX_STATE_MAX,
-        _LLDP_AGENT_RX_INVALID = -1,
-} LLDPAgentRXState;
+#define LLDP_DEFAULT_NEIGHBORS_MAX 128U
 
-/* Section 10.5.2.2 Reception counters */
-struct lldp_agent_statistics {
-        uint64_t stats_ageouts_total;
-        uint64_t stats_frames_discarded_total;
-        uint64_t stats_frames_in_errors_total;
-        uint64_t stats_frames_in_total;
-        uint64_t stats_tlvs_discarded_total;
-        uint64_t stats_tlvs_unrecognized_total;
-};
-
-struct sd_lldp {
-        lldp_port *port;
-
-        Prioq *by_expiry;
-        Hashmap *neighbour_mib;
-
-        sd_lldp_cb_t cb;
-
-        void *userdata;
-
-        LLDPAgentRXState rx_state;
-        lldp_agent_statistics statistics;
-};
-
-static unsigned long chassis_id_hash_func(const void *p,
-                                          const uint8_t hash_key[HASH_KEY_SIZE]) {
-        uint64_t u;
-        const lldp_chassis_id *id = p;
-
-        assert(id);
-
-        siphash24((uint8_t *) &u, id->data, id->length, hash_key);
-
-        return (unsigned long) u;
-}
-
-static int chassis_id_compare_func(const void *_a, const void *_b) {
-        const lldp_chassis_id *a, *b;
-
-        a = _a;
-        b = _b;
-
-        assert(!a->length || a->data);
-        assert(!b->length || b->data);
-
-        if (a->type != b->type)
-                return -1;
-
-        if (a->length != b->length)
-                return a->length < b->length ? -1 : 1;
-
-        return memcmp(a->data, b->data, a->length);
-}
-
-static const struct hash_ops chassis_id_hash_ops = {
-        .hash = chassis_id_hash_func,
-        .compare = chassis_id_compare_func
-};
-
-static void lldp_mib_delete_objects(sd_lldp *lldp);
-static void lldp_set_state(sd_lldp *lldp, LLDPAgentRXState state);
-static void lldp_run_state_machine(sd_lldp *ll);
-
-static int lldp_receive_frame(sd_lldp *lldp, tlv_packet *tlv) {
-        int r;
+static void lldp_flush_neighbors(sd_lldp *lldp) {
+        sd_lldp_neighbor *n;
 
         assert(lldp);
-        assert(tlv);
 
-        /* Remove expired packets */
-        if (prioq_size(lldp->by_expiry) > 0) {
-
-                lldp_set_state(lldp, LLDP_AGENT_RX_DELETE_INFO);
-
-                lldp_mib_delete_objects(lldp);
-        }
-
-        r = lldp_mib_add_objects(lldp->by_expiry, lldp->neighbour_mib, tlv);
-        if (r < 0)
-                goto out;
-
-        lldp_set_state(lldp, LLDP_AGENT_RX_UPDATE_INFO);
-
-        log_lldp("Packet added. MIB size: %d , PQ size: %d",
-                 hashmap_size(lldp->neighbour_mib),
-                 prioq_size(lldp->by_expiry));
-
-        lldp->statistics.stats_frames_in_total ++;
-
-        return 0;
-
- out:
-        if (r < 0)
-                log_lldp("Receive frame failed: %s", strerror(-r));
-
-        lldp_set_state(lldp, LLDP_AGENT_RX_WAIT_FOR_FRAME);
-
-        return 0;
+        while ((n = hashmap_first(lldp->neighbor_by_id)))
+                lldp_neighbor_unlink(n);
 }
 
-/* 10.3.2 LLDPDU validation: rxProcessFrame() */
-int lldp_handle_packet(tlv_packet *tlv, uint16_t length) {
-        uint16_t type, len, i, l, t;
-        bool chassis_id = false;
-        bool malformed = false;
-        bool port_id = false;
-        bool ttl = false;
-        bool end = false;
-        lldp_port *port;
-        uint8_t *p, *q;
-        sd_lldp *lldp;
-        int r;
+static void lldp_callback(sd_lldp *lldp, sd_lldp_event event, sd_lldp_neighbor *n) {
+        assert(lldp);
 
-        assert(tlv);
-        assert(length > 0);
+        log_lldp("Invoking callback for '%c'.", event);
 
-        port = (lldp_port *) tlv->userdata;
-        lldp = (sd_lldp *) port->userdata;
+        if (!lldp->callback)
+                return;
 
-        if (lldp->port->status == LLDP_PORT_STATUS_DISABLED) {
-                log_lldp("Port is disabled : %s . Dropping ...",
-                         lldp->port->ifname);
-                goto out;
-        }
-
-        lldp_set_state(lldp, LLDP_AGENT_RX_RX_FRAME);
-
-        p = tlv->pdu;
-        p += sizeof(struct ether_header);
-
-        for (i = 1, l = 0; l <= length; i++) {
-
-                memcpy(&t, p, sizeof(uint16_t));
-
-                type = ntohs(t) >> 9;
-                len = ntohs(t) & 0x01ff;
-
-                if (type == LLDP_TYPE_END) {
-                        if (len != 0) {
-                                log_lldp("TLV type end is not length 0. Length:%d received . Dropping ...",
-                                         len);
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        end = true;
-
-                        break;
-                } else if (type >=_LLDP_TYPE_MAX) {
-                        log_lldp("TLV type not recognized %d . Dropping ...",
-                                 type);
-
-                        malformed = true;
-                        goto out;
-                }
-
-                /* skip type and lengh encoding */
-                p += 2;
-                q = p;
-
-                p += len;
-                l += (len + 2);
-
-                if (i <= 3) {
-                        if (i != type) {
-                                log_lldp("TLV missing or out of order. Dropping ...");
-
-                                malformed = true;
-                                goto out;
-                        }
-                }
-
-                switch(type) {
-                case LLDP_TYPE_CHASSIS_ID:
-
-                        if (len < 2) {
-                                log_lldp("Received malformed Chassis ID TLV len = %d. Dropping",
-                                         len);
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        if (chassis_id) {
-                                log_lldp("Duplicate Chassis ID TLV found. Dropping ...");
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        /* Look what subtype it has */
-                        if (*q == LLDP_CHASSIS_SUBTYPE_RESERVED ||
-                            *q > LLDP_CHASSIS_SUBTYPE_LOCALLY_ASSIGNED) {
-                                log_lldp("Unknown subtype: %d found in Chassis ID TLV . Dropping ...",
-                                         *q);
-
-                                malformed = true;
-                                goto out;
-
-                        }
-
-                        chassis_id = true;
-
-                        break;
-                case LLDP_TYPE_PORT_ID:
-
-                        if (len < 2) {
-                                log_lldp("Received malformed Port ID TLV len = %d. Dropping",
-                                         len);
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        if (port_id) {
-                                log_lldp("Duplicate Port ID TLV found. Dropping ...");
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        /* Look what subtype it has */
-                        if (*q == LLDP_PORT_SUBTYPE_RESERVED ||
-                            *q > LLDP_PORT_SUBTYPE_LOCALLY_ASSIGNED) {
-                                log_lldp("Unknown subtype: %d found in Port ID TLV . Dropping ...",
-                                         *q);
-
-                                malformed = true;
-                                goto out;
-
-                        }
-
-                        port_id = true;
-
-                        break;
-                case LLDP_TYPE_TTL:
-
-                        if(len != 2) {
-                                log_lldp(
-                                         "Received invalid lenth: %d TTL TLV. Dropping ...",
-                                         len);
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        if (ttl) {
-                                log_lldp("Duplicate TTL TLV found. Dropping ...");
-
-                                malformed = true;
-                                goto out;
-                        }
-
-                        ttl = true;
-
-                        break;
-                default:
-
-                        if (len == 0) {
-                                log_lldp("TLV type = %d's, length 0 received . Dropping ...",
-                                         type);
-
-                                malformed = true;
-                                goto out;
-                        }
-                        break;
-                }
-        }
-
-        if(!chassis_id || !port_id || !ttl || !end) {
-                log_lldp( "One or more mandotory TLV missing . Dropping ...");
-
-                malformed = true;
-                goto out;
-
-        }
-
-        r = tlv_packet_parse_pdu(tlv, length);
-        if (r < 0) {
-                log_lldp( "Failed to parse the TLV. Dropping ...");
-
-                malformed = true;
-                goto out;
-        }
-
-        return lldp_receive_frame(lldp, tlv);
-
- out:
-        lldp_set_state(lldp, LLDP_AGENT_RX_WAIT_FOR_FRAME);
-
-        if (malformed) {
-                lldp->statistics.stats_frames_discarded_total ++;
-                lldp->statistics.stats_frames_in_errors_total ++;
-        }
-
-        tlv_packet_free(tlv);
-
-        return 0;
+        lldp->callback(lldp, event, n, lldp->userdata);
 }
 
-static int ttl_expiry_item_prioq_compare_func(const void *a, const void *b) {
-        const lldp_neighbour_port *p = a, *q = b;
-
-        if (p->until < q->until)
-                return -1;
-
-        if (p->until > q->until)
-                return 1;
-
-        return 0;
-}
-
-static void lldp_set_state(sd_lldp *lldp, LLDPAgentRXState state) {
+static int lldp_make_space(sd_lldp *lldp, size_t extra) {
+        usec_t t = USEC_INFINITY;
+        bool changed = false;
 
         assert(lldp);
-        assert(state < _LLDP_AGENT_RX_STATE_MAX);
 
-        lldp->rx_state = state;
+        /* Remove all entries that are past their TTL, and more until at least the specified number of extra entries
+         * are free. */
 
-        lldp_run_state_machine(lldp);
-}
-
-static void lldp_run_state_machine(sd_lldp *lldp) {
-
-        if (lldp->rx_state == LLDP_AGENT_RX_UPDATE_INFO)
-                if (lldp->cb)
-                        lldp->cb(lldp, LLDP_AGENT_RX_UPDATE_INFO, lldp->userdata);
-}
-
-/* 10.5.5.2.1 mibDeleteObjects ()
- * The mibDeleteObjects () procedure deletes all information in the LLDP remote
- * systems MIB associated with the MSAP identifier if an LLDPDU is received with
- * an rxTTL value of zero (see 10.3.2) or the timing counter rxInfoTTL expires. */
-
-static void lldp_mib_delete_objects(sd_lldp *lldp) {
-        lldp_neighbour_port *p;
-        usec_t t = 0;
-
-        /* Remove all entries that are past their TTL */
         for (;;) {
+                _cleanup_(sd_lldp_neighbor_unrefp) sd_lldp_neighbor *n = NULL;
 
-                if (prioq_size(lldp->by_expiry) <= 0)
+                n = prioq_peek(lldp->neighbor_by_expiry);
+                if (!n)
                         break;
 
-                p = prioq_peek(lldp->by_expiry);
-                if (!p)
+                sd_lldp_neighbor_ref(n);
+
+                if (hashmap_size(lldp->neighbor_by_id) > LESS_BY(lldp->neighbors_max, extra))
+                        goto remove_one;
+
+                if (t == USEC_INFINITY)
+                        t = now(clock_boottime_or_monotonic());
+
+                if (n->until > t)
                         break;
 
-                if (t <= 0)
-                        t = now(CLOCK_BOOTTIME);
-
-                if (p->until > t)
-                        break;
-
-                lldp_neighbour_port_remove_and_free(p);
-
-                lldp->statistics.stats_ageouts_total ++;
+        remove_one:
+                lldp_neighbor_unlink(n);
+                lldp_callback(lldp, SD_LLDP_EVENT_REMOVED, n);
+                changed = true;
         }
+
+        return changed;
 }
 
-static void lldp_mib_objects_flush(sd_lldp *lldp) {
-        lldp_neighbour_port *p, *q;
-        lldp_chassis *c;
-
+static bool lldp_keep_neighbor(sd_lldp *lldp, sd_lldp_neighbor *n) {
         assert(lldp);
-        assert(lldp->neighbour_mib);
-        assert(lldp->by_expiry);
+        assert(n);
 
-        /* Drop all packets */
-        while ((c = hashmap_steal_first(lldp->neighbour_mib))) {
+        /* Don't keep data with a zero TTL */
+        if (n->ttl <= 0)
+                return false;
 
-                LIST_FOREACH_SAFE(port, p, q, c->ports) {
-                        lldp_neighbour_port_remove_and_free(p);
-                }
-        }
+        /* Filter out data from the filter address */
+        if (!ether_addr_is_null(&lldp->filter_address) &&
+            ether_addr_equal(&lldp->filter_address, &n->source_address))
+                return false;
 
-        assert(hashmap_size(lldp->neighbour_mib) == 0);
-        assert(prioq_size(lldp->by_expiry) == 0);
+        /* Only add if the neighbor has a capability we are interested in. Note that we also store all neighbors with
+         * no caps field set. */
+        if (n->has_capabilities &&
+            (n->enabled_capabilities & lldp->capability_mask) == 0)
+                return false;
+
+        /* Keep everything else */
+        return true;
 }
 
-int sd_lldp_save(sd_lldp *lldp, const char *lldp_file) {
-        _cleanup_free_ char *temp_path = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        uint8_t *mac, *port_id, type;
-        lldp_neighbour_port *p;
-        uint16_t data = 0, length = 0;
-        char buf[LINE_MAX];
-        lldp_chassis *c;
-        usec_t time;
-        Iterator i;
+static int lldp_start_timer(sd_lldp *lldp, sd_lldp_neighbor *neighbor);
+
+static int lldp_add_neighbor(sd_lldp *lldp, sd_lldp_neighbor *n) {
+        _cleanup_(sd_lldp_neighbor_unrefp) sd_lldp_neighbor *old = NULL;
+        bool keep;
         int r;
 
         assert(lldp);
-        assert(lldp_file);
+        assert(n);
+        assert(!n->lldp);
 
-        r = fopen_temporary(lldp_file, &f, &temp_path);
+        keep = lldp_keep_neighbor(lldp, n);
+
+        /* First retrieve the old entry for this MSAP */
+        old = hashmap_get(lldp->neighbor_by_id, &n->id);
+        if (old) {
+                sd_lldp_neighbor_ref(old);
+
+                if (!keep) {
+                        lldp_neighbor_unlink(old);
+                        lldp_callback(lldp, SD_LLDP_EVENT_REMOVED, old);
+                        return 0;
+                }
+
+                if (lldp_neighbor_equal(n, old)) {
+                        /* Is this equal, then restart the TTL counter, but don't do anyting else. */
+                        old->timestamp = n->timestamp;
+                        lldp_start_timer(lldp, old);
+                        lldp_callback(lldp, SD_LLDP_EVENT_REFRESHED, old);
+                        return 0;
+                }
+
+                /* Data changed, remove the old entry, and add a new one */
+                lldp_neighbor_unlink(old);
+
+        } else if (!keep)
+                return 0;
+
+        /* Then, make room for at least one new neighbor */
+        lldp_make_space(lldp, 1);
+
+        r = hashmap_put(lldp->neighbor_by_id, &n->id, n);
         if (r < 0)
                 goto finish;
 
-        fchmod(fileno(f), 0644);
-
-        HASHMAP_FOREACH(c, lldp->neighbour_mib, i) {
-                LIST_FOREACH(port, p, c->ports) {
-                        _cleanup_free_ char *s = NULL;
-                        char *k, *t;
-
-                        r = lldp_read_chassis_id(p->packet, &type, &length, &mac);
-                        if (r < 0)
-                                continue;
-
-                        sprintf(buf, "'_Chassis=%02x:%02x:%02x:%02x:%02x:%02x' '_CType=%d' ",
-                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], type);
-
-                        s = strdup(buf);
-                        if (!s)
-                                return -ENOMEM;
-
-                        r = lldp_read_port_id(p->packet, &type, &length, &port_id);
-                        if (r < 0)
-                                continue;
-
-                        if (type != LLDP_PORT_SUBTYPE_MAC_ADDRESS) {
-                                k = strndup((char *) port_id, length -1);
-                                if (!k)
-                                        return -ENOMEM;
-
-                                sprintf(buf, "'_Port=%s' '_PType=%d' ", k , type);
-                                free(k);
-                        } else {
-                                mac = port_id;
-                                sprintf(buf, "'_Port=%02x:%02x:%02x:%02x:%02x:%02x' '_PType=%d' ",
-                                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], type);
-                        }
-
-                        k = strappend(s, buf);
-                        if (!k)
-                                return -ENOMEM;
-
-                        free(s);
-                        s = k;
-
-                        time = now(CLOCK_BOOTTIME);
-
-                        /* Don't write expired packets */
-                        if (time - p->until <= 0)
-                                continue;
-
-                        sprintf(buf, "'_TTL="USEC_FMT"' ", p->until);
-
-                        k = strappend(s, buf);
-                        if (!k)
-                                return -ENOMEM;
-
-                        free(s);
-                        s = k;
-
-                        r = lldp_read_system_name(p->packet, &length, &k);
-                        if (r < 0)
-                                k = strappend(s, "'_NAME=N/A' ");
-                        else {
-                                t = strndup(k, length);
-                                if (!t)
-                                        return -ENOMEM;
-
-                                k = strjoin(s, "'_NAME=", t, "' ", NULL);
-                                free(t);
-                        }
-
-                        if (!k)
-                                return -ENOMEM;
-
-                        free(s);
-                        s = k;
-
-                        (void) lldp_read_system_capability(p->packet, &data);
-
-                        sprintf(buf, "'_CAP=%x'", data);
-
-                        k = strappend(s, buf);
-                        if (!k)
-                                return -ENOMEM;
-
-                        free(s);
-                        s = k;
-
-                        fprintf(f, "%s\n", s);
-                }
-        }
-        r = 0;
-
-        fflush(f);
-
-        if (ferror(f) || rename(temp_path, lldp_file) < 0) {
-                r = -errno;
-                unlink(lldp_file);
-                unlink(temp_path);
+        r = prioq_put(lldp->neighbor_by_expiry, n, &n->prioq_idx);
+        if (r < 0) {
+                assert_se(hashmap_remove(lldp->neighbor_by_id, &n->id) == n);
+                goto finish;
         }
 
- finish:
-        if (r < 0)
-                log_error("Failed to save lldp data %s: %s", lldp_file, strerror(-r));
+        n->lldp = lldp;
+
+        lldp_start_timer(lldp, n);
+        lldp_callback(lldp, old ? SD_LLDP_EVENT_UPDATED : SD_LLDP_EVENT_ADDED, n);
+
+        return 1;
+
+finish:
+        if (old)
+                lldp_callback(lldp, SD_LLDP_EVENT_REMOVED, old);
 
         return r;
 }
 
-int sd_lldp_start(sd_lldp *lldp) {
+static int lldp_handle_datagram(sd_lldp *lldp, sd_lldp_neighbor *n) {
         int r;
 
-        assert_return(lldp, -EINVAL);
-        assert_return(lldp->port, -EINVAL);
+        assert(lldp);
+        assert(n);
 
-        lldp->port->status = LLDP_PORT_STATUS_ENABLED;
-
-        lldp_set_state(lldp, LLDP_AGENT_RX_LLDP_INITIALIZE);
-
-        r = lldp_port_start(lldp->port);
-        if (r < 0) {
-                log_lldp("Failed to start Port : %s , %s",
-                         lldp->port->ifname,
-                         strerror(-r));
-
-                lldp_set_state(lldp, LLDP_AGENT_RX_WAIT_PORT_OPERATIONAL);
-
-                return r;
-        }
-
-        lldp_set_state(lldp, LLDP_AGENT_RX_WAIT_FOR_FRAME);
-
-        return 0;
-}
-
-int sd_lldp_stop(sd_lldp *lldp) {
-        int r;
-
-        assert_return(lldp, -EINVAL);
-        assert_return(lldp->port, -EINVAL);
-
-        lldp->port->status = LLDP_PORT_STATUS_DISABLED;
-
-        r = lldp_port_stop(lldp->port);
+        r = lldp_neighbor_parse(n);
+        if (r == -EBADMSG) /* Ignore bad messages */
+                return 0;
         if (r < 0)
                 return r;
 
-        lldp_mib_objects_flush(lldp);
+        r = lldp_add_neighbor(lldp, n);
+        if (r < 0) {
+                log_lldp_errno(r, "Failed to add datagram. Ignoring.");
+                return 0;
+        }
 
+        log_lldp("Successfully processed LLDP datagram.");
         return 0;
 }
 
-int sd_lldp_attach_event(sd_lldp *lldp, sd_event *event, int priority) {
+static int lldp_receive_datagram(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(sd_lldp_neighbor_unrefp) sd_lldp_neighbor *n = NULL;
+        ssize_t space, length;
+        sd_lldp *lldp = userdata;
+        struct timespec ts;
+
+        assert(fd >= 0);
+        assert(lldp);
+
+        space = next_datagram_size_fd(fd);
+        if (space < 0)
+                return log_lldp_errno(space, "Failed to determine datagram size to read: %m");
+
+        n = lldp_neighbor_new(space);
+        if (!n)
+                return -ENOMEM;
+
+        length = recv(fd, LLDP_NEIGHBOR_RAW(n), n->raw_size, MSG_DONTWAIT);
+        if (length < 0) {
+                if (IN_SET(errno, EAGAIN, EINTR))
+                        return 0;
+
+                return log_lldp_errno(errno, "Failed to read LLDP datagram: %m");
+        }
+
+        if ((size_t) length != n->raw_size) {
+                log_lldp("Packet size mismatch.");
+                return -EINVAL;
+        }
+
+        /* Try to get the timestamp of this packet if it is known */
+        if (ioctl(fd, SIOCGSTAMPNS, &ts) >= 0)
+                triple_timestamp_from_realtime(&n->timestamp, timespec_load(&ts));
+        else
+                triple_timestamp_get(&n->timestamp);
+
+        return lldp_handle_datagram(lldp, n);
+}
+
+static void lldp_reset(sd_lldp *lldp) {
+        assert(lldp);
+
+        lldp->timer_event_source = sd_event_source_unref(lldp->timer_event_source);
+        lldp->io_event_source = sd_event_source_unref(lldp->io_event_source);
+        lldp->fd = safe_close(lldp->fd);
+}
+
+_public_ int sd_lldp_start(sd_lldp *lldp) {
         int r;
 
         assert_return(lldp, -EINVAL);
-        assert_return(!lldp->port->event, -EBUSY);
+        assert_return(lldp->event, -EINVAL);
+        assert_return(lldp->ifindex > 0, -EINVAL);
+
+        if (lldp->fd >= 0)
+                return 0;
+
+        assert(!lldp->io_event_source);
+
+        lldp->fd = lldp_network_bind_raw_socket(lldp->ifindex);
+        if (lldp->fd < 0)
+                return lldp->fd;
+
+        r = sd_event_add_io(lldp->event, &lldp->io_event_source, lldp->fd, EPOLLIN, lldp_receive_datagram, lldp);
+        if (r < 0)
+                goto fail;
+
+        r = sd_event_source_set_priority(lldp->io_event_source, lldp->event_priority);
+        if (r < 0)
+                goto fail;
+
+        (void) sd_event_source_set_description(lldp->io_event_source, "lldp-io");
+
+        log_lldp("Started LLDP client");
+        return 1;
+
+fail:
+        lldp_reset(lldp);
+        return r;
+}
+
+_public_ int sd_lldp_stop(sd_lldp *lldp) {
+        assert_return(lldp, -EINVAL);
+
+        if (lldp->fd < 0)
+                return 0;
+
+        log_lldp("Stopping LLDP client");
+
+        lldp_reset(lldp);
+        lldp_flush_neighbors(lldp);
+
+        return 1;
+}
+
+_public_ int sd_lldp_attach_event(sd_lldp *lldp, sd_event *event, int64_t priority) {
+        int r;
+
+        assert_return(lldp, -EINVAL);
+        assert_return(lldp->fd < 0, -EBUSY);
+        assert_return(!lldp->event, -EBUSY);
 
         if (event)
-                lldp->port->event = sd_event_ref(event);
+                lldp->event = sd_event_ref(event);
         else {
-                r = sd_event_default(&lldp->port->event);
+                r = sd_event_default(&lldp->event);
                 if (r < 0)
                         return r;
         }
 
-        lldp->port->event_priority = priority;
+        lldp->event_priority = priority;
 
         return 0;
 }
 
-int sd_lldp_detach_event(sd_lldp *lldp) {
+_public_ int sd_lldp_detach_event(sd_lldp *lldp) {
 
         assert_return(lldp, -EINVAL);
+        assert_return(lldp->fd < 0, -EBUSY);
 
-        lldp->port->event = sd_event_unref(lldp->port->event);
-
+        lldp->event = sd_event_unref(lldp->event);
         return 0;
 }
 
-int sd_lldp_set_callback(sd_lldp *lldp, sd_lldp_cb_t cb, void *userdata) {
+_public_ sd_event* sd_lldp_get_event(sd_lldp *lldp) {
+        assert_return(lldp, NULL);
+
+        return lldp->event;
+}
+
+_public_ int sd_lldp_set_callback(sd_lldp *lldp, sd_lldp_callback_t cb, void *userdata) {
         assert_return(lldp, -EINVAL);
 
-        lldp->cb = cb;
+        lldp->callback = cb;
         lldp->userdata = userdata;
 
         return 0;
 }
 
-void sd_lldp_free(sd_lldp *lldp) {
+_public_ int sd_lldp_set_ifindex(sd_lldp *lldp, int ifindex) {
+        assert_return(lldp, -EINVAL);
+        assert_return(ifindex > 0, -EINVAL);
+        assert_return(lldp->fd < 0, -EBUSY);
 
-        if (!lldp)
-                return;
-
-        /* Drop all packets */
-        lldp_mib_objects_flush(lldp);
-
-        lldp_port_free(lldp->port);
-
-        hashmap_free(lldp->neighbour_mib);
-        prioq_free(lldp->by_expiry);
-
-        free(lldp);
+        lldp->ifindex = ifindex;
+        return 0;
 }
 
-int sd_lldp_new(int ifindex,
-                const char *ifname,
-                const struct ether_addr *mac,
-                sd_lldp **ret) {
-        _cleanup_lldp_free_ sd_lldp *lldp = NULL;
+_public_ sd_lldp* sd_lldp_ref(sd_lldp *lldp) {
+
+        if (!lldp)
+                return NULL;
+
+        assert(lldp->n_ref > 0);
+        lldp->n_ref++;
+
+        return lldp;
+}
+
+_public_ sd_lldp* sd_lldp_unref(sd_lldp *lldp) {
+
+        if (!lldp)
+                return NULL;
+
+        assert(lldp->n_ref > 0);
+        lldp->n_ref --;
+
+        if (lldp->n_ref > 0)
+                return NULL;
+
+        lldp_reset(lldp);
+        sd_lldp_detach_event(lldp);
+        lldp_flush_neighbors(lldp);
+
+        hashmap_free(lldp->neighbor_by_id);
+        prioq_free(lldp->neighbor_by_expiry);
+        return mfree(lldp);
+}
+
+_public_ int sd_lldp_new(sd_lldp **ret) {
+        _cleanup_(sd_lldp_unrefp) sd_lldp *lldp = NULL;
         int r;
 
         assert_return(ret, -EINVAL);
-        assert_return(ifindex > 0, -EINVAL);
-        assert_return(ifname, -EINVAL);
-        assert_return(mac, -EINVAL);
 
         lldp = new0(sd_lldp, 1);
         if (!lldp)
                 return -ENOMEM;
 
-        r = lldp_port_new(ifindex, ifname, mac, lldp, &lldp->port);
-        if (r < 0)
-                return r;
+        lldp->n_ref = 1;
+        lldp->fd = -1;
+        lldp->neighbors_max = LLDP_DEFAULT_NEIGHBORS_MAX;
+        lldp->capability_mask = (uint16_t) -1;
 
-        lldp->neighbour_mib = hashmap_new(&chassis_id_hash_ops);
-        if (!lldp->neighbour_mib)
+        lldp->neighbor_by_id = hashmap_new(&lldp_neighbor_id_hash_ops);
+        if (!lldp->neighbor_by_id)
                 return -ENOMEM;
 
-        r = prioq_ensure_allocated(&lldp->by_expiry,
-                                   ttl_expiry_item_prioq_compare_func);
+        r = prioq_ensure_allocated(&lldp->neighbor_by_expiry, lldp_neighbor_prioq_compare_func);
         if (r < 0)
                 return r;
-
-        lldp->rx_state = LLDP_AGENT_RX_WAIT_PORT_OPERATIONAL;
 
         *ret = lldp;
         lldp = NULL;
+
+        return 0;
+}
+
+static int neighbor_compare_func(const void *a, const void *b) {
+        const sd_lldp_neighbor * const*x = a, * const *y = b;
+
+        return lldp_neighbor_id_hash_ops.compare(&(*x)->id, &(*y)->id);
+}
+
+static int on_timer_event(sd_event_source *s, uint64_t usec, void *userdata) {
+        sd_lldp *lldp = userdata;
+        int r, q;
+
+        r = lldp_make_space(lldp, 0);
+        if (r < 0)
+                return log_lldp_errno(r, "Failed to make space: %m");
+
+        q = lldp_start_timer(lldp, NULL);
+        if (q < 0)
+                return log_lldp_errno(q, "Failed to restart timer: %m");
+
+        return 0;
+}
+
+static int lldp_start_timer(sd_lldp *lldp, sd_lldp_neighbor *neighbor) {
+        sd_lldp_neighbor *n;
+        int r;
+
+        assert(lldp);
+
+        if (neighbor)
+                lldp_neighbor_start_ttl(neighbor);
+
+        n = prioq_peek(lldp->neighbor_by_expiry);
+        if (!n) {
+
+                if (lldp->timer_event_source)
+                        return sd_event_source_set_enabled(lldp->timer_event_source, SD_EVENT_OFF);
+
+                return 0;
+        }
+
+        if (lldp->timer_event_source) {
+                r = sd_event_source_set_time(lldp->timer_event_source, n->until);
+                if (r < 0)
+                        return r;
+
+                return sd_event_source_set_enabled(lldp->timer_event_source, SD_EVENT_ONESHOT);
+        }
+
+        if (!lldp->event)
+                return 0;
+
+        r = sd_event_add_time(lldp->event, &lldp->timer_event_source, clock_boottime_or_monotonic(), n->until, 0, on_timer_event, lldp);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_priority(lldp->timer_event_source, lldp->event_priority);
+        if (r < 0)
+                return r;
+
+        (void) sd_event_source_set_description(lldp->timer_event_source, "lldp-timer");
+        return 0;
+}
+
+_public_ int sd_lldp_get_neighbors(sd_lldp *lldp, sd_lldp_neighbor ***ret) {
+        sd_lldp_neighbor **l = NULL, *n;
+        Iterator i;
+        int k = 0, r;
+
+        assert_return(lldp, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        if (hashmap_isempty(lldp->neighbor_by_id)) { /* Special shortcut */
+                *ret = NULL;
+                return 0;
+        }
+
+        l = new0(sd_lldp_neighbor*, hashmap_size(lldp->neighbor_by_id));
+        if (!l)
+                return -ENOMEM;
+
+        r = lldp_start_timer(lldp, NULL);
+        if (r < 0) {
+                free(l);
+                return r;
+        }
+
+        HASHMAP_FOREACH(n, lldp->neighbor_by_id, i)
+                l[k++] = sd_lldp_neighbor_ref(n);
+
+        assert((size_t) k == hashmap_size(lldp->neighbor_by_id));
+
+        /* Return things in a stable order */
+        qsort(l, k, sizeof(sd_lldp_neighbor*), neighbor_compare_func);
+        *ret = l;
+
+        return k;
+}
+
+_public_ int sd_lldp_set_neighbors_max(sd_lldp *lldp, uint64_t m) {
+        assert_return(lldp, -EINVAL);
+        assert_return(m <= 0, -EINVAL);
+
+        lldp->neighbors_max = m;
+        lldp_make_space(lldp, 0);
+
+        return 0;
+}
+
+_public_ int sd_lldp_match_capabilities(sd_lldp *lldp, uint16_t mask) {
+        assert_return(lldp, -EINVAL);
+        assert_return(mask != 0, -EINVAL);
+
+        lldp->capability_mask = mask;
+
+        return 0;
+}
+
+_public_ int sd_lldp_set_filter_address(sd_lldp *lldp, const struct ether_addr *addr) {
+        assert_return(lldp, -EINVAL);
+
+        /* In order to deal nicely with bridges that send back our own packets, allow one address to be filtered, so
+         * that our own can be filtered out here. */
+
+        if (addr)
+                lldp->filter_address = *addr;
+        else
+                zero(lldp->filter_address);
 
         return 0;
 }

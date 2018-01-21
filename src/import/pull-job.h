@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,9 +22,9 @@
 
 #include <gcrypt.h>
 
-#include "macro.h"
 #include "curl-util.h"
 #include "import-compress.h"
+#include "macro.h"
 
 typedef struct PullJob PullJob;
 
@@ -44,16 +43,13 @@ typedef enum PullJobState {
         _PULL_JOB_STATE_INVALID = -1,
 } PullJobState;
 
-#define PULL_JOB_STATE_IS_COMPLETE(j) (IN_SET((j)->state, PULL_JOB_DONE, PULL_JOB_FAILED))
+typedef enum VerificationStyle {
+        VERIFICATION_STYLE_UNSET,
+        VERIFICATION_PER_FILE,        /* SuSE-style ".sha256" files with inline signature */
+        VERIFICATION_PER_DIRECTORY,   /* Ubuntu-style SHA256SUM files with detach SHA256SUM.gpg signatures */
+} VerificationStyle;
 
-typedef enum PullJobCompression {
-        PULL_JOB_UNCOMPRESSED,
-        PULL_JOB_XZ,
-        PULL_JOB_GZIP,
-        PULL_JOB_BZIP2,
-        _PULL_JOB_COMPRESSION_MAX,
-        _PULL_JOB_COMPRESSION_INVALID = -1,
-} PullJobCompression;
+#define PULL_JOB_IS_COMPLETE(j) (IN_SET((j)->state, PULL_JOB_DONE, PULL_JOB_FAILED))
 
 struct PullJob {
         PullJobState state;
@@ -105,6 +101,8 @@ struct PullJob {
 
         bool grow_machine_directory;
         uint64_t written_since_last_grow;
+
+        VerificationStyle style;
 };
 
 int pull_job_new(PullJob **job, const char *url, CurlGlue *glue, void *userdata);

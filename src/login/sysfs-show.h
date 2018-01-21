@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,4 +20,8 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-int show_sysfs(const char *seat, const char *prefix, unsigned columns);
+#include <sys/types.h>
+
+#include "output-mode.h"
+
+int show_sysfs(const char *seat, const char *prefix, unsigned columns, OutputFlags flags);

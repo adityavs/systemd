@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "macro.h"
 #include "uid-range.h"
+#include "user-util.h"
 
 static bool uid_range_intersect(UidRange *range, uid_t start, uid_t nr) {
         assert(range);
@@ -51,7 +55,7 @@ static void uid_range_coalesce(UidRange **p, unsigned *n) {
                                 if (*n > j+1)
                                         memmove(y, y+1, sizeof(UidRange) * (*n - j -1));
 
-                                (*n) --;
+                                (*n)--;
                                 j--;
                         }
                 }

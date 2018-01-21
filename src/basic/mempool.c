@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,8 +19,11 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "mempool.h"
+#include <stdint.h>
+#include <stdlib.h>
+
 #include "macro.h"
+#include "mempool.h"
 #include "util.h"
 
 struct pool {

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,11 +20,8 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-
 #include "sd-hwdb.h"
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(sd_hwdb*, sd_hwdb_unref);
-#define _cleanup_hwdb_unref_ _cleanup_(sd_hwdb_unrefp)
+#include "util.h"
 
 bool hwdb_validate(sd_hwdb *hwdb);

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,12 +18,19 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "architecture.h"
-#include "path-util.h"
-#include "strv.h"
 #include "sd-path.h"
+
+#include "alloc-util.h"
+#include "architecture.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
 #include "missing.h"
+#include "path-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
 
 static int from_environment(const char *envname, const char *fallback, const char **ret) {
         assert(ret);
@@ -71,7 +79,7 @@ static int from_home_dir(const char *envname, const char *suffix, char **buffer,
         if (endswith(h, "/"))
                 cc = strappend(h, suffix);
         else
-                cc = strjoin(h, "/", suffix, NULL);
+                cc = strjoin(h, "/", suffix);
         if (!cc)
                 return -ENOMEM;
 
@@ -83,7 +91,8 @@ static int from_home_dir(const char *envname, const char *suffix, char **buffer,
 static int from_user_dir(const char *field, char **buffer, const char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *b = NULL;
-        const char *fn = NULL;
+        _cleanup_free_ const char *fn = NULL;
+        const char *c = NULL;
         char line[LINE_MAX];
         size_t n;
         int r;
@@ -92,9 +101,13 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
         assert(buffer);
         assert(ret);
 
-        r = from_home_dir(NULL, ".config/user-dirs.dirs", &b, &fn);
+        r = from_home_dir("XDG_CONFIG_HOME", ".config", &b, &c);
         if (r < 0)
                 return r;
+
+        fn = strappend(c, "/user-dirs.dirs");
+        if (!fn)
+                return -ENOMEM;
 
         f = fopen(fn, "re");
         if (!f) {
@@ -208,10 +221,10 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
         switch (type) {
 
         case SD_PATH_TEMPORARY:
-                return from_environment("TMPDIR", "/tmp", ret);
+                return tmp_dir(ret);
 
         case SD_PATH_TEMPORARY_LARGE:
-                return from_environment("TMPDIR", "/var/tmp", ret);
+                return var_tmp_dir(ret);
 
         case SD_PATH_SYSTEM_BINARIES:
                 *ret = "/usr/bin";
@@ -376,7 +389,7 @@ _public_ int sd_path_home(uint64_t type, const char *suffix, char **path) {
         if (endswith(ret, "/"))
                 cc = strappend(ret, suffix);
         else
-                cc = strjoin(ret, "/", suffix, NULL);
+                cc = strjoin(ret, "/", suffix);
 
         free(buffer);
 
@@ -444,7 +457,7 @@ static int search_from_environment(
                         if (endswith(e, "/"))
                                 h = strappend(e, home_suffix);
                         else
-                                h = strjoin(e, "/", home_suffix, NULL);
+                                h = strjoin(e, "/", home_suffix);
 
                         if (!h) {
                                 strv_free(l);
@@ -481,7 +494,7 @@ static int get_search(uint64_t type, char ***list) {
                                                "/usr/local/bin",
                                                "/usr/sbin",
                                                "/usr/bin",
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
                                                "/sbin",
                                                "/bin",
 #endif
@@ -495,7 +508,7 @@ static int get_search(uint64_t type, char ***list) {
                                                false,
                                                "/usr/local/lib",
                                                "/usr/lib",
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
                                                "/lib",
 #endif
                                                NULL);
@@ -507,7 +520,7 @@ static int get_search(uint64_t type, char ***list) {
                                                "LD_LIBRARY_PATH",
                                                true,
                                                LIBDIR,
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
                                                ROOTLIBDIR,
 #endif
                                                NULL);
@@ -610,7 +623,7 @@ _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
                 if (endswith(*i, "/"))
                         *j = strappend(*i, suffix);
                 else
-                        *j = strjoin(*i, "/", suffix, NULL);
+                        *j = strjoin(*i, "/", suffix);
 
                 if (!*j) {
                         strv_free(l);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,14 +18,31 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <langinfo.h>
+#include <libintl.h>
+#include <locale.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
-#include "set.h"
-#include "util.h"
-#include "utf8.h"
-#include "strv.h"
-
+#include "def.h"
+#include "dirent-util.h"
+#include "fd-util.h"
+#include "hashmap.h"
 #include "locale-util.h"
+#include "path-util.h"
+#include "set.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "strv.h"
+#include "utf8.h"
 
 static int add_locales_from_archive(Set *locales) {
         /* Stolen from glibc... */
@@ -140,6 +156,8 @@ static int add_locales_from_libdir (Set *locales) {
         FOREACH_DIRENT(entry, dir, return -errno) {
                 char *z;
 
+                dirent_ensure_type(dir, entry);
+
                 if (entry->d_type != DT_DIR)
                         continue;
 
@@ -202,6 +220,182 @@ bool locale_is_valid(const char *name) {
                 return false;
 
         return true;
+}
+
+void init_gettext(void) {
+        setlocale(LC_ALL, "");
+        textdomain(GETTEXT_PACKAGE);
+}
+
+bool is_locale_utf8(void) {
+        const char *set;
+        static int cached_answer = -1;
+
+        /* Note that we default to 'true' here, since today UTF8 is
+         * pretty much supported everywhere. */
+
+        if (cached_answer >= 0)
+                goto out;
+
+        if (!setlocale(LC_ALL, "")) {
+                cached_answer = true;
+                goto out;
+        }
+
+        set = nl_langinfo(CODESET);
+        if (!set) {
+                cached_answer = true;
+                goto out;
+        }
+
+        if (streq(set, "UTF-8")) {
+                cached_answer = true;
+                goto out;
+        }
+
+        /* For LC_CTYPE=="C" return true, because CTYPE is effectly
+         * unset and everything can do to UTF-8 nowadays. */
+        set = setlocale(LC_CTYPE, NULL);
+        if (!set) {
+                cached_answer = true;
+                goto out;
+        }
+
+        /* Check result, but ignore the result if C was set
+         * explicitly. */
+        cached_answer =
+                STR_IN_SET(set, "C", "POSIX") &&
+                !getenv("LC_ALL") &&
+                !getenv("LC_CTYPE") &&
+                !getenv("LANG");
+
+out:
+        return (bool) cached_answer;
+}
+
+static thread_local Set *keymaps = NULL;
+
+static int nftw_cb(
+                const char *fpath,
+                const struct stat *sb,
+                int tflag,
+                struct FTW *ftwbuf) {
+
+        char *p, *e;
+        int r;
+
+        if (tflag != FTW_F)
+                return 0;
+
+        if (!endswith(fpath, ".map") &&
+            !endswith(fpath, ".map.gz"))
+                return 0;
+
+        p = strdup(basename(fpath));
+        if (!p)
+                return FTW_STOP;
+
+        e = endswith(p, ".map");
+        if (e)
+                *e = 0;
+
+        e = endswith(p, ".map.gz");
+        if (e)
+                *e = 0;
+
+        r = set_consume(keymaps, p);
+        if (r < 0 && r != -EEXIST)
+                return r;
+
+        return 0;
+}
+
+int get_keymaps(char ***ret) {
+        _cleanup_strv_free_ char **l = NULL;
+        const char *dir;
+        int r;
+
+        keymaps = set_new(&string_hash_ops);
+        if (!keymaps)
+                return -ENOMEM;
+
+        NULSTR_FOREACH(dir, KBD_KEYMAP_DIRS) {
+                r = nftw(dir, nftw_cb, 20, FTW_MOUNT|FTW_PHYS|FTW_ACTIONRETVAL);
+
+                if (r == FTW_STOP)
+                        log_debug("Directory not found %s", dir);
+                else if (r < 0)
+                        log_debug_errno(r, "Can't add keymap: %m");
+        }
+
+        l = set_get_strv(keymaps);
+        if (!l) {
+                set_free_free(keymaps);
+                return -ENOMEM;
+        }
+
+        set_free(keymaps);
+
+        if (strv_isempty(l))
+                return -ENOENT;
+
+        strv_sort(l);
+
+        *ret = l;
+        l = NULL;
+
+        return 0;
+}
+
+bool keymap_is_valid(const char *name) {
+
+        if (isempty(name))
+                return false;
+
+        if (strlen(name) >= 128)
+                return false;
+
+        if (!utf8_is_valid(name))
+                return false;
+
+        if (!filename_is_valid(name))
+                return false;
+
+        if (!string_is_safe(name))
+                return false;
+
+        return true;
+}
+
+const char *special_glyph(SpecialGlyph code) {
+
+        static const char* const draw_table[2][_SPECIAL_GLYPH_MAX] = {
+                /* ASCII fallback */
+                [false] = {
+                        [TREE_VERTICAL]      = "| ",
+                        [TREE_BRANCH]        = "|-",
+                        [TREE_RIGHT]         = "`-",
+                        [TREE_SPACE]         = "  ",
+                        [TRIANGULAR_BULLET]  = ">",
+                        [BLACK_CIRCLE]       = "*",
+                        [ARROW]              = "->",
+                        [MDASH]              = "-",
+                },
+
+                /* UTF-8 */
+                [ true ] = {
+                        [TREE_VERTICAL]      = "\342\224\202 ",            /* │  */
+                        [TREE_BRANCH]        = "\342\224\234\342\224\200", /* ├─ */
+                        [TREE_RIGHT]         = "\342\224\224\342\224\200", /* └─ */
+                        [TREE_SPACE]         = "  ",                       /*    */
+                        [TRIANGULAR_BULLET]  = "\342\200\243",             /* ‣ */
+                        [BLACK_CIRCLE]       = "\342\227\217",             /* ● */
+                        [ARROW]              = "\342\206\222",             /* → */
+                        [MDASH]              = "\342\200\223",             /* – */
+                },
+        };
+
+        return draw_table[is_locale_utf8()][code];
 }
 
 static const char * const locale_variable_table[_VARIABLE_LC_MAX] = {

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,22 +18,27 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <stdbool.h>
 #include <errno.h>
-#include <unistd.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <sys/prctl.h>
+#include <unistd.h>
 
-#include "util.h"
+#include "proc-cmdline.h"
 #include "process-util.h"
 #include "signal-util.h"
+#include "string-util.h"
+#include "util.h"
 
 static bool arg_skip = false;
 static bool arg_force = false;
 
-static int parse_proc_cmdline_item(const char *key, const char *value) {
+static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
 
-        if (streq(key, "quotacheck.mode") && value) {
+        if (streq(key, "quotacheck.mode")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
                 if (streq(value, "auto"))
                         arg_force = arg_skip = false;
@@ -46,7 +50,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
                         log_warning("Invalid quotacheck.mode= parameter '%s'. Ignoring.", value);
         }
 
-#ifdef HAVE_SYSV_COMPAT
+#if HAVE_SYSV_COMPAT
         else if (streq(key, "forcequotacheck") && !value) {
                 log_warning("Please use 'quotacheck.mode=force' rather than 'forcequotacheck' on the kernel command line.");
                 arg_force = true;
@@ -58,7 +62,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
 
 static void test_files(void) {
 
-#ifdef HAVE_SYSV_COMPAT
+#if HAVE_SYSV_COMPAT
         if (access("/forcequotacheck", F_OK) >= 0) {
                 log_error("Please pass 'quotacheck.mode=force' on the kernel command line rather than creating /forcequotacheck on the root file system.");
                 arg_force = true;
@@ -67,14 +71,6 @@ static void test_files(void) {
 }
 
 int main(int argc, char *argv[]) {
-
-        static const char * const cmdline[] = {
-                QUOTACHECK,
-                "-anug",
-                NULL
-        };
-
-        pid_t pid;
         int r;
 
         if (argc > 1) {
@@ -88,7 +84,7 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = parse_proc_cmdline(parse_proc_cmdline_item);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
@@ -102,23 +98,22 @@ int main(int argc, char *argv[]) {
                         return EXIT_SUCCESS;
         }
 
-        pid = fork();
-        if (pid < 0) {
-                log_error_errno(errno, "fork(): %m");
-                return EXIT_FAILURE;
-        } else if (pid == 0) {
+        r = safe_fork("(quotacheck)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        if (r < 0)
+                goto finish;
+        if (r == 0) {
+                static const char * const cmdline[] = {
+                        QUOTACHECK,
+                        "-anug",
+                        NULL
+                };
 
                 /* Child */
 
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
                 execv(cmdline[0], (char**) cmdline);
-                _exit(1); /* Operational error */
+                _exit(EXIT_FAILURE); /* Operational error */
         }
 
-        r = wait_for_terminate_and_warn("quotacheck", pid, true);
-
+finish:
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

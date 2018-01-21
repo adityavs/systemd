@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,48 +18,50 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-
 #include <fcntl.h>
-#include <unistd.h>
 #include <getopt.h>
 #include <shadow.h>
+#include <unistd.h>
 
-#include "strv.h"
-#include "fileio.h"
-#include "copy.h"
-#include "build.h"
-#include "mkdir.h"
-#include "time-util.h"
-#include "path-util.h"
-#include "random-util.h"
-#include "locale-util.h"
+#include "sd-id128.h"
+
+#include "alloc-util.h"
 #include "ask-password-api.h"
-#include "terminal-util.h"
+#include "copy.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
 #include "hostname-util.h"
+#include "locale-util.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "proc-cmdline.h"
+#include "random-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "terminal-util.h"
+#include "time-util.h"
+#include "umask-util.h"
+#include "user-util.h"
 
 static char *arg_root = NULL;
 static char *arg_locale = NULL;  /* $LANG */
+static char *arg_keymap = NULL;
 static char *arg_locale_messages = NULL; /* $LC_MESSAGES */
 static char *arg_timezone = NULL;
 static char *arg_hostname = NULL;
 static sd_id128_t arg_machine_id = {};
 static char *arg_root_password = NULL;
 static bool arg_prompt_locale = false;
+static bool arg_prompt_keymap = false;
 static bool arg_prompt_timezone = false;
 static bool arg_prompt_hostname = false;
 static bool arg_prompt_root_password = false;
 static bool arg_copy_locale = false;
+static bool arg_copy_keymap = false;
 static bool arg_copy_timezone = false;
 static bool arg_copy_root_password = false;
-
-static void clear_string(char *x) {
-
-        if (!x)
-                return;
-
-        /* A delicious drop of snake-oil! */
-        memset(x, 'x', strlen(x));
-}
 
 static bool press_any_key(void) {
         char k = 0;
@@ -166,7 +167,7 @@ static int prompt_loop(const char *text, char **l, bool (*is_valid)(const char *
                 _cleanup_free_ char *p = NULL;
                 unsigned u;
 
-                r = ask_string(&p, "%s %s (empty to skip): ", draw_special_char(DRAW_TRIANGULAR_BULLET), text);
+                r = ask_string(&p, "%s %s (empty to skip): ", special_glyph(TRIANGULAR_BULLET), text);
                 if (r < 0)
                         return log_error_errno(r, "Failed to query user: %m");
 
@@ -251,13 +252,13 @@ static int process_locale(void) {
         int r;
 
         etc_localeconf = prefix_roota(arg_root, "/etc/locale.conf");
-        if (faccessat(AT_FDCWD, etc_localeconf, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_localeconf, F_OK) >= 0)
                 return 0;
 
         if (arg_copy_locale && arg_root) {
 
                 mkdir_parents(etc_localeconf, 0755);
-                r = copy_file("/etc/locale.conf", etc_localeconf, 0, 0644, 0);
+                r = copy_file("/etc/locale.conf", etc_localeconf, 0, 0644, 0, COPY_REFLINK);
                 if (r != -ENOENT) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy %s: %m", etc_localeconf);
@@ -287,6 +288,80 @@ static int process_locale(void) {
                 return log_error_errno(r, "Failed to write %s: %m", etc_localeconf);
 
         log_info("%s written.", etc_localeconf);
+        return 0;
+}
+
+static int prompt_keymap(void) {
+        _cleanup_strv_free_ char **kmaps = NULL;
+        int r;
+
+        if (arg_keymap)
+                return 0;
+
+        if (!arg_prompt_keymap)
+                return 0;
+
+        r = get_keymaps(&kmaps);
+        if (r == -ENOENT) /* no keymaps installed */
+                return r;
+        if (r < 0)
+                return log_error_errno(r, "Failed to read keymaps: %m");
+
+        print_welcome();
+
+        printf("\nAvailable keymaps:\n\n");
+        r = show_menu(kmaps, 3, 22, 60);
+        if (r < 0)
+                return r;
+
+        putchar('\n');
+
+        return prompt_loop("Please enter system keymap name or number",
+                           kmaps, keymap_is_valid, &arg_keymap);
+}
+
+static int process_keymap(void) {
+        const char *etc_vconsoleconf;
+        char **keymap;
+        int r;
+
+        etc_vconsoleconf = prefix_roota(arg_root, "/etc/vconsole.conf");
+        if (laccess(etc_vconsoleconf, F_OK) >= 0)
+                return 0;
+
+        if (arg_copy_keymap && arg_root) {
+
+                mkdir_parents(etc_vconsoleconf, 0755);
+                r = copy_file("/etc/vconsole.conf", etc_vconsoleconf, 0, 0644, 0, COPY_REFLINK);
+                if (r != -ENOENT) {
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to copy %s: %m", etc_vconsoleconf);
+
+                        log_info("%s copied.", etc_vconsoleconf);
+                        return 0;
+                }
+        }
+
+        r = prompt_keymap();
+        if (r == -ENOENT)
+                return 0; /* don't fail if no keymaps are installed */
+        if (r < 0)
+                return r;
+
+        if (isempty(arg_keymap))
+                return 0;
+
+        keymap = STRV_MAKE(strjoina("KEYMAP=", arg_keymap));
+
+        r = mkdir_parents(etc_vconsoleconf, 0755);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create the parent directory of %s: %m", etc_vconsoleconf);
+
+        r = write_env_file(etc_vconsoleconf, keymap);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write %s: %m", etc_vconsoleconf);
+
+        log_info("%s written.", etc_vconsoleconf);
         return 0;
 }
 
@@ -325,7 +400,7 @@ static int process_timezone(void) {
         int r;
 
         etc_localtime = prefix_roota(arg_root, "/etc/localtime");
-        if (faccessat(AT_FDCWD, etc_localtime, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_localtime, F_OK) >= 0)
                 return 0;
 
         if (arg_copy_timezone && arg_root) {
@@ -377,7 +452,7 @@ static int prompt_hostname(void) {
         for (;;) {
                 _cleanup_free_ char *h = NULL;
 
-                r = ask_string(&h, "%s Please enter hostname for new system (empty to skip): ", draw_special_char(DRAW_TRIANGULAR_BULLET));
+                r = ask_string(&h, "%s Please enter hostname for new system (empty to skip): ", special_glyph(TRIANGULAR_BULLET));
                 if (r < 0)
                         return log_error_errno(r, "Failed to query hostname: %m");
 
@@ -386,12 +461,13 @@ static int prompt_hostname(void) {
                         break;
                 }
 
-                if (!hostname_is_valid(h)) {
+                if (!hostname_is_valid(h, true)) {
                         log_error("Specified hostname invalid.");
                         continue;
                 }
 
-                arg_hostname = h;
+                /* Get rid of the trailing dot that we allow, but don't want to see */
+                arg_hostname = hostname_cleanup(h);
                 h = NULL;
                 break;
         }
@@ -404,7 +480,7 @@ static int process_hostname(void) {
         int r;
 
         etc_hostname = prefix_roota(arg_root, "/etc/hostname");
-        if (faccessat(AT_FDCWD, etc_hostname, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_hostname, F_OK) >= 0)
                 return 0;
 
         r = prompt_hostname();
@@ -415,7 +491,8 @@ static int process_hostname(void) {
                 return 0;
 
         mkdir_parents(etc_hostname, 0755);
-        r = write_string_file(etc_hostname, arg_hostname);
+        r = write_string_file(etc_hostname, arg_hostname,
+                              WRITE_STRING_FILE_CREATE | WRITE_STRING_FILE_SYNC);
         if (r < 0)
                 return log_error_errno(r, "Failed to write %s: %m", etc_hostname);
 
@@ -429,14 +506,15 @@ static int process_machine_id(void) {
         int r;
 
         etc_machine_id = prefix_roota(arg_root, "/etc/machine-id");
-        if (faccessat(AT_FDCWD, etc_machine_id, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_machine_id, F_OK) >= 0)
                 return 0;
 
-        if (sd_id128_equal(arg_machine_id, SD_ID128_NULL))
+        if (sd_id128_is_null(arg_machine_id))
                 return 0;
 
         mkdir_parents(etc_machine_id, 0755);
-        r = write_string_file(etc_machine_id, sd_id128_to_string(arg_machine_id, id));
+        r = write_string_file(etc_machine_id, sd_id128_to_string(arg_machine_id, id),
+                              WRITE_STRING_FILE_CREATE | WRITE_STRING_FILE_SYNC);
         if (r < 0)
                 return log_error_errno(r, "Failed to write machine id: %m");
 
@@ -455,19 +533,19 @@ static int prompt_root_password(void) {
                 return 0;
 
         etc_shadow = prefix_roota(arg_root, "/etc/shadow");
-        if (faccessat(AT_FDCWD, etc_shadow, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_shadow, F_OK) >= 0)
                 return 0;
 
         print_welcome();
         putchar('\n');
 
-        msg1 = strjoina(draw_special_char(DRAW_TRIANGULAR_BULLET), " Please enter a new root password (empty to skip): ");
-        msg2 = strjoina(draw_special_char(DRAW_TRIANGULAR_BULLET), " Please enter new root password again: ");
+        msg1 = strjoina(special_glyph(TRIANGULAR_BULLET), " Please enter a new root password (empty to skip): ");
+        msg2 = strjoina(special_glyph(TRIANGULAR_BULLET), " Please enter new root password again: ");
 
         for (;;) {
-                _cleanup_free_ char *a = NULL, *b = NULL;
+                _cleanup_string_free_erase_ char *a = NULL, *b = NULL;
 
-                r = ask_password_tty(msg1, 0, false, NULL, &a);
+                r = ask_password_tty(msg1, NULL, 0, 0, NULL, &a);
                 if (r < 0)
                         return log_error_errno(r, "Failed to query root password: %m");
 
@@ -476,21 +554,15 @@ static int prompt_root_password(void) {
                         break;
                 }
 
-                r = ask_password_tty(msg2, 0, false, NULL, &b);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to query root password: %m");
-                        clear_string(a);
-                        return r;
-                }
+                r = ask_password_tty(msg2, NULL, 0, 0, NULL, &b);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to query root password: %m");
 
                 if (!streq(a, b)) {
                         log_error("Entered passwords did not match, please try again.");
-                        clear_string(a);
-                        clear_string(b);
                         continue;
                 }
 
-                clear_string(b);
                 arg_root_password = a;
                 a = NULL;
                 break;
@@ -511,9 +583,9 @@ static int write_root_shadow(const char *path, const struct spwd *p) {
 
         errno = 0;
         if (putspent(p, f) != 0)
-                return errno ? -errno : -EIO;
+                return errno > 0 ? -errno : -EIO;
 
-        return fflush_and_check(f);
+        return fflush_sync_and_check(f);
 }
 
 static int process_root_password(void) {
@@ -544,14 +616,14 @@ static int process_root_password(void) {
         int r;
 
         etc_shadow = prefix_roota(arg_root, "/etc/shadow");
-        if (faccessat(AT_FDCWD, etc_shadow, F_OK, AT_SYMLINK_NOFOLLOW) >= 0)
+        if (laccess(etc_shadow, F_OK) >= 0)
                 return 0;
 
         mkdir_parents(etc_shadow, 0755);
 
-        lock = take_password_lock(arg_root);
+        lock = take_etc_passwd_lock(arg_root);
         if (lock < 0)
-                return lock;
+                return log_error_errno(lock, "Failed to take a lock: %m");
 
         if (arg_copy_root_password && arg_root) {
                 struct spwd *p;
@@ -563,8 +635,7 @@ static int process_root_password(void) {
                                 if (!errno)
                                         errno = EIO;
 
-                                log_error_errno(errno, "Failed to find shadow entry for root: %m");
-                                return -errno;
+                                return log_error_errno(errno, "Failed to find shadow entry for root: %m");
                         }
 
                         r = write_root_shadow(etc_shadow, p);
@@ -583,7 +654,7 @@ static int process_root_password(void) {
         if (!arg_root_password)
                 return 0;
 
-        r = dev_urandom(raw, 16);
+        r = acquire_random_bytes(raw, 16, true);
         if (r < 0)
                 return log_error_errno(r, "Failed to get salt: %m");
 
@@ -599,10 +670,9 @@ static int process_root_password(void) {
         item.sp_pwdp = crypt(arg_root_password, salt);
         if (!item.sp_pwdp) {
                 if (!errno)
-                        errno = -EINVAL;
+                        errno = EINVAL;
 
-                log_error_errno(errno, "Failed to encrypt password: %m");
-                return -errno;
+                return log_error_errno(errno, "Failed to encrypt password: %m");
         }
 
         item.sp_lstchg = (long) (now(CLOCK_REALTIME) / USEC_PER_DAY);
@@ -623,20 +693,23 @@ static void help(void) {
                "     --root=PATH               Operate on an alternate filesystem root\n"
                "     --locale=LOCALE           Set primary locale (LANG=)\n"
                "     --locale-messages=LOCALE  Set message locale (LC_MESSAGES=)\n"
+               "     --keymap=KEYMAP           Set keymap\n"
                "     --timezone=TIMEZONE       Set timezone\n"
                "     --hostname=NAME           Set host name\n"
                "     --machine-ID=ID           Set machine ID\n"
                "     --root-password=PASSWORD  Set root password\n"
                "     --root-password-file=FILE Set root password from file\n"
                "     --prompt-locale           Prompt the user for locale settings\n"
+               "     --prompt-keymap           Prompt the user for keymap settings\n"
                "     --prompt-timezone         Prompt the user for timezone\n"
                "     --prompt-hostname         Prompt the user for hostname\n"
                "     --prompt-root-password    Prompt the user for root password\n"
                "     --prompt                  Prompt for all of the above\n"
                "     --copy-locale             Copy locale from host\n"
+               "     --copy-keymap             Copy keymap from host\n"
                "     --copy-timezone           Copy timezone from host\n"
                "     --copy-root-password      Copy root password from host\n"
-               "     --copy                    Copy locale, timezone, root password\n"
+               "     --copy                    Copy locale, keymap, timezone, root password\n"
                "     --setup-machine-id        Generate a new random machine ID\n"
                , program_invocation_short_name);
 }
@@ -648,6 +721,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_ROOT,
                 ARG_LOCALE,
                 ARG_LOCALE_MESSAGES,
+                ARG_KEYMAP,
                 ARG_TIMEZONE,
                 ARG_HOSTNAME,
                 ARG_MACHINE_ID,
@@ -655,11 +729,13 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_ROOT_PASSWORD_FILE,
                 ARG_PROMPT,
                 ARG_PROMPT_LOCALE,
+                ARG_PROMPT_KEYMAP,
                 ARG_PROMPT_TIMEZONE,
                 ARG_PROMPT_HOSTNAME,
                 ARG_PROMPT_ROOT_PASSWORD,
                 ARG_COPY,
                 ARG_COPY_LOCALE,
+                ARG_COPY_KEYMAP,
                 ARG_COPY_TIMEZONE,
                 ARG_COPY_ROOT_PASSWORD,
                 ARG_SETUP_MACHINE_ID,
@@ -671,6 +747,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "root",                 required_argument, NULL, ARG_ROOT                 },
                 { "locale",               required_argument, NULL, ARG_LOCALE               },
                 { "locale-messages",      required_argument, NULL, ARG_LOCALE_MESSAGES      },
+                { "keymap",               required_argument, NULL, ARG_KEYMAP               },
                 { "timezone",             required_argument, NULL, ARG_TIMEZONE             },
                 { "hostname",             required_argument, NULL, ARG_HOSTNAME             },
                 { "machine-id",           required_argument, NULL, ARG_MACHINE_ID           },
@@ -678,11 +755,13 @@ static int parse_argv(int argc, char *argv[]) {
                 { "root-password-file",   required_argument, NULL, ARG_ROOT_PASSWORD_FILE   },
                 { "prompt",               no_argument,       NULL, ARG_PROMPT               },
                 { "prompt-locale",        no_argument,       NULL, ARG_PROMPT_LOCALE        },
+                { "prompt-keymap",        no_argument,       NULL, ARG_PROMPT_KEYMAP        },
                 { "prompt-timezone",      no_argument,       NULL, ARG_PROMPT_TIMEZONE      },
                 { "prompt-hostname",      no_argument,       NULL, ARG_PROMPT_HOSTNAME      },
                 { "prompt-root-password", no_argument,       NULL, ARG_PROMPT_ROOT_PASSWORD },
                 { "copy",                 no_argument,       NULL, ARG_COPY                 },
                 { "copy-locale",          no_argument,       NULL, ARG_COPY_LOCALE          },
+                { "copy-keymap",          no_argument,       NULL, ARG_COPY_KEYMAP          },
                 { "copy-timezone",        no_argument,       NULL, ARG_COPY_TIMEZONE        },
                 { "copy-root-password",   no_argument,       NULL, ARG_COPY_ROOT_PASSWORD   },
                 { "setup-machine-id",     no_argument,       NULL, ARG_SETUP_MACHINE_ID     },
@@ -703,23 +782,12 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_ROOT:
-                        free(arg_root);
-                        arg_root = path_make_absolute_cwd(optarg);
-                        if (!arg_root)
-                                return log_oom();
-
-                        path_kill_slashes(arg_root);
-
-                        if (path_equal(arg_root, "/")) {
-                                free(arg_root);
-                                arg_root = NULL;
-                        }
-
+                        r = parse_path_argument_and_warn(optarg, true, &arg_root);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case ARG_LOCALE:
@@ -728,9 +796,8 @@ static int parse_argv(int argc, char *argv[]) {
                                 return -EINVAL;
                         }
 
-                        free(arg_locale);
-                        arg_locale = strdup(optarg);
-                        if (!arg_locale)
+                        r = free_and_strdup(&arg_locale, optarg);
+                        if (r < 0)
                                 return log_oom();
 
                         break;
@@ -741,9 +808,20 @@ static int parse_argv(int argc, char *argv[]) {
                                 return -EINVAL;
                         }
 
-                        free(arg_locale_messages);
-                        arg_locale_messages = strdup(optarg);
-                        if (!arg_locale_messages)
+                        r = free_and_strdup(&arg_locale_messages, optarg);
+                        if (r < 0)
+                                return log_oom();
+
+                        break;
+
+                case ARG_KEYMAP:
+                        if (!keymap_is_valid(optarg)) {
+                                log_error("Keymap %s is not valid.", optarg);
+                                return -EINVAL;
+                        }
+
+                        r = free_and_strdup(&arg_keymap, optarg);
+                        if (r < 0)
                                 return log_oom();
 
                         break;
@@ -754,24 +832,20 @@ static int parse_argv(int argc, char *argv[]) {
                                 return -EINVAL;
                         }
 
-                        free(arg_timezone);
-                        arg_timezone = strdup(optarg);
-                        if (!arg_timezone)
+                        r = free_and_strdup(&arg_timezone, optarg);
+                        if (r < 0)
                                 return log_oom();
 
                         break;
 
                 case ARG_ROOT_PASSWORD:
-                        free(arg_root_password);
-                        arg_root_password = strdup(optarg);
-                        if (!arg_root_password)
+                        r = free_and_strdup(&arg_root_password, optarg);
+                        if (r < 0)
                                 return log_oom();
-
                         break;
 
                 case ARG_ROOT_PASSWORD_FILE:
-                        free(arg_root_password);
-                        arg_root_password  = NULL;
+                        arg_root_password = mfree(arg_root_password);
 
                         r = read_one_line_file(optarg, &arg_root_password);
                         if (r < 0)
@@ -780,14 +854,14 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_HOSTNAME:
-                        if (!hostname_is_valid(optarg)) {
+                        if (!hostname_is_valid(optarg, true)) {
                                 log_error("Host name %s is not valid.", optarg);
                                 return -EINVAL;
                         }
 
-                        free(arg_hostname);
-                        arg_hostname = strdup(optarg);
-                        if (!arg_hostname)
+                        hostname_cleanup(optarg);
+                        r = free_and_strdup(&arg_hostname, optarg);
+                        if (r < 0)
                                 return log_oom();
 
                         break;
@@ -801,11 +875,15 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_PROMPT:
-                        arg_prompt_locale = arg_prompt_timezone = arg_prompt_hostname = arg_prompt_root_password = true;
+                        arg_prompt_locale = arg_prompt_keymap = arg_prompt_timezone = arg_prompt_hostname = arg_prompt_root_password = true;
                         break;
 
                 case ARG_PROMPT_LOCALE:
                         arg_prompt_locale = true;
+                        break;
+
+                case ARG_PROMPT_KEYMAP:
+                        arg_prompt_keymap = true;
                         break;
 
                 case ARG_PROMPT_TIMEZONE:
@@ -821,11 +899,15 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_COPY:
-                        arg_copy_locale = arg_copy_timezone = arg_copy_root_password = true;
+                        arg_copy_locale = arg_copy_keymap = arg_copy_timezone = arg_copy_root_password = true;
                         break;
 
                 case ARG_COPY_LOCALE:
                         arg_copy_locale = true;
+                        break;
+
+                case ARG_COPY_KEYMAP:
+                        arg_copy_keymap = true;
                         break;
 
                 case ARG_COPY_TIMEZONE:
@@ -855,6 +937,7 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+        bool enabled;
         int r;
 
         r = parse_argv(argc, argv);
@@ -867,7 +950,21 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
+        r = proc_cmdline_get_bool("systemd.firstboot", &enabled);
+        if (r < 0) {
+                log_error_errno(r, "Failed to parse systemd.firstboot= kernel command line argument, ignoring.");
+                goto finish;
+        }
+        if (r > 0 && !enabled) {
+                r = 0; /* disabled */
+                goto finish;
+        }
+
         r = process_locale();
+        if (r < 0)
+                goto finish;
+
+        r = process_keymap();
         if (r < 0)
                 goto finish;
 
@@ -891,9 +988,10 @@ finish:
         free(arg_root);
         free(arg_locale);
         free(arg_locale_messages);
+        free(arg_keymap);
         free(arg_timezone);
         free(arg_hostname);
-        clear_string(arg_root_password);
+        string_erase(arg_root_password);
         free(arg_root_password);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

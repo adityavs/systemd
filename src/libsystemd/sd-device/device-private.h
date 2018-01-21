@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -20,6 +19,12 @@
   You should have received a copy of the GNU Lesser General Public License
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
+
+#include <inttypes.h>
+#include <stdbool.h>
+#include <sys/types.h>
+
+#include "sd-device.h"
 
 int device_new_from_nulstr(sd_device **ret, uint8_t *nulstr, size_t len);
 int device_new_from_strv(sd_device **ret, char **strv);

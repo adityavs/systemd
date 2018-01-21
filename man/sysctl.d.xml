@@ -1,6 +1,8 @@
 <?xml version="1.0"?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2011 Lennart Poettering
@@ -123,11 +125,12 @@
     </example>
 
     <example>
-      <title>Disable packet filter on bridged packets (method one)</title>
+      <title>Apply settings available only when a certain module is loaded (method one)</title>
       <para><filename>/etc/udev/rules.d/99-bridge.rules</filename>:
       </para>
 
-      <programlisting>ACTION=="add", SUBSYSTEM=="module", KERNEL=="bridge", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/bridge"
+      <programlisting>ACTION=="add", SUBSYSTEM=="module", KERNEL=="br_netfilter", \
+      RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/bridge"
 </programlisting>
 
       <para><filename>/etc/sysctl.d/bridge.conf</filename>:
@@ -137,14 +140,20 @@
 net.bridge.bridge-nf-call-iptables = 0
 net.bridge.bridge-nf-call-arptables = 0
 </programlisting>
+
+      <para>This method applies settings when the module is
+      loaded. Please note that, unless the <filename>br_netfilter</filename>
+      module is loaded, bridged packets will not be filtered by
+      Netfilter (starting with kernel 3.18), so simply not loading the
+      module is sufficient to avoid filtering.</para>
     </example>
 
     <example>
-      <title>Disable packet filter on bridged packets (method two)</title>
+      <title>Apply settings available only when a certain module is loaded (method two)</title>
       <para><filename>/etc/modules-load.d/bridge.conf</filename>:
       </para>
 
-      <programlisting>bridge</programlisting>
+      <programlisting>br_netfilter</programlisting>
 
       <para><filename>/etc/sysctl.d/bridge.conf</filename>:
       </para>
@@ -153,6 +162,12 @@ net.bridge.bridge-nf-call-arptables = 0
 net.bridge.bridge-nf-call-iptables = 0
 net.bridge.bridge-nf-call-arptables = 0
 </programlisting>
+
+      <para>This method forces the module to be always loaded. Please
+      note that, unless the <filename>br_netfilter</filename> module is
+      loaded, bridged packets will not be filtered with Netfilter
+      (starting with kernel 3.18), so simply not loading the module is
+      sufficient to avoid filtering.</para>
     </example>
   </refsect1>
 

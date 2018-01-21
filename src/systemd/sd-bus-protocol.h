@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #ifndef foosdbusprotocolhfoo
 #define foosdbusprotocolhfoo
 
@@ -61,7 +60,7 @@ enum {
         SD_BUS_TYPE_STRUCT_END       = ')',
         SD_BUS_TYPE_DICT_ENTRY       = 'e', /* not actually used in signatures */
         SD_BUS_TYPE_DICT_ENTRY_BEGIN = '{',
-        SD_BUS_TYPE_DICT_ENTRY_END   = '}',
+        SD_BUS_TYPE_DICT_ENTRY_END   = '}'
 };
 
 /* Well-known errors. Note that this is only a sanitized subset of the

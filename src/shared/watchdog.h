@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,8 +20,16 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdbool.h>
+
+#include "time-util.h"
 #include "util.h"
 
+int watchdog_set_device(char *path);
 int watchdog_set_timeout(usec_t *usec);
 int watchdog_ping(void);
 void watchdog_close(bool disarm);
+
+static inline void watchdog_free_device(void) {
+        (void) watchdog_set_device(NULL);
+}

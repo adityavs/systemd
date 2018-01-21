@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,20 +18,22 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
-#include "loopback-setup.h"
 #include "log.h"
+#include "loopback-setup.h"
 
 int main(int argc, char* argv[]) {
         int r;
 
         log_open();
+        log_set_max_level(LOG_DEBUG);
         log_parse_environment();
 
-        if ((r = loopback_setup()) < 0)
-                fprintf(stderr, "loopback: %s\n", strerror(-r));
+        r = loopback_setup();
+        if (r < 0)
+                log_error_errno(r, "loopback: %m");
 
-        return 0;
+        return r >= 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

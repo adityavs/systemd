@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,24 +18,64 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "specifier.h"
-#include "unit-name.h"
-#include "util.h"
+#include "format-util.h"
 #include "install-printf.h"
-#include "formats-util.h"
+#include "install.h"
+#include "macro.h"
+#include "specifier.h"
+#include "string-util.h"
+#include "unit-name.h"
+#include "user-util.h"
 
 static int specifier_prefix_and_instance(char specifier, void *data, void *userdata, char **ret) {
-        UnitFileInstallInfo *i = userdata;
+        const UnitFileInstallInfo *i = userdata;
+        _cleanup_free_ char *prefix = NULL;
+        int r;
 
         assert(i);
 
-        return unit_name_to_prefix_and_instance(i->name, ret);
+        r = unit_name_to_prefix_and_instance(i->name, &prefix);
+        if (r < 0)
+                return r;
+
+        if (endswith(prefix, "@") && i->default_instance) {
+                char *ans;
+
+                ans = strjoin(prefix, i->default_instance);
+                if (!ans)
+                        return -ENOMEM;
+                *ret = ans;
+        } else {
+                *ret = prefix;
+                prefix = NULL;
+        }
+
+        return 0;
+}
+
+static int specifier_name(char specifier, void *data, void *userdata, char **ret) {
+        const UnitFileInstallInfo *i = userdata;
+        char *ans;
+
+        assert(i);
+
+        if (unit_name_is_valid(i->name, UNIT_NAME_TEMPLATE) && i->default_instance)
+                return unit_name_replace_instance(i->name, i->default_instance, ret);
+
+        ans = strdup(i->name);
+        if (!ans)
+                return -ENOMEM;
+        *ret = ans;
+        return 0;
 }
 
 static int specifier_prefix(char specifier, void *data, void *userdata, char **ret) {
-        UnitFileInstallInfo *i = userdata;
+        const UnitFileInstallInfo *i = userdata;
 
         assert(i);
 
@@ -44,7 +83,7 @@ static int specifier_prefix(char specifier, void *data, void *userdata, char **r
 }
 
 static int specifier_instance(char specifier, void *data, void *userdata, char **ret) {
-        UnitFileInstallInfo *i = userdata;
+        const UnitFileInstallInfo *i = userdata;
         char *instance;
         int r;
 
@@ -54,53 +93,15 @@ static int specifier_instance(char specifier, void *data, void *userdata, char *
         if (r < 0)
                 return r;
 
-        if (!instance) {
-                instance = strdup("");
-                if (!instance)
-                        return -ENOMEM;
+        if (isempty(instance)) {
+                r = free_and_strdup(&instance, strempty(i->default_instance));
+                if (r < 0)
+                        return r;
         }
 
         *ret = instance;
         return 0;
 }
-
-static int specifier_user_name(char specifier, void *data, void *userdata, char **ret) {
-        UnitFileInstallInfo *i = userdata;
-        const char *username;
-        _cleanup_free_ char *tmp = NULL;
-        char *printed = NULL;
-
-        assert(i);
-
-        if (i->user)
-                username = i->user;
-        else
-                /* get USER env from env or our own uid */
-                username = tmp = getusername_malloc();
-
-        switch (specifier) {
-        case 'u':
-                printed = strdup(username);
-                break;
-        case 'U': {
-                /* fish username from passwd */
-                uid_t uid;
-                int r;
-
-                r = get_user_creds(&username, &uid, NULL, NULL, NULL);
-                if (r < 0)
-                        return r;
-
-                if (asprintf(&printed, UID_FMT, uid) < 0)
-                        return -ENOMEM;
-                break;
-        }}
-
-
-        *ret = printed;
-        return 0;
-}
-
 
 int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) {
 
@@ -112,8 +113,8 @@ int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) 
          * %p: the prefix                              (foo)
          * %i: the instance                            (bar)
 
-         * %U the UID of the configured user or running user
-         * %u the username of the configured user or running user
+         * %U the UID of the running user
+         * %u the username of running user
          * %m the machine ID of the running system
          * %H the host name of the running system
          * %b the boot ID of the running system
@@ -121,12 +122,12 @@ int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) 
          */
 
         const Specifier table[] = {
-                { 'n', specifier_string,              i->name },
+                { 'n', specifier_name,                NULL },
                 { 'N', specifier_prefix_and_instance, NULL },
                 { 'p', specifier_prefix,              NULL },
                 { 'i', specifier_instance,            NULL },
 
-                { 'U', specifier_user_name,           NULL },
+                { 'U', specifier_user_id,             NULL },
                 { 'u', specifier_user_name,           NULL },
 
                 { 'm', specifier_machine_id,          NULL },

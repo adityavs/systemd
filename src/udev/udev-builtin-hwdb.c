@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,22 +18,25 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <fnmatch.h>
 #include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-#include "udev.h"
 #include "sd-hwdb.h"
 
+#include "alloc-util.h"
 #include "hwdb-util.h"
+#include "string-util.h"
+#include "udev-util.h"
+#include "udev.h"
 
 static sd_hwdb *hwdb;
 
 int udev_builtin_hwdb_lookup(struct udev_device *dev,
                              const char *prefix, const char *modalias,
                              const char *filter, bool test) {
-        _cleanup_free_ const char *lookup = NULL;
+        _cleanup_free_ char *lookup = NULL;
         const char *key, *value;
         int n = 0;
 
@@ -40,7 +44,7 @@ int udev_builtin_hwdb_lookup(struct udev_device *dev,
                 return -ENOENT;
 
         if (prefix) {
-                lookup = strjoin(prefix, modalias, NULL);
+                lookup = strjoin(prefix, modalias);
                 if (!lookup)
                         return -ENOMEM;
                 modalias = lookup;
@@ -86,6 +90,9 @@ static int udev_builtin_hwdb_search(struct udev_device *dev, struct udev_device 
         int r = 0;
 
         assert(dev);
+
+        if (!srcdev)
+                srcdev = dev;
 
         for (d = srcdev; d && !last; d = udev_device_get_parent(d)) {
                 const char *dsubsys;
@@ -133,7 +140,7 @@ static int builtin_hwdb(struct udev_device *dev, int argc, char *argv[], bool te
         const char *device = NULL;
         const char *subsystem = NULL;
         const char *prefix = NULL;
-        struct udev_device *srcdev;
+        _cleanup_udev_device_unref_ struct udev_device *srcdev = NULL;
 
         if (!hwdb)
                 return EXIT_FAILURE;
@@ -176,8 +183,7 @@ static int builtin_hwdb(struct udev_device *dev, int argc, char *argv[], bool te
                 srcdev = udev_device_new_from_device_id(udev_device_get_udev(dev), device);
                 if (!srcdev)
                         return EXIT_FAILURE;
-        } else
-                srcdev = dev;
+        }
 
         if (udev_builtin_hwdb_search(dev, srcdev, subsystem, prefix, filter, test) > 0)
                 return EXIT_SUCCESS;

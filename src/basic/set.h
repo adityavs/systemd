@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,19 +20,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "extract-word.h"
 #include "hashmap.h"
 #include "macro.h"
 
-Set *internal_set_new(const struct hash_ops *hash_ops  HASHMAP_DEBUG_PARAMS);
-#define set_new(ops) internal_set_new(ops  HASHMAP_DEBUG_SRC_ARGS)
+Set *internal_set_new(const struct hash_ops *hash_ops HASHMAP_DEBUG_PARAMS);
+#define set_new(ops) internal_set_new(ops HASHMAP_DEBUG_SRC_ARGS)
 
-
-static inline void set_free(Set *s) {
+static inline Set *set_free(Set *s) {
         internal_hashmap_free(HASHMAP_BASE(s));
+        return NULL;
 }
 
-static inline void set_free_free(Set *s) {
+static inline Set *set_free_free(Set *s) {
         internal_hashmap_free_free(HASHMAP_BASE(s));
+        return NULL;
 }
 
 /* no set_free_free_free */
@@ -42,8 +43,8 @@ static inline Set *set_copy(Set *s) {
         return (Set*) internal_hashmap_copy(HASHMAP_BASE(s));
 }
 
-int internal_set_ensure_allocated(Set **s, const struct hash_ops *hash_ops  HASHMAP_DEBUG_PARAMS);
-#define set_ensure_allocated(h, ops) internal_set_ensure_allocated(h, ops  HASHMAP_DEBUG_SRC_ARGS)
+int internal_set_ensure_allocated(Set **s, const struct hash_ops *hash_ops HASHMAP_DEBUG_PARAMS);
+#define set_ensure_allocated(h, ops) internal_set_ensure_allocated(h, ops HASHMAP_DEBUG_SRC_ARGS)
 
 int set_put(Set *s, const void *key);
 /* no set_update */
@@ -107,6 +108,18 @@ static inline void *set_steal_first(Set *s) {
         return internal_hashmap_steal_first(HASHMAP_BASE(s));
 }
 
+#define set_clear_with_destructor(_s, _f)               \
+        ({                                              \
+                void *_item;                            \
+                while ((_item = set_steal_first(_s)))   \
+                        _f(_item);                      \
+        })
+#define set_free_with_destructor(_s, _f)                \
+        ({                                              \
+                set_clear_with_destructor(_s, _f);      \
+                set_free(_s);                           \
+        })
+
 /* no set_steal_first_key */
 /* no set_first_key */
 
@@ -123,12 +136,18 @@ static inline char **set_get_strv(Set *s) {
 int set_consume(Set *s, void *value);
 int set_put_strdup(Set *s, const char *p);
 int set_put_strdupv(Set *s, char **l);
+int set_put_strsplit(Set *s, const char *v, const char *separators, ExtractFlags flags);
 
 #define SET_FOREACH(e, s, i) \
         for ((i) = ITERATOR_FIRST; set_iterate((s), &(i), (void**)&(e)); )
+
+#define SET_FOREACH_MOVE(e, d, s)                                       \
+        for (; ({ e = set_first(s); assert_se(!e || set_move_one(d, s, e) >= 0); e; }); )
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Set*, set_free);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Set*, set_free_free);
 
 #define _cleanup_set_free_ _cleanup_(set_freep)
 #define _cleanup_set_free_free_ _cleanup_(set_free_freep)
+
+int set_make(Set **ret, const struct hash_ops *hash_ops HASHMAP_DEBUG_PARAMS, void *add, ...);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,13 +21,13 @@
 #include <net/if_arp.h>
 #include <string.h>
 
-#include "util.h"
 #include "arphrd-list.h"
+#include "macro.h"
 
-static const struct arphrd_name* lookup_arphrd(register const char *str, register unsigned int len);
+static const struct arphrd_name* lookup_arphrd(register const char *str, register GPERF_LEN_TYPE len);
 
-#include "arphrd-to-name.h"
 #include "arphrd-from-name.h"
+#include "arphrd-to-name.h"
 
 const char *arphrd_to_name(int id) {
 

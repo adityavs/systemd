@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * cdrom_id - optical drive and media information prober
  *
@@ -17,26 +18,28 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-#include <limits.h>
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
-#include <time.h>
+#include <limits.h>
+#include <linux/cdrom.h>
 #include <scsi/sg.h>
-#include <sys/types.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/ioctl.h>
-#include <linux/cdrom.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "libudev.h"
+
 #include "libudev-private.h"
 #include "random-util.h"
+#include "udev-util.h"
 
 /* device info */
 static unsigned int cd_cd_rom;
@@ -106,11 +109,11 @@ static bool is_mounted(const char *device)
         bool mounted = false;
 
         if (stat(device, &statbuf) < 0)
-                return -ENODEV;
+                return false;
 
         fp = fopen("/proc/self/mountinfo", "re");
         if (fp == NULL)
-                return -ENOSYS;
+                return false;
         while (fscanf(fp, "%*s %*s %i:%i %*[^\n]", &maj, &min) == 2) {
                 if (makedev(maj, min) == statbuf.st_rdev) {
                         mounted = true;
@@ -542,7 +545,7 @@ static int cd_profiles(struct udev *udev, int fd)
         if ((err != 0)) {
                 info_scsi_cmd_err(udev, "GET CONFIGURATION", err);
                 /* handle pre-MMC2 drives which do not support GET CONFIGURATION */
-                if (SK(err) == 0x5 && (ASC(err) == 0x20 || ASC(err) == 0x24)) {
+                if (SK(err) == 0x5 && IN_SET(ASC(err), 0x20, 0x24)) {
                         log_debug("drive is pre-MMC2 and does not support 46h get configuration command");
                         log_debug("trying to work around the problem");
                         ret = cd_profiles_old_mmc(udev, fd);
@@ -565,9 +568,8 @@ static int cd_profiles(struct udev *udev, int fd)
         if (len > sizeof(features)) {
                 log_debug("can not get features in a single query, truncating");
                 len = sizeof(features);
-        } else if (len <= 8) {
+        } else if (len <= 8)
                 len = sizeof(features);
-        }
 
         /* Now get the full feature buffer */
         scsi_cmd_init(udev, &sc);
@@ -843,8 +845,7 @@ static int cd_media_toc(struct udev *udev, int fd)
         return 0;
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
         struct udev *udev;
         static const struct option options[] = {
                 { "lock-media", no_argument, NULL, 'l' },
@@ -862,6 +863,8 @@ int main(int argc, char *argv[])
         int cnt;
         int rc = 0;
 
+        log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
         log_parse_environment();
         log_open();
 
@@ -869,7 +872,7 @@ int main(int argc, char *argv[])
         if (udev == NULL)
                 goto exit;
 
-        while (1) {
+        for (;;) {
                 int option;
 
                 option = getopt_long(argc, argv, "deluh", options, NULL);

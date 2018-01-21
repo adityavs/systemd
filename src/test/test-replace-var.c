@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,12 +20,13 @@
 
 #include <string.h>
 
-#include "util.h"
 #include "macro.h"
 #include "replace-var.h"
+#include "string-util.h"
+#include "util.h"
 
 static char *lookup(const char *variable, void *userdata) {
-        return strjoin("<<<", variable, ">>>", NULL);
+        return strjoin("<<<", variable, ">>>");
 }
 
 int main(int argc, char *argv[]) {

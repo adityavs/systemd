@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2009 Kay Sievers <kay@vrfy.org>
  * Copyright (c) 2009 Filippo Argiolas <filippo.argiolas@gmail.com>
@@ -13,19 +14,20 @@
  * General Public License for more details:
  */
 
-#include <stdio.h>
-#include <errno.h>
-#include <string.h>
 #include <ctype.h>
-#include <stdlib.h>
-#include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <sys/types.h>
-#include <sys/time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <linux/videodev2.h>
 
+#include "fd-util.h"
 #include "util.h"
 
 int main(int argc, char *argv[]) {

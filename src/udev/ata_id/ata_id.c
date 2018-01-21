@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * ata_id - reads product/serial number from ATA drives
  *
@@ -19,28 +20,30 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <linux/bsg.h>
+#include <linux/hdreg.h>
+#include <scsi/scsi.h>
+#include <scsi/scsi_ioctl.h>
+#include <scsi/sg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <ctype.h>
 #include <string.h>
-#include <errno.h>
-#include <getopt.h>
-#include <scsi/scsi.h>
-#include <scsi/sg.h>
-#include <scsi/scsi_ioctl.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <linux/hdreg.h>
-#include <linux/bsg.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "libudev.h"
+
+#include "fd-util.h"
 #include "libudev-private.h"
-#include "udev-util.h"
 #include "log.h"
+#include "udev-util.h"
 
 #define COMMAND_TIMEOUT_MSEC (30 * 1000)
 
@@ -409,7 +412,6 @@ int main(int argc, char *argv[])
         union {
                 uint8_t  byte[512];
                 uint16_t wyde[256];
-                uint64_t octa[64];
         } identify;
         char model[41];
         char model_enc[256];
@@ -426,6 +428,8 @@ int main(int argc, char *argv[])
                 {}
         };
 
+        log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
         log_parse_environment();
         log_open();
 
@@ -433,7 +437,7 @@ int main(int argc, char *argv[])
         if (udev == NULL)
                 return 0;
 
-        while (1) {
+        for (;;) {
                 int option;
 
                 option = getopt_long(argc, argv, "xh", options, NULL);
@@ -474,7 +478,7 @@ int main(int argc, char *argv[])
                 disk_identify_fixup_string(identify.byte,  27, 40); /* model */
                 disk_identify_fixup_uint16(identify.byte,  0);      /* configuration */
                 disk_identify_fixup_uint16(identify.byte,  75);     /* queue depth */
-                disk_identify_fixup_uint16(identify.byte,  75);     /* SATA capabilities */
+                disk_identify_fixup_uint16(identify.byte,  76);     /* SATA capabilities */
                 disk_identify_fixup_uint16(identify.byte,  82);     /* command set supported */
                 disk_identify_fixup_uint16(identify.byte,  83);     /* command set supported */
                 disk_identify_fixup_uint16(identify.byte,  84);     /* command set supported */
@@ -485,6 +489,10 @@ int main(int argc, char *argv[])
                 disk_identify_fixup_uint16(identify.byte,  90);     /* time required for enhanced SECURITY ERASE UNIT */
                 disk_identify_fixup_uint16(identify.byte,  91);     /* current APM values */
                 disk_identify_fixup_uint16(identify.byte,  94);     /* current AAM value */
+                disk_identify_fixup_uint16(identify.byte, 108);     /* WWN */
+                disk_identify_fixup_uint16(identify.byte, 109);     /* WWN */
+                disk_identify_fixup_uint16(identify.byte, 110);     /* WWN */
+                disk_identify_fixup_uint16(identify.byte, 111);     /* WWN */
                 disk_identify_fixup_uint16(identify.byte, 128);     /* device lock function */
                 disk_identify_fixup_uint16(identify.byte, 217);     /* nominal media rotation rate */
                 memcpy(&id, identify.byte, sizeof id);
@@ -610,7 +618,7 @@ int main(int argc, char *argv[])
                  */
 
                 word = identify.wyde[76];
-                if (word != 0x0000 && word != 0xffff) {
+                if (!IN_SET(word, 0x0000, 0xffff)) {
                         printf("ID_ATA_SATA=1\n");
                         /*
                          * If bit 2 of word 76 is set to one, then the device supports the Gen2
@@ -638,14 +646,23 @@ int main(int argc, char *argv[])
                  * All other values are reserved.
                  */
                 word = identify.wyde[108];
-                if ((word & 0xf000) == 0x5000)
-                        printf("ID_WWN=0x%1$"PRIu64"x\n"
-                               "ID_WWN_WITH_EXTENSION=0x%1$"PRIu64"x\n",
-                               identify.octa[108/4]);
+                if ((word & 0xf000) == 0x5000) {
+                        uint64_t wwwn;
+
+                        wwwn   = identify.wyde[108];
+                        wwwn <<= 16;
+                        wwwn  |= identify.wyde[109];
+                        wwwn <<= 16;
+                        wwwn  |= identify.wyde[110];
+                        wwwn <<= 16;
+                        wwwn  |= identify.wyde[111];
+                        printf("ID_WWN=0x%1$" PRIx64 "\n"
+                               "ID_WWN_WITH_EXTENSION=0x%1$" PRIx64 "\n",
+                               wwwn);
+                }
 
                 /* from Linux's include/linux/ata.h */
-                if (identify.wyde[0] == 0x848a ||
-                    identify.wyde[0] == 0x844a ||
+                if (IN_SET(identify.wyde[0], 0x848a, 0x844a) ||
                     (identify.wyde[83] & 0xc004) == 0x4004)
                         printf("ID_ATA_CFA=1\n");
         } else {

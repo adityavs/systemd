@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,18 +18,30 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <nss.h>
 #include <netdb.h>
+#include <nss.h>
 
 #include "sd-bus.h"
 #include "sd-login.h"
-#include "macro.h"
-#include "util.h"
-#include "nss-util.h"
-#include "bus-util.h"
+
+#include "alloc-util.h"
+#include "bus-common-errors.h"
+#include "env-util.h"
+#include "hostname-util.h"
 #include "in-addr-util.h"
+#include "macro.h"
+#include "nss-util.h"
+#include "signal-util.h"
+#include "string-util.h"
+#include "user-util.h"
+#include "util.h"
 
 NSS_GETHOSTBYNAME_PROTOTYPES(mymachines);
+NSS_GETPW_PROTOTYPES(mymachines);
+NSS_GETGR_PROTOTYPES(mymachines);
+
+#define HOST_UID_LIMIT ((uid_t) UINT32_C(0x10000))
+#define HOST_GID_LIMIT ((gid_t) UINT32_C(0x10000))
 
 static int count_addresses(sd_bus_message *m, int af, unsigned *ret) {
         unsigned c = 0;
@@ -57,7 +68,7 @@ static int count_addresses(sd_bus_message *m, int af, unsigned *ret) {
                 if (af != AF_UNSPEC && family != af)
                         continue;
 
-                c ++;
+                c++;
         }
         if (r < 0)
                 return r;
@@ -78,14 +89,16 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
                 int32_t *ttlp) {
 
         struct gaih_addrtuple *r_tuple, *r_tuple_first = NULL;
-        _cleanup_bus_message_unref_ sd_bus_message* reply = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_free_ int *ifindices = NULL;
         _cleanup_free_ char *class = NULL;
         size_t l, ms, idx;
         unsigned i = 0, c = 0;
         char *r_name;
         int n_ifindices, r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
 
         assert(name);
         assert(pat);
@@ -139,8 +152,8 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
         l = strlen(name);
         ms = ALIGN(l+1) + ALIGN(sizeof(struct gaih_addrtuple)) * c;
         if (buflen < ms) {
-                *errnop = ENOMEM;
-                *h_errnop = TRY_AGAIN;
+                *errnop = ERANGE;
+                *h_errnop = NETDB_INTERNAL;
                 return NSS_STATUS_TRYAGAIN;
         }
 
@@ -227,13 +240,15 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
                 int32_t *ttlp,
                 char **canonp) {
 
-        _cleanup_bus_message_unref_ sd_bus_message* reply = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_free_ char *class = NULL;
         unsigned c = 0, i = 0;
         char *r_name, *r_aliases, *r_addr, *r_addr_list;
         size_t l, idx, ms, alen;
         int r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
 
         assert(name);
         assert(result);
@@ -292,8 +307,8 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
         ms = ALIGN(l+1) + c * ALIGN(alen) + (c+2) * sizeof(char*);
 
         if (buflen < ms) {
-                *errnop = ENOMEM;
-                *h_errnop = NO_RECOVERY;
+                *errnop = ERANGE;
+                *h_errnop = NETDB_INTERNAL;
                 return NSS_STATUS_TRYAGAIN;
         }
 
@@ -380,4 +395,357 @@ fail:
         return NSS_STATUS_UNAVAIL;
 }
 
-NSS_GETHOSTBYNAME_FALLBACKS(mymachines)
+NSS_GETHOSTBYNAME_FALLBACKS(mymachines);
+
+enum nss_status _nss_mymachines_getpwnam_r(
+                const char *name,
+                struct passwd *pwd,
+                char *buffer, size_t buflen,
+                int *errnop) {
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        const char *p, *e, *machine;
+        uint32_t mapped;
+        uid_t uid;
+        size_t l;
+        int r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+
+        assert(name);
+        assert(pwd);
+
+        p = startswith(name, "vu-");
+        if (!p)
+                goto not_found;
+
+        e = strrchr(p, '-');
+        if (!e || e == p)
+                goto not_found;
+
+        if (e - p > HOST_NAME_MAX - 1) /* -1 for the last dash */
+                goto not_found;
+
+        r = parse_uid(e + 1, &uid);
+        if (r < 0)
+                goto not_found;
+
+        machine = strndupa(p, e - p);
+        if (!machine_name_is_valid(machine))
+                goto not_found;
+
+        if (getenv_bool_secure("SYSTEMD_NSS_BYPASS_BUS") > 0)
+                /* Make sure we can't deadlock if we are invoked by dbus-daemon. This way, it won't be able to resolve
+                 * these UIDs, but that should be unproblematic as containers should never be able to connect to a bus
+                 * running on the host. */
+                goto not_found;
+
+        r = sd_bus_open_system(&bus);
+        if (r < 0)
+                goto fail;
+
+        r = sd_bus_call_method(bus,
+                               "org.freedesktop.machine1",
+                               "/org/freedesktop/machine1",
+                               "org.freedesktop.machine1.Manager",
+                               "MapFromMachineUser",
+                               &error,
+                               &reply,
+                               "su",
+                               machine, (uint32_t) uid);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_USER_MAPPING))
+                        goto not_found;
+
+                goto fail;
+        }
+
+        r = sd_bus_message_read(reply, "u", &mapped);
+        if (r < 0)
+                goto fail;
+
+        /* Refuse to work if the mapped address is in the host UID range, or if there was no mapping at all. */
+        if (mapped < HOST_UID_LIMIT || mapped == uid)
+                goto not_found;
+
+        l = strlen(name);
+        if (buflen < l+1) {
+                *errnop = ERANGE;
+                return NSS_STATUS_TRYAGAIN;
+        }
+
+        memcpy(buffer, name, l+1);
+
+        pwd->pw_name = buffer;
+        pwd->pw_uid = mapped;
+        pwd->pw_gid = GID_NOBODY;
+        pwd->pw_gecos = buffer;
+        pwd->pw_passwd = (char*) "*"; /* locked */
+        pwd->pw_dir = (char*) "/";
+        pwd->pw_shell = (char*) "/sbin/nologin";
+
+        *errnop = 0;
+        return NSS_STATUS_SUCCESS;
+
+not_found:
+        *errnop = 0;
+        return NSS_STATUS_NOTFOUND;
+
+fail:
+        *errnop = -r;
+        return NSS_STATUS_UNAVAIL;
+}
+
+enum nss_status _nss_mymachines_getpwuid_r(
+                uid_t uid,
+                struct passwd *pwd,
+                char *buffer, size_t buflen,
+                int *errnop) {
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        const char *machine, *object;
+        uint32_t mapped;
+        int r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+
+        if (!uid_is_valid(uid))
+                goto not_found;
+
+        /* We consider all uids < 65536 host uids */
+        if (uid < HOST_UID_LIMIT)
+                goto not_found;
+
+        if (getenv_bool_secure("SYSTEMD_NSS_BYPASS_BUS") > 0)
+                goto not_found;
+
+        r = sd_bus_open_system(&bus);
+        if (r < 0)
+                goto fail;
+
+        r = sd_bus_call_method(bus,
+                               "org.freedesktop.machine1",
+                               "/org/freedesktop/machine1",
+                               "org.freedesktop.machine1.Manager",
+                               "MapToMachineUser",
+                               &error,
+                               &reply,
+                               "u",
+                               (uint32_t) uid);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_USER_MAPPING))
+                        goto not_found;
+
+                goto fail;
+        }
+
+        r = sd_bus_message_read(reply, "sou", &machine, &object, &mapped);
+        if (r < 0)
+                goto fail;
+
+        if (mapped == uid)
+                goto not_found;
+
+        if (snprintf(buffer, buflen, "vu-%s-" UID_FMT, machine, (uid_t) mapped) >= (int) buflen) {
+                *errnop = ERANGE;
+                return NSS_STATUS_TRYAGAIN;
+        }
+
+        pwd->pw_name = buffer;
+        pwd->pw_uid = uid;
+        pwd->pw_gid = GID_NOBODY;
+        pwd->pw_gecos = buffer;
+        pwd->pw_passwd = (char*) "*"; /* locked */
+        pwd->pw_dir = (char*) "/";
+        pwd->pw_shell = (char*) "/sbin/nologin";
+
+        *errnop = 0;
+        return NSS_STATUS_SUCCESS;
+
+not_found:
+        *errnop = 0;
+        return NSS_STATUS_NOTFOUND;
+
+fail:
+        *errnop = -r;
+        return NSS_STATUS_UNAVAIL;
+}
+
+enum nss_status _nss_mymachines_getgrnam_r(
+                const char *name,
+                struct group *gr,
+                char *buffer, size_t buflen,
+                int *errnop) {
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        const char *p, *e, *machine;
+        uint32_t mapped;
+        uid_t gid;
+        size_t l;
+        int r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+
+        assert(name);
+        assert(gr);
+
+        p = startswith(name, "vg-");
+        if (!p)
+                goto not_found;
+
+        e = strrchr(p, '-');
+        if (!e || e == p)
+                goto not_found;
+
+        if (e - p > HOST_NAME_MAX - 1)  /* -1 for the last dash */
+                goto not_found;
+
+        r = parse_gid(e + 1, &gid);
+        if (r < 0)
+                goto not_found;
+
+        machine = strndupa(p, e - p);
+        if (!machine_name_is_valid(machine))
+                goto not_found;
+
+        if (getenv_bool_secure("SYSTEMD_NSS_BYPASS_BUS") > 0)
+                goto not_found;
+
+        r = sd_bus_open_system(&bus);
+        if (r < 0)
+                goto fail;
+
+        r = sd_bus_call_method(bus,
+                               "org.freedesktop.machine1",
+                               "/org/freedesktop/machine1",
+                               "org.freedesktop.machine1.Manager",
+                               "MapFromMachineGroup",
+                               &error,
+                               &reply,
+                               "su",
+                               machine, (uint32_t) gid);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_GROUP_MAPPING))
+                        goto not_found;
+
+                goto fail;
+        }
+
+        r = sd_bus_message_read(reply, "u", &mapped);
+        if (r < 0)
+                goto fail;
+
+        if (mapped < HOST_GID_LIMIT || mapped == gid)
+                goto not_found;
+
+        l = sizeof(char*) + strlen(name) + 1;
+        if (buflen < l) {
+                *errnop = ERANGE;
+                return NSS_STATUS_TRYAGAIN;
+        }
+
+        memzero(buffer, sizeof(char*));
+        strcpy(buffer + sizeof(char*), name);
+
+        gr->gr_name = buffer + sizeof(char*);
+        gr->gr_gid = gid;
+        gr->gr_passwd = (char*) "*"; /* locked */
+        gr->gr_mem = (char**) buffer;
+
+        *errnop = 0;
+        return NSS_STATUS_SUCCESS;
+
+not_found:
+        *errnop = 0;
+        return NSS_STATUS_NOTFOUND;
+
+fail:
+        *errnop = -r;
+        return NSS_STATUS_UNAVAIL;
+}
+
+enum nss_status _nss_mymachines_getgrgid_r(
+                gid_t gid,
+                struct group *gr,
+                char *buffer, size_t buflen,
+                int *errnop) {
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message* reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        const char *machine, *object;
+        uint32_t mapped;
+        int r;
+
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+
+        if (!gid_is_valid(gid))
+                goto not_found;
+
+        /* We consider all gids < 65536 host gids */
+        if (gid < HOST_GID_LIMIT)
+                goto not_found;
+
+        if (getenv_bool_secure("SYSTEMD_NSS_BYPASS_BUS") > 0)
+                goto not_found;
+
+        r = sd_bus_open_system(&bus);
+        if (r < 0)
+                goto fail;
+
+        r = sd_bus_call_method(bus,
+                               "org.freedesktop.machine1",
+                               "/org/freedesktop/machine1",
+                               "org.freedesktop.machine1.Manager",
+                               "MapToMachineGroup",
+                               &error,
+                               &reply,
+                               "u",
+                               (uint32_t) gid);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_GROUP_MAPPING))
+                        goto not_found;
+
+                goto fail;
+        }
+
+        r = sd_bus_message_read(reply, "sou", &machine, &object, &mapped);
+        if (r < 0)
+                goto fail;
+
+        if (mapped == gid)
+                goto not_found;
+
+        if (buflen < sizeof(char*) + 1) {
+                *errnop = ERANGE;
+                return NSS_STATUS_TRYAGAIN;
+        }
+
+        memzero(buffer, sizeof(char*));
+        if (snprintf(buffer + sizeof(char*), buflen - sizeof(char*), "vg-%s-" GID_FMT, machine, (gid_t) mapped) >= (int) buflen) {
+                *errnop = ERANGE;
+                return NSS_STATUS_TRYAGAIN;
+        }
+
+        gr->gr_name = buffer + sizeof(char*);
+        gr->gr_gid = gid;
+        gr->gr_passwd = (char*) "*"; /* locked */
+        gr->gr_mem = (char**) buffer;
+
+        *errnop = 0;
+        return NSS_STATUS_SUCCESS;
+
+not_found:
+        *errnop = 0;
+        return NSS_STATUS_NOTFOUND;
+
+fail:
+        *errnop = -r;
+        return NSS_STATUS_UNAVAIL;
+}

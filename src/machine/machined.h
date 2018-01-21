@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,16 +22,18 @@
 
 #include <stdbool.h>
 
-#include "list.h"
-#include "hashmap.h"
-#include "sd-event.h"
 #include "sd-bus.h"
+#include "sd-event.h"
+
+#include "hashmap.h"
+#include "list.h"
 
 typedef struct Manager Manager;
 
-#include "machine.h"
-#include "machine-dbus.h"
 #include "image-dbus.h"
+#include "machine-dbus.h"
+#include "machine.h"
+#include "operation.h"
 
 struct Manager {
         sd_event *event;
@@ -48,6 +49,11 @@ struct Manager {
         sd_event_source *image_cache_defer_event;
 
         LIST_HEAD(Machine, machine_gc_queue);
+
+        Machine *host_machine;
+
+        LIST_HEAD(Operation, operations);
+        unsigned n_operations;
 };
 
 Manager *manager_new(void);

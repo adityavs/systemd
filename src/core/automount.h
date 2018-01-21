@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -25,18 +24,11 @@ typedef struct Automount Automount;
 
 #include "unit.h"
 
-typedef enum AutomountState {
-        AUTOMOUNT_DEAD,
-        AUTOMOUNT_WAITING,
-        AUTOMOUNT_RUNNING,
-        AUTOMOUNT_FAILED,
-        _AUTOMOUNT_STATE_MAX,
-        _AUTOMOUNT_STATE_INVALID = -1
-} AutomountState;
-
 typedef enum AutomountResult {
         AUTOMOUNT_SUCCESS,
         AUTOMOUNT_FAILURE_RESOURCES,
+        AUTOMOUNT_FAILURE_START_LIMIT_HIT,
+        AUTOMOUNT_FAILURE_MOUNT_START_LIMIT_HIT,
         _AUTOMOUNT_RESULT_MAX,
         _AUTOMOUNT_RESULT_INVALID = -1
 } AutomountResult;
@@ -63,11 +55,6 @@ struct Automount {
 };
 
 extern const UnitVTable automount_vtable;
-
-int automount_update_mount(Automount *a, MountState old_state, MountState state);
-
-const char* automount_state_to_string(AutomountState i) _const_;
-AutomountState automount_state_from_string(const char *s) _pure_;
 
 const char* automount_result_to_string(AutomountResult i) _const_;
 AutomountResult automount_result_from_string(const char *s) _pure_;

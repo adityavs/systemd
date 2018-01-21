@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,10 +22,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "util.h"
-#include "label.h"
-#include "path-util.h"
+#include "alloc-util.h"
 #include "dev-setup.h"
+#include "label.h"
+#include "log.h"
+#include "path-util.h"
+#include "user-util.h"
+#include "util.h"
 
 int dev_setup(const char *prefix, uid_t uid, gid_t gid) {
         static const char symlinks[] =

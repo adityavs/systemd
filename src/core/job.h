@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,6 +21,11 @@
 ***/
 
 #include <stdbool.h>
+
+#include "sd-event.h"
+
+#include "list.h"
+#include "unit-name.h"
 
 typedef struct Job Job;
 typedef struct JobDependency JobDependency;
@@ -60,6 +64,9 @@ enum JobType {
          * it always collapses into JOB_RESTART or JOB_NOP before entering.
          * Thus we never need to merge it with anything. */
         JOB_TRY_RESTART = _JOB_TYPE_MAX_IN_TRANSACTION, /* if running, stop and then start */
+
+        /* Similar to JOB_TRY_RESTART but collapses to JOB_RELOAD or JOB_NOP */
+        JOB_TRY_RELOAD,
 
         /* JOB_RELOAD_OR_START won't enter into a transaction and cannot result
          * from transaction merging (there's no way for JOB_RELOAD and
@@ -101,13 +108,12 @@ enum JobResult {
         JOB_INVALID,             /* JOB_RELOAD of inactive unit */
         JOB_ASSERT,              /* Couldn't start a unit, because an assert didn't hold */
         JOB_UNSUPPORTED,         /* Couldn't start a unit, because the unit type is not supported on the system */
+        JOB_COLLECTED,           /* Job was garbage collected, since nothing needed it anymore */
         _JOB_RESULT_MAX,
         _JOB_RESULT_INVALID = -1
 };
 
-#include "sd-event.h"
 #include "unit.h"
-#include "list.h"
 
 struct JobDependency {
         /* Encodes that the 'subject' job needs the 'object' job in
@@ -118,8 +124,8 @@ struct JobDependency {
         LIST_FIELDS(JobDependency, subject);
         LIST_FIELDS(JobDependency, object);
 
-        bool matters;
-        bool conflicts;
+        bool matters:1;
+        bool conflicts:1;
 };
 
 struct Job {
@@ -129,6 +135,7 @@ struct Job {
         LIST_FIELDS(Job, transaction);
         LIST_FIELDS(Job, run_queue);
         LIST_FIELDS(Job, dbus_queue);
+        LIST_FIELDS(Job, gc_queue);
 
         LIST_HEAD(JobDependency, subject_list);
         LIST_HEAD(JobDependency, object_list);
@@ -144,6 +151,7 @@ struct Job {
 
         sd_event_source *timer_event_source;
         usec_t begin_usec;
+        usec_t begin_running_usec;
 
         /*
          * This tracks where to send signals, and also which clients
@@ -152,7 +160,7 @@ struct Job {
          *
          * There can be more than one client, because of job merging.
          */
-        sd_bus_track *clients;
+        sd_bus_track *bus_track;
         char **deserialized_clients;
 
         JobResult result;
@@ -160,11 +168,12 @@ struct Job {
         bool installed:1;
         bool in_run_queue:1;
         bool matters_to_anchor:1;
-        bool override:1;
         bool in_dbus_queue:1;
         bool sent_dbus_new_signal:1;
         bool ignore_order:1;
         bool irreversible:1;
+        bool in_gc_queue:1;
+        bool ref_by_private_bus:1;
 };
 
 Job* job_new(Unit *unit, JobType type);
@@ -174,8 +183,8 @@ Job* job_install(Job *j);
 int job_install_deserialized(Job *j);
 void job_uninstall(Job *j);
 void job_dump(Job *j, FILE*f, const char *prefix);
-int job_serialize(Job *j, FILE *f, FDSet *fds);
-int job_deserialize(Job *j, FILE *f, FDSet *fds);
+int job_serialize(Job *j, FILE *f);
+int job_deserialize(Job *j, FILE *f);
 int job_coldplug(Job *j);
 
 JobDependency* job_dependency_new(Job *subject, Job *object, bool matters, bool conflicts);
@@ -213,14 +222,22 @@ int job_type_merge_and_collapse(JobType *a, JobType b, Unit *u);
 void job_add_to_run_queue(Job *j);
 void job_add_to_dbus_queue(Job *j);
 
-int job_start_timer(Job *j);
+int job_start_timer(Job *j, bool job_running);
 
 int job_run_and_invalidate(Job *j);
-int job_finish_and_invalidate(Job *j, JobResult result, bool recursive);
+int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool already);
 
 char *job_dbus_path(Job *j);
 
 void job_shutdown_magic(Job *j);
+
+int job_get_timeout(Job *j, usec_t *timeout) _pure_;
+
+bool job_check_gc(Job *j);
+void job_add_to_gc_queue(Job *j);
+
+int job_get_before(Job *j, Job*** ret);
+int job_get_after(Job *j, Job*** ret);
 
 const char* job_type_to_string(JobType t) _const_;
 JobType job_type_from_string(const char *s) _pure_;
@@ -234,4 +251,4 @@ JobMode job_mode_from_string(const char *s) _pure_;
 const char* job_result_to_string(JobResult t) _const_;
 JobResult job_result_from_string(const char *s) _pure_;
 
-int job_get_timeout(Job *j, uint64_t *timeout) _pure_;
+const char* job_type_to_access_method(JobType t);

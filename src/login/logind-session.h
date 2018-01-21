@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -25,8 +24,8 @@ typedef struct Session Session;
 typedef enum KillWho KillWho;
 
 #include "list.h"
-#include "logind-user.h"
 #include "login-util.h"
+#include "logind-user.h"
 
 typedef enum SessionState {
         SESSION_OPENING,  /* Session scope is being created */
@@ -70,7 +69,7 @@ struct Session {
         Manager *manager;
 
         const char *id;
-        unsigned int pos;
+        unsigned int position;
         SessionType type;
         SessionClass class;
 
@@ -107,9 +106,13 @@ struct Session {
         bool idle_hint;
         dual_timestamp idle_hint_timestamp;
 
+        bool locked_hint;
+
         bool in_gc_queue:1;
         bool started:1;
         bool stopping:1;
+
+        bool was_active:1;
 
         sd_bus_message *create_message;
 
@@ -117,6 +120,7 @@ struct Session {
 
         char *controller;
         Hashmap *devices;
+        sd_bus_track *track;
 
         LIST_FIELDS(Session, sessions_by_user);
         LIST_FIELDS(Session, sessions_by_seat);
@@ -133,6 +137,8 @@ int session_activate(Session *s);
 bool session_is_active(Session *s);
 int session_get_idle_hint(Session *s, dual_timestamp *t);
 void session_set_idle_hint(Session *s, bool b);
+int session_get_locked_hint(Session *s);
+void session_set_locked_hint(Session *s, bool b);
 int session_create_fifo(Session *s);
 int session_start(Session *s);
 int session_stop(Session *s, bool force);
@@ -173,7 +179,7 @@ void session_restore_vt(Session *s);
 void session_leave_vt(Session *s);
 
 bool session_is_controller(Session *s, const char *sender);
-int session_set_controller(Session *s, const char *sender, bool force);
+int session_set_controller(Session *s, const char *sender, bool force, bool prepare);
 void session_drop_controller(Session *s);
 
 int bus_session_method_activate(sd_bus_message *message, void *userdata, sd_bus_error *error);

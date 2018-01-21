@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) IBM Corp. 2003
  * Copyright (C) SUSE Linux Products GmbH, 2006
@@ -16,22 +17,25 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <unistd.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <getopt.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "libudev.h"
+
+#include "fd-util.h"
 #include "libudev-private.h"
 #include "scsi_id.h"
+#include "string-util.h"
 #include "udev-util.h"
 
 static const struct option options[] = {
@@ -190,7 +194,7 @@ static int get_file_options(struct udev *udev,
 
         *newargv = NULL;
         lineno = 0;
-        while (1) {
+        for (;;) {
                 vendor_in = model_in = options_in = NULL;
 
                 buf = fgets(buffer, MAX_BUFFER_LEN, f);
@@ -279,9 +283,9 @@ static int get_file_options(struct udev *udev,
                         strcpy(buffer, options_in);
                         c = argc_count(buffer) + 2;
                         *newargv = calloc(c, sizeof(**newargv));
-                        if (!*newargv) {
+                        if (!*newargv)
                                 retval = log_oom();
-                        } else {
+                        else {
                                 *argc = c;
                                 c = 0;
                                 /*
@@ -333,7 +337,7 @@ static int set_options(struct udev *udev,
          * file) we have to reset this back to 1.
          */
         optind = 1;
-        while ((option = getopt_long(argc, argv, "d:f:gp:uvVxh", options, NULL)) >= 0)
+        while ((option = getopt_long(argc, argv, "d:f:gp:uvVxhbs:", options, NULL)) >= 0)
                 switch (option) {
                 case 'b':
                         all_good = false;
@@ -354,7 +358,7 @@ static int set_options(struct udev *udev,
 
                 case 'h':
                         help();
-                        exit(0);
+                        exit(EXIT_SUCCESS);
 
                 case 'p':
                         if (streq(optarg, "0x80"))
@@ -388,8 +392,8 @@ static int set_options(struct udev *udev,
                         break;
 
                 case 'V':
-                        printf("%s\n", VERSION);
-                        exit(0);
+                        printf("%s\n", PACKAGE_VERSION);
+                        exit(EXIT_SUCCESS);
 
                 case 'x':
                         export = true;
@@ -537,16 +541,13 @@ static int scsi_id(struct udev *udev, char *maj_min_dev)
                         if (dev_scsi.wwn_vendor_extension[0] != '\0') {
                                 printf("ID_WWN_VENDOR_EXTENSION=0x%s\n", dev_scsi.wwn_vendor_extension);
                                 printf("ID_WWN_WITH_EXTENSION=0x%s%s\n", dev_scsi.wwn, dev_scsi.wwn_vendor_extension);
-                        } else {
+                        } else
                                 printf("ID_WWN_WITH_EXTENSION=0x%s\n", dev_scsi.wwn);
-                        }
                 }
-                if (dev_scsi.tgpt_group[0] != '\0') {
+                if (dev_scsi.tgpt_group[0] != '\0')
                         printf("ID_TARGET_PORT=%s\n", dev_scsi.tgpt_group);
-                }
-                if (dev_scsi.unit_serial_number[0] != '\0') {
+                if (dev_scsi.unit_serial_number[0] != '\0')
                         printf("ID_SCSI_SERIAL=%s\n", dev_scsi.unit_serial_number);
-                }
                 goto out;
         }
 
@@ -577,6 +578,8 @@ int main(int argc, char **argv)
         int newargc;
         char **newargv = NULL;
 
+        log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
         log_parse_environment();
         log_open();
 
@@ -605,7 +608,7 @@ int main(int argc, char **argv)
          * Get command line options (overriding any config file settings).
          */
         if (set_options(udev, argc, argv, maj_min_dev) < 0)
-                exit(1);
+                exit(EXIT_FAILURE);
 
         if (!dev_specified) {
                 log_error("No device specified.");

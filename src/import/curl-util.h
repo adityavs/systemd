@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,11 +20,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
 #include <curl/curl.h>
+#include <sys/types.h>
+
+#include "sd-event.h"
 
 #include "hashmap.h"
-#include "sd-event.h"
 
 typedef struct CurlGlue CurlGlue;
 

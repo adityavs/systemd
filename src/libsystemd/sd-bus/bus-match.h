@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,9 +20,9 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "hashmap.h"
-
 #include "sd-bus.h"
+
+#include "hashmap.h"
 
 enum bus_match_node_type {
         BUS_MATCH_ROOT,
@@ -44,6 +43,8 @@ enum bus_match_node_type {
         BUS_MATCH_ARG_PATH_LAST = BUS_MATCH_ARG_PATH + 63,
         BUS_MATCH_ARG_NAMESPACE,
         BUS_MATCH_ARG_NAMESPACE_LAST = BUS_MATCH_ARG_NAMESPACE + 63,
+        BUS_MATCH_ARG_HAS,
+        BUS_MATCH_ARG_HAS_LAST = BUS_MATCH_ARG_HAS + 63,
         _BUS_MATCH_NODE_TYPE_MAX,
         _BUS_MATCH_NODE_TYPE_INVALID = -1
 };

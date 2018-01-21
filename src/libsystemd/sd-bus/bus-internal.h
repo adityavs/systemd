@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,25 +20,25 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/socket.h>
 #include <pthread.h>
-
-#include "hashmap.h"
-#include "prioq.h"
-#include "list.h"
-#include "util.h"
-#include "refcnt.h"
-#include "socket-util.h"
+#include <sys/socket.h>
 
 #include "sd-bus.h"
+
 #include "bus-error.h"
-#include "bus-match.h"
 #include "bus-kernel.h"
-#include "kdbus.h"
+#include "bus-match.h"
+#include "def.h"
+#include "hashmap.h"
+#include "list.h"
+#include "prioq.h"
+#include "refcnt.h"
+#include "socket-util.h"
+#include "util.h"
 
 struct reply_callback {
         sd_bus_message_handler_t callback;
-        usec_t timeout;
+        usec_t timeout_usec; /* this is a relative timeout until we reach the BUS_HELLO state, and an absolute one right after */
         uint64_t cookie;
         unsigned prioq_idx;
 };
@@ -54,8 +53,10 @@ struct filter_callback {
 
 struct match_callback {
         sd_bus_message_handler_t callback;
+        sd_bus_message_handler_t install_callback;
 
-        uint64_t cookie;
+        sd_bus_slot *install_slot; /* The AddMatch() call */
+
         unsigned last_iteration;
 
         char *match_string;
@@ -159,12 +160,14 @@ struct sd_bus_slot {
 
 enum bus_state {
         BUS_UNSET,
-        BUS_OPENING,
-        BUS_AUTHENTICATING,
-        BUS_HELLO,
+        BUS_WATCH_BIND,      /* waiting for the socket to appear via inotify */
+        BUS_OPENING,         /* the kernel's connect() is still not ready */
+        BUS_AUTHENTICATING,  /* we are currently in the "SASL" authorization phase of dbus */
+        BUS_HELLO,           /* we are waiting for the Hello() response */
         BUS_RUNNING,
         BUS_CLOSING,
-        BUS_CLOSED
+        BUS_CLOSED,
+        _BUS_STATE_MAX,
 };
 
 static inline bool BUS_IS_OPEN(enum bus_state state) {
@@ -190,10 +193,10 @@ struct sd_bus {
 
         enum bus_state state;
         int input_fd, output_fd;
+        int inotify_fd;
         int message_version;
         int message_endian;
 
-        bool is_kernel:1;
         bool can_fds:1;
         bool bus_client:1;
         bool ucred_valid:1;
@@ -205,12 +208,19 @@ struct sd_bus {
         bool filter_callbacks_modified:1;
         bool nodes_modified:1;
         bool trusted:1;
-        bool fake_creds_valid:1;
-        bool fake_pids_valid:1;
         bool manual_peer_interface:1;
         bool is_system:1;
         bool is_user:1;
         bool allow_interactive_authorization:1;
+        bool exit_on_disconnect:1;
+        bool exited:1;
+        bool exit_triggered:1;
+        bool is_local:1;
+        bool watch_bind:1;
+        bool is_monitor:1;
+        bool accept_fd:1;
+        bool attach_timestamp:1;
+        bool connected_signal:1;
 
         int use_memfd;
 
@@ -243,7 +253,6 @@ struct sd_bus {
         union sockaddr_union sockaddr;
         socklen_t sockaddr_size;
 
-        char *kernel;
         char *machine;
         pid_t nspid;
 
@@ -263,6 +272,8 @@ struct sd_bus {
 
         struct ucred ucred;
         char *label;
+        gid_t *groups;
+        size_t n_groups;
 
         uint64_t creds_mask;
 
@@ -273,8 +284,6 @@ struct sd_bus {
         char **exec_argv;
 
         unsigned iteration_counter;
-
-        void *kdbus_buffer;
 
         /* We do locking around the memfd cache, since we want to
          * allow people to process a sd_bus_message in a different
@@ -288,15 +297,11 @@ struct sd_bus {
 
         pid_t original_pid;
 
-        uint64_t hello_flags;
-        uint64_t attach_flags;
-
-        uint64_t match_cookie;
-
         sd_event_source *input_io_event_source;
         sd_event_source *output_io_event_source;
         sd_event_source *time_event_source;
         sd_event_source *quit_event_source;
+        sd_event_source *inotify_event_source;
         sd_event *event;
         int event_priority;
 
@@ -308,26 +313,29 @@ struct sd_bus {
         sd_bus **default_bus_ptr;
         pid_t tid;
 
-        struct kdbus_creds fake_creds;
-        struct kdbus_pids fake_pids;
-        char *fake_label;
-
         char *cgroup_root;
 
         char *description;
-
-        size_t bloom_size;
-        unsigned bloom_n_hash;
+        char *patch_sender;
 
         sd_bus_track *track_queue;
 
         LIST_HEAD(sd_bus_slot, slots);
+        LIST_HEAD(sd_bus_track, tracks);
+
+        int *inotify_watches;
+        size_t n_inotify_watches;
 };
 
+/* For method calls we time-out at 25s, like in the D-Bus reference implementation */
 #define BUS_DEFAULT_TIMEOUT ((usec_t) (25 * USEC_PER_SEC))
 
-#define BUS_WQUEUE_MAX 1024
-#define BUS_RQUEUE_MAX 64*1024
+/* For the authentication phase we grant 90s, to provide extra room during boot, when RNGs and such are not filled up
+ * with enough entropy yet and might delay the boot */
+#define BUS_AUTH_TIMEOUT ((usec_t) DEFAULT_TIMEOUT_USEC)
+
+#define BUS_WQUEUE_MAX (192*1024)
+#define BUS_RQUEUE_MAX (192*1024)
 
 #define BUS_MESSAGE_SIZE_MAX (64*1024*1024)
 #define BUS_AUTH_SIZE_MAX (64*1024)
@@ -372,6 +380,12 @@ bool bus_pid_changed(sd_bus *bus);
 
 char *bus_address_escape(const char *v);
 
+int bus_attach_io_events(sd_bus *b);
+int bus_attach_inotify_event(sd_bus *b);
+
+void bus_close_inotify_fd(sd_bus *b);
+void bus_close_io_fds(sd_bus *b);
+
 #define OBJECT_PATH_FOREACH_PREFIX(prefix, path)                        \
         for (char *_slash = ({ strcpy((prefix), (path)); streq((prefix), "/") ? NULL : strrchr((prefix), '/'); }) ; \
              _slash && !(_slash[(_slash) == (prefix)] = 0);             \
@@ -381,15 +395,23 @@ char *bus_address_escape(const char *v);
  * bus from the callback doesn't destroy the object we are working
  * on */
 #define BUS_DONT_DESTROY(bus) \
-        _cleanup_bus_unref_ _unused_ sd_bus *_dont_destroy_##bus = sd_bus_ref(bus)
+        _cleanup_(sd_bus_unrefp) _unused_ sd_bus *_dont_destroy_##bus = sd_bus_ref(bus)
 
 int bus_set_address_system(sd_bus *bus);
 int bus_set_address_user(sd_bus *bus);
 int bus_set_address_system_remote(sd_bus *b, const char *host);
 int bus_set_address_system_machine(sd_bus *b, const char *machine);
 
-int bus_remove_match_by_string(sd_bus *bus, const char *match, sd_bus_message_handler_t callback, void *userdata);
-
 int bus_get_root_path(sd_bus *bus);
 
 int bus_maybe_reply_error(sd_bus_message *m, int r, sd_bus_error *error);
+
+#define bus_assert_return(expr, r, error)                               \
+        do {                                                            \
+                if (!assert_log(expr, #expr))                           \
+                        return sd_bus_error_set_errno(error, r);        \
+        } while (false)
+
+void bus_enter_closing(sd_bus *bus);
+
+void bus_set_state(sd_bus *bus, enum bus_state state);

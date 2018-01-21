@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,8 +18,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
+#include <errno.h>
+#include <string.h>
+
+#include "alloc-util.h"
+#include "btrfs-util.h"
 #include "import-util.h"
+#include "log.h"
+#include "macro.h"
+#include "path-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "util.h"
 
 int import_url_last_component(const char *url, char **ret) {
         const char *e, *p;
@@ -150,54 +159,28 @@ int raw_strip_suffixes(const char *p, char **ret) {
         return 0;
 }
 
-bool dkr_digest_is_valid(const char *digest) {
-        /* 7 chars for prefix, 64 chars for the digest itself */
-        if (strlen(digest) != 71)
-                return false;
+int import_assign_pool_quota_and_warn(const char *path) {
+        int r;
 
-        return startswith(digest, "sha256:") && in_charset(digest + 7, "0123456789abcdef");
-}
+        r = btrfs_subvol_auto_qgroup("/var/lib/machines", 0, true);
+        if (r == -ENOTTY)  {
+                log_debug_errno(r, "Failed to set up default quota hierarchy for /var/lib/machines, as directory is not on btrfs or not a subvolume. Ignoring.");
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up default quota hierarchy for /var/lib/machines: %m");
+        if (r > 0)
+                log_info("Set up default quota hierarchy for /var/lib/machines.");
 
-bool dkr_ref_is_valid(const char *ref) {
-        const char *colon;
+        r = btrfs_subvol_auto_qgroup(path, 0, true);
+        if (r == -ENOTTY) {
+                log_debug_errno(r, "Failed to set up quota hierarchy for %s, as directory is not on btrfs or not a subvolume. Ignoring.", path);
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up default quota hierarchy for %s: %m", path);
+        if (r > 0)
+                log_info("Set up default quota hierarchy for %s.", path);
 
-        if (isempty(ref))
-                return false;
-
-        colon = strchr(ref, ':');
-        if (!colon)
-                return filename_is_valid(ref);
-
-        return dkr_digest_is_valid(ref);
-}
-
-bool dkr_name_is_valid(const char *name) {
-        const char *slash, *p;
-
-        if (isempty(name))
-                return false;
-
-        slash = strchr(name, '/');
-        if (!slash)
-                return false;
-
-        if (!filename_is_valid(slash + 1))
-                return false;
-
-        p = strndupa(name, slash - name);
-        if (!filename_is_valid(p))
-                return false;
-
-        return true;
-}
-
-bool dkr_id_is_valid(const char *id) {
-
-        if (!filename_is_valid(id))
-                return false;
-
-        if (!in_charset(id, "0123456789abcdef"))
-                return false;
-
-        return true;
+        return 0;
 }

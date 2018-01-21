@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -48,12 +47,12 @@
 /* Early boot targets */
 #define SPECIAL_SYSINIT_TARGET "sysinit.target"
 #define SPECIAL_SOCKETS_TARGET "sockets.target"
-#define SPECIAL_BUSNAMES_TARGET "busnames.target"
 #define SPECIAL_TIMERS_TARGET "timers.target"
 #define SPECIAL_PATHS_TARGET "paths.target"
 #define SPECIAL_LOCAL_FS_TARGET "local-fs.target"
 #define SPECIAL_LOCAL_FS_PRE_TARGET "local-fs-pre.target"
 #define SPECIAL_INITRD_FS_TARGET "initrd-fs.target"
+#define SPECIAL_INITRD_ROOT_DEVICE_TARGET "initrd-root-device.target"
 #define SPECIAL_INITRD_ROOT_FS_TARGET "initrd-root-fs.target"
 #define SPECIAL_REMOTE_FS_TARGET "remote-fs.target"       /* LSB's $remote_fs */
 #define SPECIAL_REMOTE_FS_PRE_TARGET "remote-fs-pre.target"
@@ -104,6 +103,7 @@
 #define SPECIAL_DBUS_SOCKET "dbus.socket"
 #define SPECIAL_JOURNALD_SOCKET "systemd-journald.socket"
 #define SPECIAL_JOURNALD_SERVICE "systemd-journald.service"
+#define SPECIAL_TMPFILES_SETUP_SERVICE "systemd-tmpfiles-setup.service"
 
 /* Magic init signals */
 #define SPECIAL_KBREQUEST_TARGET "kbrequest.target"
@@ -115,3 +115,9 @@
 #define SPECIAL_USER_SLICE "user.slice"
 #define SPECIAL_MACHINE_SLICE "machine.slice"
 #define SPECIAL_ROOT_SLICE "-.slice"
+
+/* The scope unit systemd itself lives in. */
+#define SPECIAL_INIT_SCOPE "init.scope"
+
+/* The root directory. */
+#define SPECIAL_ROOT_MOUNT "-.mount"

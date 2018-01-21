@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,21 +22,23 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "sd-messages.h"
-#include "sd-event.h"
 #include "sd-bus.h"
+#include "sd-event.h"
+#include "sd-messages.h"
 
-#include "util.h"
-#include "strv.h"
-#include "def.h"
-#include "clock-util.h"
-#include "path-util.h"
-#include "fileio-label.h"
-#include "bus-util.h"
-#include "bus-error.h"
+#include "alloc-util.h"
 #include "bus-common-errors.h"
-#include "event-util.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "clock-util.h"
+#include "def.h"
+#include "fileio-label.h"
+#include "fs-util.h"
+#include "path-util.h"
 #include "selinux-util.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
 
 #define NULL_ADJTIME_UTC "0.0 0 0\n0\nUTC\n"
 #define NULL_ADJTIME_LOCAL "0.0 0 0\n0\nLOCAL\n"
@@ -68,34 +69,15 @@ static int context_read_data(Context *c) {
 
         assert(c);
 
-        r = readlink_malloc("/etc/localtime", &t);
-        if (r < 0) {
-                if (r == -EINVAL)
-                        log_warning("/etc/localtime should be a symbolic link to a time zone data file in /usr/share/zoneinfo/.");
-                else
-                        log_warning_errno(r, "Failed to get target of /etc/localtime: %m");
-        } else {
-                const char *e;
+        r = get_timezone(&t);
+        if (r == -EINVAL)
+                log_warning_errno(r, "/etc/localtime should be a symbolic link to a time zone data file in /usr/share/zoneinfo/.");
+        else if (r < 0)
+                log_warning_errno(r, "Failed to get target of /etc/localtime: %m");
 
-                e = path_startswith(t, "/usr/share/zoneinfo/");
-                if (!e)
-                        e = path_startswith(t, "../usr/share/zoneinfo/");
+        free_and_replace(c->zone, t);
 
-                if (!e)
-                        log_warning("/etc/localtime should be a symbolic link to a time zone data file in /usr/share/zoneinfo/.");
-                else {
-                        c->zone = strdup(e);
-                        if (!c->zone)
-                                return log_oom();
-                }
-        }
-
-        if (isempty(c->zone)) {
-                free(c->zone);
-                c->zone = NULL;
-        }
-
-        c->local_rtc = clock_is_localtime() > 0;
+        c->local_rtc = clock_is_localtime(NULL) > 0;
 
         return 0;
 }
@@ -142,30 +124,44 @@ static int context_write_data_local_rtc(Context *c) {
                 if (!w)
                         return -ENOMEM;
         } else {
-                char *p, *e;
+                char *p;
+                const char *e = "\n"; /* default if there is less than 3 lines */
+                const char *prepend = "";
                 size_t a, b;
 
-                p = strchr(s, '\n');
-                if (!p)
-                        return -EIO;
-
-                p = strchr(p+1, '\n');
-                if (!p)
-                        return -EIO;
-
-                p++;
-                e = strchr(p, '\n');
-                if (!e)
-                        return -EIO;
+                p = strchrnul(s, '\n');
+                if (*p == '\0')
+                        /* only one line, no \n terminator */
+                        prepend = "\n0\n";
+                else if (p[1] == '\0') {
+                        /* only one line, with \n terminator */
+                        ++p;
+                        prepend = "0\n";
+                } else {
+                        p = strchr(p+1, '\n');
+                        if (!p) {
+                                /* only two lines, no \n terminator */
+                                prepend = "\n";
+                                p = s + strlen(s);
+                        } else {
+                                char *end;
+                                /* third line might have a \n terminator or not */
+                                p++;
+                                end = strchr(p, '\n');
+                                /* if we actually have a fourth line, use that as suffix "e", otherwise the default \n */
+                                if (end)
+                                        e = end;
+                        }
+                }
 
                 a = p - s;
                 b = strlen(e);
 
-                w = new(char, a + (c->local_rtc ? 5 : 3) + b + 1);
+                w = new(char, a + (c->local_rtc ? 5 : 3) + strlen(prepend) + b + 1);
                 if (!w)
                         return -ENOMEM;
 
-                *(char*) mempcpy(stpcpy(mempcpy(w, s, a), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
+                *(char*) mempcpy(stpcpy(stpcpy(mempcpy(w, s, a), prepend), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
 
                 if (streq(w, NULL_ADJTIME_UTC)) {
                         if (unlink("/etc/adjtime") < 0)
@@ -176,13 +172,13 @@ static int context_write_data_local_rtc(Context *c) {
                 }
         }
 
-        mac_selinux_init("/etc");
+        mac_selinux_init();
         return write_string_file_atomic_label("/etc/adjtime", w);
 }
 
 static int context_read_ntp(Context *c, sd_bus *bus) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *s;
         int r;
 
@@ -378,6 +374,7 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
                         m,
                         CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-timezone",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -415,7 +412,7 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
         }
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_TIMEZONE_CHANGE),
+                   "MESSAGE_ID=" SD_MESSAGE_TIMEZONE_CHANGE_STR,
                    "TIMEZONE=%s", c->zone,
                    LOG_MESSAGE("Changed time zone to '%s'.", c->zone),
                    NULL);
@@ -445,6 +442,7 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                         m,
                         CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-local-rtc",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -560,6 +558,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
                         m,
                         CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-time",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -591,7 +590,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         clock_set_hwclock(tm);
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_TIME_CHANGE),
+                   "MESSAGE_ID=" SD_MESSAGE_TIME_CHANGE_STR,
                    "REALTIME="USEC_FMT, timespec_load(&ts),
                    LOG_MESSAGE("Changed local time to %s", ctime(&ts.tv_sec)),
                    NULL);
@@ -618,6 +617,7 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                         m,
                         CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-ntp",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &c->polkit_registry,
@@ -636,7 +636,7 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                 return r;
 
         c->use_ntp = enabled;
-        log_info("Set NTP to %s", enabled ? "enabled" : "disabled");
+        log_info("Set NTP to %sd", enable_disable(enabled));
 
         (void) sd_bus_emit_properties_changed(sd_bus_message_get_bus(m), "/org/freedesktop/timedate1", "org.freedesktop.timedate1", "NTP", NULL);
 
@@ -660,7 +660,7 @@ static const sd_bus_vtable timedate_vtable[] = {
 };
 
 static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         assert(c);
@@ -675,9 +675,9 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to register object: %m");
 
-        r = sd_bus_request_name(bus, "org.freedesktop.timedate1", 0);
+        r = sd_bus_request_name_async(bus, NULL, "org.freedesktop.timedate1", 0, NULL, NULL);
         if (r < 0)
-                return log_error_errno(r, "Failed to register name: %m");
+                return log_error_errno(r, "Failed to request name: %m");
 
         r = sd_bus_attach_event(bus, event, 0);
         if (r < 0)
@@ -691,8 +691,8 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
 
 int main(int argc, char *argv[]) {
         Context context = {};
-        _cleanup_event_unref_ sd_event *event = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         log_set_target(LOG_TARGET_AUTO);

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
+
 /***
   This file is part of systemd.
 
@@ -16,9 +19,9 @@
   You should have received a copy of the GNU Lesser General Public License
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
-#pragma once
 
 #include "sparse-endian.h"
+#include "util.h"
 
 #define HWDB_SIG { 'K', 'S', 'L', 'P', 'H', 'H', 'R', 'H' }
 
@@ -67,4 +70,14 @@ struct trie_child_entry_f {
 struct trie_value_entry_f {
         le64_t key_off;
         le64_t value_off;
+} _packed_;
+
+/* v2 extends v1 with filename and line-number */
+struct trie_value_entry2_f {
+        le64_t key_off;
+        le64_t value_off;
+        le64_t filename_off;
+        le32_t line_number;
+        le16_t file_priority;
+        le16_t padding;
 } _packed_;

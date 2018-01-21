@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,18 +19,35 @@
 ***/
 
 #include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "alloc-util.h"
+#include "glob-util.h"
+#include "hexdecoct.h"
 #include "path-util.h"
-#include "bus-label.h"
-#include "util.h"
-#include "unit-name.h"
-#include "def.h"
+#include "special.h"
+#include "string-util.h"
 #include "strv.h"
+#include "unit-name.h"
 
+/* Characters valid in a unit name. */
 #define VALID_CHARS                             \
-        DIGITS LETTERS                          \
+        DIGITS                                  \
+        LETTERS                                 \
         ":-_.\\"
+
+/* The same, but also permits the single @ character that may appear */
+#define VALID_CHARS_WITH_AT                     \
+        "@"                                     \
+        VALID_CHARS
+
+/* All chars valid in a unit name glob */
+#define VALID_CHARS_GLOB                        \
+        VALID_CHARS_WITH_AT                     \
+        "[]!-*?"
 
 bool unit_name_is_valid(const char *n, UnitNameFlags flags) {
         const char *e, *i, *at;
@@ -256,7 +272,7 @@ int unit_name_build(const char *prefix, const char *instance, const char *suffix
         if (!instance)
                 s = strappend(prefix, suffix);
         else
-                s = strjoin(prefix, "@", instance, suffix, NULL);
+                s = strjoin(prefix, "@", instance, suffix);
         if (!s)
                 return -ENOMEM;
 
@@ -288,7 +304,7 @@ static char *do_escape(const char *f, char *t) {
         for (; *f; f++) {
                 if (*f == '/')
                         *(t++) = '-';
-                else if (*f == '-' || *f == '\\' || !strchr(VALID_CHARS, *f))
+                else if (IN_SET(*f, '-', '\\') || !strchr(VALID_CHARS, *f))
                         t = do_escape_char(*f, t);
                 else
                         *(t++) = *f;
@@ -368,19 +384,14 @@ int unit_name_path_escape(const char *f, char **ret) {
         if (STR_IN_SET(p, "/", ""))
                 s = strdup("-");
         else {
-                char *e;
-
-                if (!path_is_safe(p))
+                if (!path_is_normalized(p))
                         return -EINVAL;
 
                 /* Truncate trailing slashes */
-                e = endswith(p, "/");
-                if (e)
-                        *e = 0;
+                delete_trailing_chars(p, "/");
 
                 /* Truncate leading slashes */
-                if (p[0] == '/')
-                        p++;
+                p = skip_leading_chars(p, "/");
 
                 s = unit_name_escape(p);
         }
@@ -423,7 +434,7 @@ int unit_name_path_unescape(const char *f, char **ret) {
                 if (!s)
                         return -ENOMEM;
 
-                if (!path_is_safe(s)) {
+                if (!path_is_normalized(s)) {
                         free(s);
                         return -EINVAL;
                 }
@@ -537,7 +548,7 @@ int unit_name_from_path_instance(const char *prefix, const char *path, const cha
         if (r < 0)
                 return r;
 
-        s = strjoin(prefix, "@", p, suffix, NULL);
+        s = strjoin(prefix, "@", p, suffix);
         if (!s)
                 return -ENOMEM;
 
@@ -558,34 +569,6 @@ int unit_name_to_path(const char *name, char **ret) {
         return unit_name_path_unescape(prefix, ret);
 }
 
-char *unit_dbus_path_from_name(const char *name) {
-        _cleanup_free_ char *e = NULL;
-
-        assert(name);
-
-        e = bus_label_escape(name);
-        if (!e)
-                return NULL;
-
-        return strappend("/org/freedesktop/systemd1/unit/", e);
-}
-
-int unit_name_from_dbus_path(const char *path, char **name) {
-        const char *e;
-        char *n;
-
-        e = startswith(path, "/org/freedesktop/systemd1/unit/");
-        if (!e)
-                return -EINVAL;
-
-        n = bus_label_unescape(e);
-        if (!n)
-                return -ENOMEM;
-
-        *name = n;
-        return 0;
-}
-
 static char *do_escape_mangle(const char *f, UnitNameMangle allow_globs, char *t) {
         const char *valid_chars;
 
@@ -596,7 +579,7 @@ static char *do_escape_mangle(const char *f, UnitNameMangle allow_globs, char *t
         /* We'll only escape the obvious characters here, to play
          * safe. */
 
-        valid_chars = allow_globs == UNIT_NAME_GLOB ? "@" VALID_CHARS "[]!-*?" : "@" VALID_CHARS;
+        valid_chars = allow_globs == UNIT_NAME_GLOB ? VALID_CHARS_GLOB : VALID_CHARS_WITH_AT;
 
         for (; *f; f++) {
                 if (*f == '/')
@@ -615,7 +598,7 @@ static char *do_escape_mangle(const char *f, UnitNameMangle allow_globs, char *t
  *  /blah/blah is converted to blah-blah.mount, anything else is left alone,
  *  except that @suffix is appended if a valid unit suffix is not present.
  *
- *  If @allow_globs, globs characters are preserved. Otherwise they are escaped.
+ *  If @allow_globs, globs characters are preserved. Otherwise, they are escaped.
  */
 int unit_name_mangle_with_suffix(const char *name, UnitNameMangle allow_globs, const char *suffix, char **ret) {
         char *s, *t;
@@ -631,15 +614,15 @@ int unit_name_mangle_with_suffix(const char *name, UnitNameMangle allow_globs, c
         if (!unit_suffix_is_valid(suffix))
                 return -EINVAL;
 
-        if (unit_name_is_valid(name, UNIT_NAME_ANY)) {
-                /* No mangling necessary... */
-                s = strdup(name);
-                if (!s)
-                        return -ENOMEM;
+        /* Already a fully valid unit name? If so, no mangling is necessary... */
+        if (unit_name_is_valid(name, UNIT_NAME_ANY))
+                goto good;
 
-                *ret = s;
-                return 0;
-        }
+        /* Already a fully valid globbing expression? If so, no mangling is necessary either... */
+        if (allow_globs == UNIT_NAME_GLOB &&
+            string_is_glob(name) &&
+            in_charset(name, VALID_CHARS_GLOB))
+                goto good;
 
         if (is_device_path(name)) {
                 r = unit_name_from_path(name, ".device", ret);
@@ -664,15 +647,26 @@ int unit_name_mangle_with_suffix(const char *name, UnitNameMangle allow_globs, c
         t = do_escape_mangle(name, allow_globs, s);
         *t = 0;
 
-        if (unit_name_to_type(s) < 0)
+        /* Append a suffix if it doesn't have any, but only if this is not a glob, so that we can allow "foo.*" as a
+         * valid glob. */
+        if ((allow_globs != UNIT_NAME_GLOB || !string_is_glob(s)) && unit_name_to_type(s) < 0)
                 strcpy(t, suffix);
 
         *ret = s;
         return 1;
+
+good:
+        s = strdup(name);
+        if (!s)
+                return -ENOMEM;
+
+        *ret = s;
+        return 0;
 }
 
 int slice_build_parent_slice(const char *slice, char **ret) {
         char *s, *dash;
+        int r;
 
         assert(slice);
         assert(ret);
@@ -680,7 +674,7 @@ int slice_build_parent_slice(const char *slice, char **ret) {
         if (!slice_name_is_valid(slice))
                 return -EINVAL;
 
-        if (streq(slice, "-.slice")) {
+        if (streq(slice, SPECIAL_ROOT_SLICE)) {
                 *ret = NULL;
                 return 0;
         }
@@ -693,11 +687,11 @@ int slice_build_parent_slice(const char *slice, char **ret) {
         if (dash)
                 strcpy(dash, ".slice");
         else {
-                free(s);
-
-                s = strdup("-.slice");
-                if (!s)
-                        return -ENOMEM;
+                r = free_and_strdup(&s, SPECIAL_ROOT_SLICE);
+                if (r < 0) {
+                        free(s);
+                        return r;
+                }
         }
 
         *ret = s;
@@ -717,7 +711,7 @@ int slice_build_subslice(const char *slice, const char*name, char **ret) {
         if (!unit_prefix_is_valid(name))
                 return -EINVAL;
 
-        if (streq(slice, "-.slice"))
+        if (streq(slice, SPECIAL_ROOT_SLICE))
                 subslice = strappend(name, ".slice");
         else {
                 char *e;
@@ -742,7 +736,7 @@ bool slice_name_is_valid(const char *name) {
         if (!unit_name_is_valid(name, UNIT_NAME_PLAIN))
                 return false;
 
-        if (streq(name, "-.slice"))
+        if (streq(name, SPECIAL_ROOT_SLICE))
                 return true;
 
         e = endswith(name, ".slice");
@@ -772,63 +766,3 @@ bool slice_name_is_valid(const char *name) {
 
         return true;
 }
-
-static const char* const unit_type_table[_UNIT_TYPE_MAX] = {
-        [UNIT_SERVICE] = "service",
-        [UNIT_SOCKET] = "socket",
-        [UNIT_BUSNAME] = "busname",
-        [UNIT_TARGET] = "target",
-        [UNIT_SNAPSHOT] = "snapshot",
-        [UNIT_DEVICE] = "device",
-        [UNIT_MOUNT] = "mount",
-        [UNIT_AUTOMOUNT] = "automount",
-        [UNIT_SWAP] = "swap",
-        [UNIT_TIMER] = "timer",
-        [UNIT_PATH] = "path",
-        [UNIT_SLICE] = "slice",
-        [UNIT_SCOPE] = "scope"
-};
-
-DEFINE_STRING_TABLE_LOOKUP(unit_type, UnitType);
-
-static const char* const unit_load_state_table[_UNIT_LOAD_STATE_MAX] = {
-        [UNIT_STUB] = "stub",
-        [UNIT_LOADED] = "loaded",
-        [UNIT_NOT_FOUND] = "not-found",
-        [UNIT_ERROR] = "error",
-        [UNIT_MERGED] = "merged",
-        [UNIT_MASKED] = "masked"
-};
-
-DEFINE_STRING_TABLE_LOOKUP(unit_load_state, UnitLoadState);
-
-static const char* const unit_dependency_table[_UNIT_DEPENDENCY_MAX] = {
-        [UNIT_REQUIRES] = "Requires",
-        [UNIT_REQUIRES_OVERRIDABLE] = "RequiresOverridable",
-        [UNIT_REQUISITE] = "Requisite",
-        [UNIT_REQUISITE_OVERRIDABLE] = "RequisiteOverridable",
-        [UNIT_WANTS] = "Wants",
-        [UNIT_BINDS_TO] = "BindsTo",
-        [UNIT_PART_OF] = "PartOf",
-        [UNIT_REQUIRED_BY] = "RequiredBy",
-        [UNIT_REQUIRED_BY_OVERRIDABLE] = "RequiredByOverridable",
-        [UNIT_REQUISITE_OF] = "RequisiteOf",
-        [UNIT_REQUISITE_OF_OVERRIDABLE] = "RequisiteOfOverridable",
-        [UNIT_WANTED_BY] = "WantedBy",
-        [UNIT_BOUND_BY] = "BoundBy",
-        [UNIT_CONSISTS_OF] = "ConsistsOf",
-        [UNIT_CONFLICTS] = "Conflicts",
-        [UNIT_CONFLICTED_BY] = "ConflictedBy",
-        [UNIT_BEFORE] = "Before",
-        [UNIT_AFTER] = "After",
-        [UNIT_ON_FAILURE] = "OnFailure",
-        [UNIT_TRIGGERS] = "Triggers",
-        [UNIT_TRIGGERED_BY] = "TriggeredBy",
-        [UNIT_PROPAGATES_RELOAD_TO] = "PropagatesReloadTo",
-        [UNIT_RELOAD_PROPAGATED_FROM] = "ReloadPropagatedFrom",
-        [UNIT_JOINS_NAMESPACE_OF] = "JoinsNamespaceOf",
-        [UNIT_REFERENCES] = "References",
-        [UNIT_REFERENCED_BY] = "ReferencedBy",
-};
-
-DEFINE_STRING_TABLE_LOOKUP(unit_dependency, UnitDependency);

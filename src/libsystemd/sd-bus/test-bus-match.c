@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,13 +18,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "log.h"
-#include "macro.h"
-
 #include "bus-match.h"
 #include "bus-message.h"
-#include "bus-util.h"
 #include "bus-slot.h"
+#include "bus-util.h"
+#include "log.h"
+#include "macro.h"
 
 static bool mask[32];
 
@@ -91,13 +89,13 @@ int main(int argc, char *argv[]) {
                 .type = BUS_MATCH_ROOT,
         };
 
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         enum bus_match_node_type i;
         sd_bus_slot slots[19];
         int r;
 
-        r = sd_bus_open_system(&bus);
+        r = sd_bus_open_user(&bus);
         if (r < 0)
                 return EXIT_TEST_SKIP;
 
@@ -115,16 +113,16 @@ int main(int argc, char *argv[]) {
         assert_se(match_add(slots, &root, "arg1='two'", 12) >= 0);
         assert_se(match_add(slots, &root, "member='waldo',arg2path='/prefix/'", 13) >= 0);
         assert_se(match_add(slots, &root, "member=waldo,path='/foo/bar',arg3namespace='prefix'", 14) >= 0);
-        assert_se(match_add(slots, &root, "arg4='pi'", 15) >= 0);
-        assert_se(match_add(slots, &root, "arg4='pa'", 16) >= 0);
-        assert_se(match_add(slots, &root, "arg4='po'", 17) >= 0);
-        assert_se(match_add(slots, &root, "arg4='pu'", 18) >= 0);
+        assert_se(match_add(slots, &root, "arg4has='pi'", 15) >= 0);
+        assert_se(match_add(slots, &root, "arg4has='pa'", 16) >= 0);
+        assert_se(match_add(slots, &root, "arg4has='po'", 17) >= 0);
+        assert_se(match_add(slots, &root, "arg4='pi'", 18) >= 0);
 
         bus_match_dump(&root, 0);
 
         assert_se(sd_bus_message_new_signal(bus, &m, "/foo/bar", "bar.x", "waldo") >= 0);
         assert_se(sd_bus_message_append(m, "ssssas", "one", "two", "/prefix/three", "prefix.four", 3, "pi", "pa", "po") >= 0);
-        assert_se(bus_message_seal(m, 1, 0) >= 0);
+        assert_se(sd_bus_message_seal(m, 1, 0) >= 0);
 
         zero(mask);
         assert_se(bus_match_run(NULL, &root, m) == 0);

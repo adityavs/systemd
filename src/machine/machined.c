@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -24,14 +23,21 @@
 #include <unistd.h>
 
 #include "sd-daemon.h"
-#include "cgroup-util.h"
-#include "bus-util.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-util.h"
+#include "cgroup-util.h"
+#include "dirent-util.h"
+#include "fd-util.h"
+#include "format-util.h"
+#include "hostname-util.h"
 #include "label.h"
-#include "formats-util.h"
-#include "signal-util.h"
 #include "machine-image.h"
 #include "machined.h"
+#include "process-util.h"
+#include "signal-util.h"
+#include "special.h"
 
 Manager *manager_new(void) {
         Manager *m;
@@ -63,9 +69,13 @@ Manager *manager_new(void) {
 
 void manager_free(Manager *m) {
         Machine *machine;
-        Image *i;
 
         assert(m);
+
+        while (m->operations)
+                operation_free(m->operations);
+
+        assert(m->n_operations == 0);
 
         while ((machine = hashmap_first(m->machines)))
                 machine_free(machine);
@@ -74,10 +84,7 @@ void manager_free(Manager *m) {
         hashmap_free(m->machine_units);
         hashmap_free(m->machine_leaders);
 
-        while ((i = hashmap_steal_first(m->image_cache)))
-                image_unref(i);
-
-        hashmap_free(m->image_cache);
+        hashmap_free_with_destructor(m->image_cache, image_unref);
 
         sd_event_source_unref(m->image_cache_defer_event);
 
@@ -89,6 +96,45 @@ void manager_free(Manager *m) {
         free(m);
 }
 
+static int manager_add_host_machine(Manager *m) {
+        _cleanup_free_ char *rd = NULL, *unit = NULL;
+        sd_id128_t mid;
+        Machine *t;
+        int r;
+
+        if (m->host_machine)
+                return 0;
+
+        r = sd_id128_get_machine(&mid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get machine ID: %m");
+
+        rd = strdup("/");
+        if (!rd)
+                return log_oom();
+
+        unit = strdup(SPECIAL_ROOT_SLICE);
+        if (!unit)
+                return log_oom();
+
+        t = machine_new(m, MACHINE_HOST, ".host");
+        if (!t)
+                return log_oom();
+
+        t->leader = 1;
+        t->id = mid;
+
+        t->root_directory = rd;
+        t->unit = unit;
+        rd = unit = NULL;
+
+        dual_timestamp_from_boottime_or_monotonic(&t->timestamp, 0);
+
+        m->host_machine = t;
+
+        return 0;
+}
+
 int manager_enumerate_machines(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
         struct dirent *de;
@@ -96,14 +142,17 @@ int manager_enumerate_machines(Manager *m) {
 
         assert(m);
 
+        r = manager_add_host_machine(m);
+        if (r < 0)
+                return r;
+
         /* Read in machine data stored on disk */
         d = opendir("/run/systemd/machines");
         if (!d) {
                 if (errno == ENOENT)
                         return 0;
 
-                log_error_errno(errno, "Failed to open /run/systemd/machines: %m");
-                return -errno;
+                return log_error_errno(errno, "Failed to open /run/systemd/machines: %m");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
@@ -117,11 +166,12 @@ int manager_enumerate_machines(Manager *m) {
                 if (startswith(de->d_name, "unit:"))
                         continue;
 
+                if (!machine_name_is_valid(de->d_name))
+                        continue;
+
                 k = manager_add_machine(m, de->d_name, &machine);
                 if (k < 0) {
-                        log_error_errno(k, "Failed to add machine by file name %s: %m", de->d_name);
-
-                        r = k;
+                        r = log_error_errno(k, "Failed to add machine by file name %s: %m", de->d_name);
                         continue;
                 }
 
@@ -136,7 +186,6 @@ int manager_enumerate_machines(Manager *m) {
 }
 
 static int manager_connect_bus(Manager *m) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(m);
@@ -166,70 +215,65 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add image enumerator: %m");
 
-        r = sd_bus_add_match(m->bus,
-                             NULL,
-                             "type='signal',"
-                             "sender='org.freedesktop.systemd1',"
-                             "interface='org.freedesktop.systemd1.Manager',"
-                             "member='JobRemoved',"
-                             "path='/org/freedesktop/systemd1'",
-                             match_job_removed,
-                             m);
+        r = sd_bus_match_signal_async(
+                        m->bus,
+                        NULL,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "JobRemoved",
+                        match_job_removed, NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to add match for JobRemoved: %m");
 
-        r = sd_bus_add_match(m->bus,
-                             NULL,
-                             "type='signal',"
-                             "sender='org.freedesktop.systemd1',"
-                             "interface='org.freedesktop.systemd1.Manager',"
-                             "member='UnitRemoved',"
-                             "path='/org/freedesktop/systemd1'",
-                             match_unit_removed,
-                             m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add match for UnitRemoved: %m");
-
-        r = sd_bus_add_match(m->bus,
-                             NULL,
-                             "type='signal',"
-                             "sender='org.freedesktop.systemd1',"
-                             "interface='org.freedesktop.DBus.Properties',"
-                             "member='PropertiesChanged',"
-                             "arg0='org.freedesktop.systemd1.Unit'",
-                             match_properties_changed,
-                             m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add match for PropertiesChanged: %m");
-
-        r = sd_bus_add_match(m->bus,
-                             NULL,
-                             "type='signal',"
-                             "sender='org.freedesktop.systemd1',"
-                             "interface='org.freedesktop.systemd1.Manager',"
-                             "member='Reloading',"
-                             "path='/org/freedesktop/systemd1'",
-                             match_reloading,
-                             m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add match for Reloading: %m");
-
-        r = sd_bus_call_method(
+        r = sd_bus_match_signal_async(
                         m->bus,
+                        NULL,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "UnitRemoved",
+                        match_unit_removed, NULL, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to request match for UnitRemoved: %m");
+
+        r = sd_bus_match_signal_async(
+                        m->bus,
+                        NULL,
+                        "org.freedesktop.systemd1",
+                        NULL,
+                        "org.freedesktop.DBus.Properties",
+                        "PropertiesChanged",
+                        match_properties_changed, NULL, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to request match for PropertiesChanged: %m");
+
+        r = sd_bus_match_signal_async(
+                        m->bus,
+                        NULL,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "Reloading",
+                        match_reloading, NULL, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to request match for Reloading: %m");
+
+        r = sd_bus_call_method_async(
+                        m->bus,
+                        NULL,
                         "org.freedesktop.systemd1",
                         "/org/freedesktop/systemd1",
                         "org.freedesktop.systemd1.Manager",
                         "Subscribe",
-                        &error,
-                        NULL, NULL);
-        if (r < 0) {
-                log_error("Failed to enable subscription: %s", bus_error_message(&error, r));
-                return r;
-        }
-
-        r = sd_bus_request_name(m->bus, "org.freedesktop.machine1", 0);
+                        NULL, NULL,
+                        NULL);
         if (r < 0)
-                return log_error_errno(r, "Failed to register name: %m");
+                return log_error_errno(r, "Failed to enable subscription: %m");
+
+        r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.machine1", 0, NULL, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to request name: %m");
 
         r = sd_bus_attach_event(m->bus, m->event, 0);
         if (r < 0)
@@ -247,8 +291,16 @@ void manager_gc(Manager *m, bool drop_not_started) {
                 LIST_REMOVE(gc_queue, m->machine_gc_queue, machine);
                 machine->in_gc_queue = false;
 
-                if (!machine_check_gc(machine, drop_not_started)) {
+                /* First, if we are not closing yet, initiate stopping */
+                if (!machine_check_gc(machine, drop_not_started) &&
+                    machine_get_state(machine) != MACHINE_CLOSING)
                         machine_stop(machine);
+
+                /* Now, the stop probably made this referenced
+                 * again, but if it didn't, then it's time to let it
+                 * go entirely. */
+                if (!machine_check_gc(machine, drop_not_started)) {
+                        machine_finalize(machine);
                         machine_free(machine);
                 }
         }
@@ -281,6 +333,9 @@ int manager_startup(Manager *m) {
 
 static bool check_idle(void *userdata) {
         Manager *m = userdata;
+
+        if (m->operations)
+                return false;
 
         manager_gc(m, true);
 
@@ -336,7 +391,7 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        log_debug("systemd-machined running as pid "PID_FMT, getpid());
+        log_debug("systemd-machined running as pid "PID_FMT, getpid_cached());
 
         sd_notify(false,
                   "READY=1\n"
@@ -344,11 +399,10 @@ int main(int argc, char *argv[]) {
 
         r = manager_run(m);
 
-        log_debug("systemd-machined stopped as pid "PID_FMT, getpid());
+        log_debug("systemd-machined stopped as pid "PID_FMT, getpid_cached());
 
 finish:
-        if (m)
-                manager_free(m);
+        manager_free(m);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

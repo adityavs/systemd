@@ -1,8 +1,7 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 #pragma once
 
 #include "macro.h"
+#include "missing.h"
 #include "sparse-endian.h"
 
 /* Stolen from btrfs' ctree.h */

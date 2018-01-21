@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,18 +19,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdio.h>
 
 #include "sd-messages.h"
-#include "log.h"
-#include "util.h"
-#include "strv.h"
-#include "fileio.h"
-#include "build.h"
-#include "sleep-config.h"
+
 #include "def.h"
+#include "exec-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "log.h"
+#include "sleep-config.h"
+#include "string-util.h"
+#include "strv.h"
+#include "util.h"
 
 static char* arg_verb = NULL;
 
@@ -42,7 +44,7 @@ static int write_mode(char **modes) {
         STRV_FOREACH(mode, modes) {
                 int k;
 
-                k = write_string_file("/sys/power/disk", *mode);
+                k = write_string_file("/sys/power/disk", *mode, 0);
                 if (k == 0)
                         return 0;
 
@@ -65,7 +67,7 @@ static int write_state(FILE **f, char **states) {
         STRV_FOREACH(state, states) {
                 int k;
 
-                k = write_string_stream(*f, *state);
+                k = write_string_stream(*f, *state, 0);
                 if (k == 0)
                         return 0;
                 log_debug_errno(k, "Failed to write '%s' to /sys/power/state: %m",
@@ -90,7 +92,10 @@ static int execute(char **modes, char **states) {
                 arg_verb,
                 NULL
         };
-        static const char* const dirs[] = {SYSTEM_SLEEP_PATH, NULL};
+        static const char* const dirs[] = {
+                SYSTEM_SLEEP_PATH,
+                NULL
+        };
 
         int r;
         _cleanup_fclose_ FILE *f = NULL;
@@ -106,10 +111,10 @@ static int execute(char **modes, char **states) {
         if (r < 0)
                 return r;
 
-        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, arguments);
+        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, arguments);
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_SLEEP_START),
+                   "MESSAGE_ID=" SD_MESSAGE_SLEEP_START_STR,
                    LOG_MESSAGE("Suspending system..."),
                    "SLEEP=%s", arg_verb,
                    NULL);
@@ -119,13 +124,13 @@ static int execute(char **modes, char **states) {
                 return r;
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_SLEEP_STOP),
+                   "MESSAGE_ID=" SD_MESSAGE_SLEEP_STOP_STR,
                    LOG_MESSAGE("System resumed."),
                    "SLEEP=%s", arg_verb,
                    NULL);
 
         arguments[1] = (char*) "post";
-        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, arguments);
+        execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, arguments);
 
         return r;
 }
@@ -165,9 +170,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0; /* done */
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0 /* done */;
+                        return version();
 
                 case '?':
                         return -EINVAL;

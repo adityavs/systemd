@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,15 +18,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <assert.h>
-#include <stdio.h>
 #include <errno.h>
-#include <stdlib.h>
-#include <stdbool.h>
-
 #include <qrencode.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdio_ext.h>
+#include <stdlib.h>
 
 #include "journal-qrcode.h"
+#include "macro.h"
 
 #define WHITE_ON_BLACK "\033[40;37;1m"
 #define NORMAL "\033[0m"
@@ -67,6 +66,8 @@ int print_qr_code(
         f = open_memstream(&url, &url_size);
         if (!f)
                 return -ENOMEM;
+
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
 
         fputs("fss://", f);
 

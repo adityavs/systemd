@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -21,11 +20,10 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "sparse-endian.h"
-
-#include "systemd/sd-id128.h"
+#include "sd-id128.h"
 
 #include "macro.h"
+#include "sparse-endian.h"
 
 /*
  * If you change this file you probably should also change its documentation:
@@ -165,11 +163,11 @@ enum {
 
 #define HEADER_INCOMPATIBLE_ANY (HEADER_INCOMPATIBLE_COMPRESSED_XZ|HEADER_INCOMPATIBLE_COMPRESSED_LZ4)
 
-#if defined(HAVE_XZ) && defined(HAVE_LZ4)
+#if HAVE_XZ && HAVE_LZ4
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_ANY
-#elif defined(HAVE_XZ)
+#elif HAVE_XZ
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_COMPRESSED_XZ
-#elif defined(HAVE_LZ4)
+#elif HAVE_LZ4
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_COMPRESSED_LZ4
 #else
 #  define HEADER_INCOMPATIBLE_SUPPORTED 0
@@ -180,7 +178,7 @@ enum {
 };
 
 #define HEADER_COMPATIBLE_ANY HEADER_COMPATIBLE_SEALED
-#ifdef HAVE_GCRYPT
+#if HAVE_GCRYPT
 #  define HEADER_COMPATIBLE_SUPPORTED HEADER_COMPATIBLE_SEALED
 #else
 #  define HEADER_COMPATIBLE_SUPPORTED 0

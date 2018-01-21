@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2010 - Maxim Levitsky
  *
@@ -17,15 +18,17 @@
  * Boston, MA  02110-1301  USA
  */
 
+#include <fcntl.h>
+#include <mtd/mtd-user.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <mtd/mtd-user.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <stdint.h>
+
+#include "alloc-util.h"
 #include "mtd_probe.h"
 
 static const uint8_t cis_signature[] = {
@@ -33,16 +36,16 @@ static const uint8_t cis_signature[] = {
 };
 
 
-void probe_smart_media(int mtd_fd, mtd_info_t* info)
-{
+void probe_smart_media(int mtd_fd, mtd_info_t* info) {
         int sector_size;
         int block_size;
         int size_in_megs;
         int spare_count;
-        char* cis_buffer = malloc(SM_SECTOR_SIZE);
+        _cleanup_free_ uint8_t *cis_buffer = NULL;
         int offset;
         int cis_found = 0;
 
+        cis_buffer = malloc(SM_SECTOR_SIZE);
         if (!cis_buffer)
                 return;
 
@@ -53,7 +56,7 @@ void probe_smart_media(int mtd_fd, mtd_info_t* info)
         block_size = info->erasesize;
         size_in_megs = info->size / (1024 * 1024);
 
-        if (sector_size != SM_SECTOR_SIZE && sector_size != SM_SMALL_PAGE)
+        if (!IN_SET(sector_size, SM_SECTOR_SIZE, SM_SMALL_PAGE))
                 goto exit;
 
         switch(size_in_megs) {
@@ -72,7 +75,7 @@ void probe_smart_media(int mtd_fd, mtd_info_t* info)
         for (offset = 0 ; offset < block_size * spare_count ;
                                                 offset += sector_size) {
                 lseek(mtd_fd, SEEK_SET, offset);
-                if (read(mtd_fd, cis_buffer, SM_SECTOR_SIZE) == SM_SECTOR_SIZE){
+                if (read(mtd_fd, cis_buffer, SM_SECTOR_SIZE) == SM_SECTOR_SIZE) {
                         cis_found = 1;
                         break;
                 }
@@ -87,9 +90,8 @@ void probe_smart_media(int mtd_fd, mtd_info_t* info)
                 goto exit;
 
         printf("MTD_FTL=smartmedia\n");
-        free(cis_buffer);
-        exit(0);
+        exit(EXIT_SUCCESS);
+
 exit:
-        free(cis_buffer);
         return;
 }

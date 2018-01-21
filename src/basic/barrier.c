@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -30,8 +29,8 @@
 #include <unistd.h>
 
 #include "barrier.h"
+#include "fd-util.h"
 #include "macro.h"
-#include "util.h"
 
 /**
  * Barriers
@@ -173,7 +172,7 @@ void barrier_set_role(Barrier *b, unsigned int role) {
         int fd;
 
         assert(b);
-        assert(role == BARRIER_PARENT || role == BARRIER_CHILD);
+        assert(IN_SET(role, BARRIER_PARENT, BARRIER_CHILD));
         /* make sure this is only called once */
         assert(b->pipe[0] >= 0 && b->pipe[1] >= 0);
 
@@ -197,6 +196,7 @@ static bool barrier_write(Barrier *b, uint64_t buf) {
         if (barrier_i_aborted(b))
                 return false;
 
+        assert(b->me >= 0);
         do {
                 len = write(b->me, &buf, sizeof(buf));
         } while (len < 0 && IN_SET(errno, EAGAIN, EINTR));

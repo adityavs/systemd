@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,20 +18,23 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <string.h>
 #include <errno.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "log.h"
-#include "util.h"
-#include "mkdir.h"
-#include "unit-name.h"
-#include "virt.h"
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "fileio.h"
+#include "log.h"
+#include "mkdir.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "string-util.h"
 #include "terminal-util.h"
+#include "unit-name.h"
+#include "util.h"
+#include "virt.h"
 
 static const char *arg_dest = "/tmp";
 
@@ -109,7 +111,7 @@ static int verify_tty(const char *name) {
 
         errno = 0;
         if (isatty(fd) <= 0)
-                return errno ? -errno : -EIO;
+                return errno > 0 ? -errno : -EIO;
 
         return 0;
 }
@@ -142,7 +144,7 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        if (detect_container(NULL) > 0) {
+        if (detect_container() > 0) {
                 _cleanup_free_ char *container_ttys = NULL;
 
                 log_debug("Automatically adding console shell.");
@@ -200,15 +202,15 @@ int main(int argc, char *argv[]) {
                                 return EXIT_FAILURE;
                         }
 
+                        /* We assume that gettys on virtual terminals are
+                         * started via manual configuration and do this magic
+                         * only for non-VC terminals. */
+
                         if (isempty(tty) || tty_is_vc(tty))
                                 continue;
 
                         if (verify_tty(tty) < 0)
                                 continue;
-
-                        /* We assume that gettys on virtual terminals are
-                         * started via manual configuration and do this magic
-                         * only for non-VC terminals. */
 
                         if (add_serial_getty(tty) < 0)
                                 return EXIT_FAILURE;

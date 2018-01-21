@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -23,6 +22,8 @@
 
 #include <sys/stat.h>
 
+#include "util.h"
+
 typedef enum RemoveFlags {
         REMOVE_ONLY_DIRECTORIES = 1,
         REMOVE_ROOT = 2,
@@ -32,3 +33,11 @@ typedef enum RemoveFlags {
 
 int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev);
 int rm_rf(const char *path, RemoveFlags flags);
+
+/* Useful for usage with _cleanup_(), destroys a directory and frees the pointer */
+static inline void rm_rf_physical_and_free(char *p) {
+        PROTECT_ERRNO;
+        (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL);
+        free(p);
+}
+DEFINE_TRIVIAL_CLEANUP_FUNC(char*, rm_rf_physical_and_free);

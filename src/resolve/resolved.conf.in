@@ -14,4 +14,9 @@
 [Resolve]
 #DNS=
 #FallbackDNS=@DNS_SERVERS@
+#Domains=
 #LLMNR=yes
+#MulticastDNS=yes
+#DNSSEC=@DEFAULT_DNSSEC_MODE@
+#Cache=yes
+#DNSStubListener=udp

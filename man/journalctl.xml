@@ -3,6 +3,8 @@
         "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -82,20 +84,34 @@
       matches apply to the same field, then they are automatically
       matched as alternatives, i.e. the resulting output will show
       entries matching any of the specified matches for the same
-      field. Finally, the character <literal>+</literal> may appears
+      field. Finally, the character <literal>+</literal> may appear
       as a separate word between other terms on the command line. This
       causes all matches before and after to be combined in a
       disjunction (i.e. logical OR).</para>
 
-      <para>As shortcuts for a few types of field/value matches, file
-      paths may be specified. If a file path refers to an executable
-      file, this is equivalent to an <literal>_EXE=</literal> match
-      for the canonicalized binary path. Similarly, if a path refers
-      to a device node, this is equivalent to a
-      <literal>_KERNEL_DEVICE=</literal> match for the device.</para>
+      <para>It is also possible to filter the entries by specifying an
+      absolute file path as an argument. The file path may be a file or
+      a symbolic link and the file must exist at the time of the query. If a
+      file path refers to an executable binary, an <literal>_EXE=</literal>
+      match for the canonicalized binary path is added to the query. If a
+      file path refers to an executable script, a <literal>_COMM=</literal>
+      match for the script name is added to the query. If a file path
+      refers to a device node, <literal>_KERNEL_DEVICE=</literal> matches for
+      the kernel name of the device and for each of its ancestor devices is
+      added to the query. Symbolic links are dereferenced, kernel names are
+      synthesized, and parent devices are identified from the environment at
+      the time of the query. In general, a device node is the best proxy for
+      an actual device, as log entries do not usually contain fields that
+      identify an actual device. For the resulting log entries to be correct
+      for the actual device, the relevant parts of the environment at the time
+      the entry was logged, in particular the actual device corresponding to
+      the device node, must have been the same as those at the time of the
+      query. Because device nodes generally change their corresponding devices
+      across reboots, specifying a device node path causes the resulting
+      entries to be restricted to those from the current boot.</para>
 
       <para>Additional constraints may be added using options
-      <option>--boot</option>, <option>--unit=</option>, etc, to
+      <option>--boot</option>, <option>--unit=</option>, etc., to
       further limit what entries will be shown (logical AND).</para>
 
       <para>Output is interleaved from all accessible journal files,
@@ -111,9 +127,9 @@
       <para>All users are granted access to their private per-user
       journals. However, by default, only root and users who are
       members of a few special groups are granted access to the system
-      journal and the journals of other users. Members of the the
+      journal and the journals of other users. Members of the groups
       <literal>systemd-journal</literal>, <literal>adm</literal>, and
-      <literal>wheel</literal> groups can read all journal files. Note
+      <literal>wheel</literal> can read all journal files. Note
       that the two latter groups traditionally have additional
       privileges specified by the distribution. Members of the
       <literal>wheel</literal> group can often perform administrative
@@ -181,7 +197,7 @@
           <option>-n1000</option> to guarantee that the pager will not
           buffer logs of unbounded size. This may be overridden with
           an explicit <option>-n</option> with some other numeric
-          value while <option>-nall</option> will disable this cap.
+          value, while <option>-nall</option> will disable this cap.
           Note that this option is only supported for the
           <citerefentry project='man-pages'><refentrytitle>less</refentrytitle><manvolnum>1</manvolnum></citerefentry>
           pager.</para></listitem>
@@ -236,6 +252,18 @@
 
             <varlistentry>
               <term>
+                <option>short-full</option>
+              </term>
+              <listitem>
+                <para>is very similar, but shows timestamps in the format the <option>--since=</option> and
+                <option>--until=</option> options accept. Unlike the timestamp information shown in
+                <option>short</option> output mode this mode includes weekday, year and timezone information in the
+                output, and is locale-independent.</para>
+              </listitem>
+            </varlistentry>
+
+            <varlistentry>
+              <term>
                 <option>short-iso</option>
               </term>
               <listitem>
@@ -246,11 +274,21 @@
 
             <varlistentry>
               <term>
+                <option>short-iso-precise</option>
+              </term>
+              <listitem>
+                <para>as for <option>short-iso</option> but includes full
+                microsecond precision.</para>
+              </listitem>
+            </varlistentry>
+
+            <varlistentry>
+              <term>
                 <option>short-precise</option>
               </term>
               <listitem>
-                <para>is very similar, but shows timestamps with full
-                microsecond precision.</para>
+                <para>is very similar, but shows classic syslog timestamps
+                with full microsecond precision.</para>
               </listitem>
             </varlistentry>
 
@@ -261,6 +299,16 @@
               <listitem>
                 <para>is very similar, but shows monotonic timestamps
                 instead of wallclock timestamps.</para>
+              </listitem>
+            </varlistentry>
+
+            <varlistentry>
+              <term>
+                <option>short-unix</option>
+              </term>
+              <listitem>
+                <para>is very similar, but shows seconds passed since January 1st 1970 UTC instead of wallclock
+                timestamps ("UNIX time"). The time is shown with microsecond accuracy.</para>
               </listitem>
             </varlistentry>
 
@@ -282,8 +330,10 @@
                 <para>serializes the journal into a binary (but mostly
                 text-based) stream suitable for backups and network
                 transfer (see
-                <ulink url="http://www.freedesktop.org/wiki/Software/systemd/export">Journal Export Format</ulink>
-                for more information).</para>
+                <ulink url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal Export Format</ulink>
+                for more information). To import the binary stream back
+                into native journald format use
+                <citerefentry><refentrytitle>systemd-journal-remote</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
               </listitem>
             </varlistentry>
 
@@ -294,7 +344,7 @@
               <listitem>
                 <para>formats entries as JSON data structures, one per
                 line (see
-                <ulink url="http://www.freedesktop.org/wiki/Software/systemd/json">Journal JSON Format</ulink>
+                <ulink url="https://www.freedesktop.org/wiki/Software/systemd/json">Journal JSON Format</ulink>
                 for more information).</para>
               </listitem>
             </varlistentry>
@@ -337,10 +387,31 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--output-fields=</option></term>
+
+        <listitem><para>A comma separated list of the fields which should
+        be included in the output. This only has an effect for the output modes
+        which would normally show all fields (<option>verbose</option>,
+        <option>export</option>, <option>json</option>,
+        <option>json-pretty</option>, and <option>json-sse</option>). The
+        <literal>__CURSOR</literal>, <literal>__REALTIME_TIMESTAMP</literal>,
+        <literal>__MONOTONIC_TIMESTAMP</literal>, and
+        <literal>_BOOT_ID</literal> fields are always
+        printed.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--utc</option></term>
 
         <listitem><para>Express time in Coordinated Universal Time
         (UTC).</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--no-hostname</option></term>
+
+        <listitem><para>Don't show the hostname field of log messages originating from the local host. This switch only
+        has an effect on the <option>short</option> family of output modes (see above).</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -356,7 +427,7 @@
         manuals. Note that help texts are not available for all
         messages, but only for selected ones. For more information on
         the message catalog, please refer to the
-        <ulink url="http://www.freedesktop.org/wiki/Software/systemd/catalog">Message Catalog Developer Documentation</ulink>.</para>
+        <ulink url="https://www.freedesktop.org/wiki/Software/systemd/catalog">Message Catalog Developer Documentation</ulink>.</para>
 
         <para>Note: when attaching <command>journalctl</command>
         output to bug reports, please do <emphasis>not</emphasis> use
@@ -368,7 +439,9 @@
         <term><option>-q</option></term>
         <term><option>--quiet</option></term>
 
-        <listitem><para>Suppresses any warning messages regarding
+        <listitem><para>Suppresses all informational messages
+        (i.e. "-- Logs begin at …", "-- Reboot --"),
+        any warning messages regarding
         inaccessible system journals when run as a normal
         user.</para></listitem>
       </varlistentry>
@@ -393,7 +466,7 @@
 
         <para>If the boot ID is omitted, a positive
         <replaceable>offset</replaceable> will look up the boots
-        starting from the beginning of the journal, and a
+        starting from the beginning of the journal, and an
         equal-or-less-than zero <replaceable>offset</replaceable> will
         look up boots starting from the end of the journal. Thus,
         <constant>1</constant> means the first boot found in the
@@ -411,7 +484,7 @@
         <replaceable>offset</replaceable> which identifies the boot
         relative to the one given by boot
         <replaceable>ID</replaceable>. Negative values mean earlier
-        boots and a positive values mean later boots. If
+        boots and positive values mean later boots. If
         <replaceable>offset</replaceable> is not specified, a value of
         zero is assumed, and the logs for the boot given by
         <replaceable>ID</replaceable> are shown.</para>
@@ -437,13 +510,11 @@
 
       <varlistentry>
         <term><option>-t</option></term>
-        <term><option>--identifier=<replaceable>SYSLOG_IDENTIFIER</replaceable>|<replaceable>PATTERN</replaceable></option></term>
+        <term><option>--identifier=<replaceable>SYSLOG_IDENTIFIER</replaceable></option></term>
 
         <listitem><para>Show messages for the specified syslog
-        identifier <replaceable>SYSLOG_IDENTIFIER</replaceable>, or
-        for any of the messages with a
-        <literal>SYSLOG_IDENTIFIER</literal> matched by
-        <replaceable>PATTERN</replaceable>.</para>
+        identifier
+        <replaceable>SYSLOG_IDENTIFIER</replaceable>.</para>
 
         <para>This parameter can be specified multiple
         times.</para></listitem>
@@ -520,7 +591,7 @@
 
         <listitem><para>Start showing entries from the location in the
         journal <emphasis>after</emphasis> the location specified by
-        the this cursor.  The cursor is shown when the
+        the passed cursor.  The cursor is shown when the
         <option>--show-cursor</option> option is used.</para>
         </listitem>
       </varlistentry>
@@ -530,31 +601,29 @@
 
         <listitem><para>The cursor is shown after the last entry after
         two dashes:</para>
-        <programlisting>-- cursor: s=0639...</programlisting>
+        <programlisting>-- cursor: s=0639…</programlisting>
         <para>The format of the cursor is private
         and subject to change.</para></listitem>
       </varlistentry>
 
       <varlistentry>
+        <term><option>-S</option></term>
         <term><option>--since=</option></term>
+        <term><option>-U</option></term>
         <term><option>--until=</option></term>
 
-        <listitem><para>Start showing entries on or newer than the
-        specified date, or on or older than the specified date,
-        respectively. Date specifications should be of the format
-        <literal>2012-10-30 18:17:16</literal>.  If the time part is
-        omitted, <literal>00:00:00</literal> is assumed.  If only the
-        seconds component is omitted, <literal>:00</literal> is
-        assumed. If the date component is omitted, the current day is
-        assumed. Alternatively the strings
-        <literal>yesterday</literal>, <literal>today</literal>,
-        <literal>tomorrow</literal> are understood, which refer to
-        00:00:00 of the day before the current day, the current day,
-        or the day after the current day,
-        respectively. <literal>now</literal> refers to the current
-        time. Finally, relative times may be specified, prefixed with
-        <literal>-</literal> or <literal>+</literal>, referring to
-        times before or after the current time, respectively.</para>
+        <listitem><para>Start showing entries on or newer than the specified date, or on or older than the specified
+        date, respectively. Date specifications should be of the format <literal>2012-10-30 18:17:16</literal>.  If the
+        time part is omitted, <literal>00:00:00</literal> is assumed.  If only the seconds component is omitted,
+        <literal>:00</literal> is assumed. If the date component is omitted, the current day is assumed. Alternatively
+        the strings <literal>yesterday</literal>, <literal>today</literal>, <literal>tomorrow</literal> are understood,
+        which refer to 00:00:00 of the day before the current day, the current day, or the day after the current day,
+        respectively. <literal>now</literal> refers to the current time. Finally, relative times may be specified,
+        prefixed with <literal>-</literal> or <literal>+</literal>, referring to times before or after the current
+        time, respectively. For complete time and date specification, see
+        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>. Note that
+        <option>--output=short-full</option> prints timestamps that follow precisely this format.
+        </para>
         </listitem>
       </varlistentry>
 
@@ -564,6 +633,13 @@
 
         <listitem><para>Print all possible data values the specified
         field can take in all entries of the journal.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-N</option></term>
+        <term><option>--fields</option></term>
+
+        <listitem><para>Print all field names currently used in all entries of the journal.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -611,10 +687,12 @@
         <term><option>--root=<replaceable>ROOT</replaceable></option></term>
 
         <listitem><para>Takes a directory path as an argument. If
-        specified, journalctl will operate on catalog file hierarchy
+        specified, journalctl will operate on journal directories and catalog file hierarchy
         underneath the specified directory instead of the root
         directory (e.g. <option>--update-catalog</option> will create
-        <filename><replaceable>ROOT</replaceable>/var/lib/systemd/catalog/database</filename>).
+        <filename><replaceable>ROOT</replaceable>/var/lib/systemd/catalog/database</filename>,
+        and journal files under <filename><replaceable>ROOT</replaceable>/run/journal</filename>
+        or <filename><replaceable>ROOT</replaceable>/var/log/journal</filename> will be displayed).
         </para></listitem>
       </varlistentry>
 
@@ -625,7 +703,7 @@
         a new 128-bit ID suitable for identifying messages. This is
         intended for usage by developers who need a new identifier for
         a new message they introduce and want to make
-        recognizable. This will print the new ID in three different
+        recognizable. This will print the new ID in four different
         formats which can be copied into source code or similar.
         </para></listitem>
       </varlistentry>
@@ -649,29 +727,39 @@
       <varlistentry>
         <term><option>--vacuum-size=</option></term>
         <term><option>--vacuum-time=</option></term>
+        <term><option>--vacuum-files=</option></term>
 
         <listitem><para>Removes archived journal files until the disk
         space they use falls below the specified size (specified with
         the usual <literal>K</literal>, <literal>M</literal>,
-        <literal>G</literal>, <literal>T</literal> suffixes), or all
-        journal files contain no data older than the specified
+        <literal>G</literal> and <literal>T</literal> suffixes), or all
+        archived journal files contain no data older than the specified
         timespan (specified with the usual <literal>s</literal>,
-        <literal>min</literal>, <literal>h</literal>,
+        <literal>m</literal>, <literal>h</literal>,
         <literal>days</literal>, <literal>months</literal>,
-        <literal>weeks</literal>, <literal>years</literal>
-        suffixes). Note that running <option>--vacuum-size=</option>
-        has only indirect effect on the output shown by
-        <option>--disk-usage</option> as the latter includes active
-        journal files, while the former only operates on archived
-        journal files. <option>--vacuum-size=</option> and
-        <option>--vacuum-time=</option> may be combined in a single
-        invocation to enforce both a size and time limit on the
-        archived journal files.</para></listitem>
+        <literal>weeks</literal> and <literal>years</literal> suffixes),
+        or no more than the specified number of separate journal files
+        remain. Note that running <option>--vacuum-size=</option> has
+        only an indirect effect on the output shown by
+        <option>--disk-usage</option>, as the latter includes active
+        journal files, while the vacuuming operation only operates
+        on archived journal files. Similarly,
+        <option>--vacuum-files=</option> might not actually reduce the
+        number of journal files to below the specified number, as it
+        will not remove active journal
+        files. <option>--vacuum-size=</option>,
+        <option>--vacuum-time=</option> and
+        <option>--vacuum-files=</option> may be combined in a single
+        invocation to enforce any combination of a size, a time and a
+        number of files limit on the archived journal
+        files. Specifying any of these three parameters as zero is
+        equivalent to not enforcing the specific limit, and is thus
+        redundant.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--list-catalog
-        <optional><replaceable>128-bit-ID...</replaceable></optional>
+        <optional><replaceable>128-bit-ID…</replaceable></optional>
         </option></term>
 
         <listitem><para>List the contents of the message catalog as a
@@ -685,7 +773,7 @@
 
       <varlistentry>
         <term><option>--dump-catalog
-        <optional><replaceable>128-bit-ID...</replaceable></optional>
+        <optional><replaceable>128-bit-ID…</replaceable></optional>
         </option></term>
 
         <listitem><para>Show the contents of the message catalog, with
@@ -758,13 +846,39 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--sync</option></term>
+
+        <listitem><para>Asks the journal daemon to write all yet
+        unwritten journal data to the backing file system and
+        synchronize all journals. This call does not return until the
+        synchronization operation is complete. This command guarantees
+        that any log messages written before its invocation are safely
+        stored on disk at the time it returns.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--flush</option></term>
 
-        <listitem><para>Asks the Journal daemon to flush any log data
+        <listitem><para>Asks the journal daemon to flush any log data
         stored in <filename>/run/log/journal</filename> into
-        <filename>/var/log/journal</filename>, if persistent storage is
-        enabled. This call does not return until the operation is
-        complete.</para></listitem>
+        <filename>/var/log/journal</filename>, if persistent storage
+        is enabled. This call does not return until the operation is
+        complete. Note that this call is idempotent: the data is only
+        flushed from <filename>/run/log/journal</filename> into
+        <filename>/var/log/journal</filename> once during system
+        runtime, and this command exits cleanly without executing any
+        operation if this has already happened. This command
+        effectively guarantees that all data is flushed to
+        <filename>/var/log/journal</filename> at the time it
+        returns.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--rotate</option></term>
+
+        <listitem><para>Asks the journal daemon to rotate journal
+        files. This call does not return until the rotation operation
+        is complete.</para></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -836,7 +950,10 @@
       <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+      <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd-journal-remote</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd-journal-upload</refentrytitle><manvolnum>8</manvolnum></citerefentry>
     </para>
   </refsect1>
 </refentry>

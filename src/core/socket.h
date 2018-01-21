@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,28 +21,11 @@
 ***/
 
 typedef struct Socket Socket;
+typedef struct SocketPeer SocketPeer;
 
-#include "socket-util.h"
 #include "mount.h"
 #include "service.h"
-
-typedef enum SocketState {
-        SOCKET_DEAD,
-        SOCKET_START_PRE,
-        SOCKET_START_CHOWN,
-        SOCKET_START_POST,
-        SOCKET_LISTENING,
-        SOCKET_RUNNING,
-        SOCKET_STOP_PRE,
-        SOCKET_STOP_PRE_SIGTERM,
-        SOCKET_STOP_PRE_SIGKILL,
-        SOCKET_STOP_POST,
-        SOCKET_FINAL_SIGTERM,
-        SOCKET_FINAL_SIGKILL,
-        SOCKET_FAILED,
-        _SOCKET_STATE_MAX,
-        _SOCKET_STATE_INVALID = -1
-} SocketState;
+#include "socket-util.h"
 
 typedef enum SocketExecCommand {
         SOCKET_EXEC_START_PRE,
@@ -60,8 +42,9 @@ typedef enum SocketType {
         SOCKET_FIFO,
         SOCKET_SPECIAL,
         SOCKET_MQUEUE,
-        _SOCKET_FIFO_MAX,
-        _SOCKET_FIFO_INVALID = -1
+        SOCKET_USB_FUNCTION,
+        _SOCKET_TYPE_MAX,
+        _SOCKET_TYPE_INVALID = -1
 } SocketType;
 
 typedef enum SocketResult {
@@ -71,7 +54,9 @@ typedef enum SocketResult {
         SOCKET_FAILURE_EXIT_CODE,
         SOCKET_FAILURE_SIGNAL,
         SOCKET_FAILURE_CORE_DUMP,
-        SOCKET_FAILURE_SERVICE_FAILED_PERMANENT,
+        SOCKET_FAILURE_START_LIMIT_HIT,
+        SOCKET_FAILURE_TRIGGER_LIMIT_HIT,
+        SOCKET_FAILURE_SERVICE_START_LIMIT_HIT,
         _SOCKET_RESULT_MAX,
         _SOCKET_RESULT_INVALID = -1
 } SocketResult;
@@ -81,6 +66,8 @@ typedef struct SocketPort {
 
         SocketType type;
         int fd;
+        int *auxiliary_fds;
+        int n_auxiliary_fds;
 
         SocketAddress address;
         char *path;
@@ -94,9 +81,12 @@ struct Socket {
 
         LIST_HEAD(SocketPort, ports);
 
+        Set *peers_by_address;
+
         unsigned n_accepted;
         unsigned n_connections;
         unsigned max_connections;
+        unsigned max_connections_per_source;
 
         unsigned backlog;
         unsigned keep_alive_cnt;
@@ -109,7 +99,9 @@ struct Socket {
         ExecContext exec_context;
         KillContext kill_context;
         CGroupContext cgroup_context;
+
         ExecRuntime *exec_runtime;
+        DynamicCreds dynamic_creds;
 
         /* For Accept=no sockets refers to the one service we'll
         activate. For Accept=yes sockets is either NULL, or filled
@@ -133,6 +125,9 @@ struct Socket {
 
         bool accept;
         bool remove_on_stop;
+        bool writable;
+
+        int socket_protocol;
 
         /* Socket options */
         bool keep_alive;
@@ -167,21 +162,30 @@ struct Socket {
 
         char *user, *group;
 
-        bool reset_cpu_usage:1;
+        char *fdname;
+
+        RateLimit trigger_limit;
 };
 
+SocketPeer *socket_peer_ref(SocketPeer *p);
+SocketPeer *socket_peer_unref(SocketPeer *p);
+int socket_acquire_peer(Socket *s, int fd, SocketPeer **p);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(SocketPeer*, socket_peer_unref);
+
 /* Called from the service code when collecting fds */
-int socket_collect_fds(Socket *s, int **fds, unsigned *n_fds);
+int socket_collect_fds(Socket *s, int **fds);
 
 /* Called from the service code when a per-connection service ended */
 void socket_connection_unref(Socket *s);
 
 void socket_free_ports(Socket *s);
 
-extern const UnitVTable socket_vtable;
+int socket_instantiate_service(Socket *s);
 
-const char* socket_state_to_string(SocketState i) _const_;
-SocketState socket_state_from_string(const char *s) _pure_;
+char *socket_fdname(Socket *s);
+
+extern const UnitVTable socket_vtable;
 
 const char* socket_exec_command_to_string(SocketExecCommand i) _const_;
 SocketExecCommand socket_exec_command_from_string(const char *s) _pure_;
@@ -190,5 +194,4 @@ const char* socket_result_to_string(SocketResult i) _const_;
 SocketResult socket_result_from_string(const char *s) _pure_;
 
 const char* socket_port_type_to_string(SocketPort *p) _pure_;
-
-int socket_instantiate_service(Socket *s);
+SocketType socket_port_type_from_string(const char *p) _pure_;

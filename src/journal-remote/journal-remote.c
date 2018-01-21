@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,31 +20,37 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <getopt.h>
+#include <stdint.h>
 
 #include "sd-daemon.h"
-#include "signal-util.h"
-#include "journal-file.h"
-#include "journald-native.h"
-#include "socket-util.h"
-#include "build.h"
-#include "macro.h"
-#include "strv.h"
-#include "fileio.h"
+
+#include "alloc-util.h"
 #include "conf-parser.h"
-
-#ifdef HAVE_GNUTLS
-#include <gnutls/gnutls.h>
-#endif
-
-#include "journal-remote.h"
+#include "def.h"
+#include "escape.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "journal-file.h"
 #include "journal-remote-write.h"
+#include "journal-remote.h"
+#include "journald-native.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "signal-util.h"
+#include "socket-util.h"
+#include "stat-util.h"
+#include "stdio-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "strv.h"
 
 #define REMOTE_JOURNAL_PATH "/var/log/journal/remote"
 
@@ -64,7 +69,7 @@ static int arg_seal = false;
 static int http_socket = -1, https_socket = -1;
 static char** arg_gnutls_log = NULL;
 
-static JournalWriteSplitMode arg_split_mode = JOURNAL_WRITE_SPLIT_HOST;
+static JournalWriteSplitMode arg_split_mode = _JOURNAL_WRITE_SPLIT_INVALID;
 static char* arg_output = NULL;
 
 static char *arg_key = NULL;
@@ -77,28 +82,20 @@ static bool arg_trust_all = false;
  **********************************************************************/
 
 static int spawn_child(const char* child, char** argv) {
-        int fd[2];
-        pid_t parent_pid, child_pid;
-        int r;
+        pid_t child_pid;
+        int fd[2], r;
 
         if (pipe(fd) < 0)
                 return log_error_errno(errno, "Failed to create pager pipe: %m");
 
-        parent_pid = getpid();
-
-        child_pid = fork();
-        if (child_pid < 0) {
-                r = -errno;
-                log_error_errno(errno, "Failed to fork: %m");
+        r = safe_fork("(remote)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &child_pid);
+        if (r < 0) {
                 safe_close_pair(fd);
                 return r;
         }
 
         /* In the child */
-        if (child_pid == 0) {
-
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
+        if (r == 0) {
 
                 r = dup2(fd[1], STDOUT_FILENO);
                 if (r < 0) {
@@ -108,15 +105,6 @@ static int spawn_child(const char* child, char** argv) {
 
                 safe_close_pair(fd);
 
-                /* Make sure the child goes away when the parent dies */
-                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0)
-                        _exit(EXIT_FAILURE);
-
-                /* Check whether our parent died before we were able
-                 * to set the death signal */
-                if (getppid() != parent_pid)
-                        _exit(EXIT_SUCCESS);
-
                 execvp(child, argv);
                 log_error_errno(errno, "Failed to exec child %s: %m", child);
                 _exit(EXIT_FAILURE);
@@ -125,6 +113,10 @@ static int spawn_child(const char* child, char** argv) {
         r = close(fd[1]);
         if (r < 0)
                 log_warning_errno(errno, "Failed to close write end of pipe: %m");
+
+        r = fd_nonblock(fd[0], true);
+        if (r < 0)
+                log_warning_errno(errno, "Failed to set child pipe to non-blocking: %m");
 
         return fd[0];
 }
@@ -139,26 +131,22 @@ static int spawn_curl(const char* url) {
 
         r = spawn_child("curl", argv);
         if (r < 0)
-                log_error_errno(errno, "Failed to spawn curl: %m");
+                log_error_errno(r, "Failed to spawn curl: %m");
         return r;
 }
 
-static int spawn_getter(const char *getter, const char *url) {
+static int spawn_getter(const char *getter) {
         int r;
         _cleanup_strv_free_ char **words = NULL;
 
         assert(getter);
-        r = strv_split_quoted(&words, getter, 0);
+        r = strv_split_extract(&words, getter, WHITESPACE, EXTRACT_QUOTES);
         if (r < 0)
                 return log_error_errno(r, "Failed to split getter option: %m");
 
-        r = strv_extend(&words, url);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create command line: %m");
-
         r = spawn_child(words[0], words);
         if (r < 0)
-                log_error_errno(errno, "Failed to spawn getter %s: %m", getter);
+                log_error_errno(r, "Failed to spawn getter %s: %m", getter);
 
         return r;
 }
@@ -202,7 +190,7 @@ static int open_output(Writer *w, const char* host) {
                                        O_RDWR|O_CREAT, 0640,
                                        arg_compress, arg_seal,
                                        &w->metrics,
-                                       w->mmap,
+                                       w->mmap, NULL,
                                        NULL, &w->journal);
         if (r < 0)
                 log_error_errno(r, "Failed to open output journal %s: %m",
@@ -298,6 +286,9 @@ static int dispatch_raw_connection_event(sd_event_source *event,
                                          int fd,
                                          uint32_t revents,
                                          void *userdata);
+static int null_timer_event_handler(sd_event_source *s,
+                                uint64_t usec,
+                                void *userdata);
 static int dispatch_http_event(sd_event_source *event,
                                int fd,
                                uint32_t revents,
@@ -416,7 +407,7 @@ static int add_source(RemoteServer *s, int fd, char* name, bool own_name) {
 static int add_raw_socket(RemoteServer *s, int fd) {
         int r;
         _cleanup_close_ int fd_ = fd;
-        char name[sizeof("raw-socket-")-1 + DECIMAL_STR_MAX(int) + 1];
+        char name[STRLEN("raw-socket-") + DECIMAL_STR_MAX(int) + 1];
 
         assert(fd >= 0);
 
@@ -433,14 +424,14 @@ static int add_raw_socket(RemoteServer *s, int fd) {
                 return r;
 
         fd_ = -1;
-        s->active ++;
+        s->active++;
         return 0;
 }
 
 static int setup_raw_socket(RemoteServer *s, const char *address) {
         int fd;
 
-        fd = make_socket_fd(LOG_INFO, address, SOCK_STREAM | SOCK_CLOEXEC);
+        fd = make_socket_fd(LOG_INFO, address, SOCK_STREAM, SOCK_CLOEXEC);
         if (fd < 0)
                 return fd;
 
@@ -511,7 +502,8 @@ static int process_http_upload(
         if (*upload_data_size) {
                 log_trace("Received %zu bytes", *upload_data_size);
 
-                r = push_data(source, upload_data, *upload_data_size);
+                r = journal_importer_push_data(&source->importer,
+                                               upload_data, *upload_data_size);
                 if (r < 0)
                         return mhd_respond_oom(connection);
 
@@ -519,7 +511,7 @@ static int process_http_upload(
         } else
                 finished = true;
 
-        while (true) {
+        for (;;) {
                 r = process_source(source, arg_compress, arg_seal);
                 if (r == -EAGAIN)
                         break;
@@ -527,13 +519,12 @@ static int process_http_upload(
                         log_warning("Failed to process data for connection %p", connection);
                         if (r == -E2BIG)
                                 return mhd_respondf(connection,
-                                                    MHD_HTTP_REQUEST_ENTITY_TOO_LARGE,
-                                                    "Entry is too large, maximum is %u bytes.\n",
-                                                    DATA_SIZE_MAX);
+                                                    r, MHD_HTTP_PAYLOAD_TOO_LARGE,
+                                                    "Entry is too large, maximum is " STRINGIFY(DATA_SIZE_MAX) " bytes.");
                         else
                                 return mhd_respondf(connection,
-                                                    MHD_HTTP_UNPROCESSABLE_ENTITY,
-                                                    "Processing failed: %s.", strerror(-r));
+                                                    r, MHD_HTTP_UNPROCESSABLE_ENTITY,
+                                                    "Processing failed: %m.");
                 }
         }
 
@@ -542,15 +533,16 @@ static int process_http_upload(
 
         /* The upload is finished */
 
-        remaining = source_non_empty(source);
+        remaining = journal_importer_bytes_remaining(&source->importer);
         if (remaining > 0) {
-                log_warning("Premature EOFbyte. %zu bytes lost.", remaining);
-                return mhd_respondf(connection, MHD_HTTP_EXPECTATION_FAILED,
+                log_warning("Premature EOF byte. %zu bytes lost.", remaining);
+                return mhd_respondf(connection,
+                                    0, MHD_HTTP_EXPECTATION_FAILED,
                                     "Premature EOF. %zu bytes of trailing data not processed.",
                                     remaining);
         }
 
-        return mhd_respond(connection, MHD_HTTP_ACCEPTED, "OK.\n");
+        return mhd_respond(connection, MHD_HTTP_ACCEPTED, "OK.");
 };
 
 static int request_handler(
@@ -580,19 +572,16 @@ static int request_handler(
                                            *connection_cls);
 
         if (!streq(method, "POST"))
-                return mhd_respond(connection, MHD_HTTP_METHOD_NOT_ACCEPTABLE,
-                                   "Unsupported method.\n");
+                return mhd_respond(connection, MHD_HTTP_NOT_ACCEPTABLE, "Unsupported method.");
 
         if (!streq(url, "/upload"))
-                return mhd_respond(connection, MHD_HTTP_NOT_FOUND,
-                                   "Not found.\n");
+                return mhd_respond(connection, MHD_HTTP_NOT_FOUND, "Not found.");
 
         header = MHD_lookup_connection_value(connection,
                                              MHD_HEADER_KIND, "Content-Type");
         if (!header || !streq(header, "application/vnd.fdo.journal"))
                 return mhd_respond(connection, MHD_HTTP_UNSUPPORTED_MEDIA_TYPE,
-                                   "Content-Type: application/vnd.fdo.journal"
-                                   " is required.\n");
+                                   "Content-Type: application/vnd.fdo.journal is required.");
 
         {
                 const union MHD_ConnectionInfo *ci;
@@ -602,7 +591,7 @@ static int request_handler(
                 if (!ci) {
                         log_error("MHD_get_connection_info failed: cannot get remote fd");
                         return mhd_respond(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
-                                           "Cannot check remote address");
+                                           "Cannot check remote address.");
                 }
 
                 fd = ci->connect_fd;
@@ -614,11 +603,10 @@ static int request_handler(
                 if (r < 0)
                         return code;
         } else {
-                r = getnameinfo_pretty(fd, &hostname);
-                if (r < 0) {
+                r = getpeername_pretty(fd, false, &hostname);
+                if (r < 0)
                         return mhd_respond(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
-                                           "Cannot check remote hostname");
-                }
+                                           "Cannot check remote hostname.");
         }
 
         assert(hostname);
@@ -627,8 +615,7 @@ static int request_handler(
         if (r == -ENOMEM)
                 return respond_oom(connection);
         else if (r < 0)
-                return mhd_respond(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
-                                   strerror(-r));
+                return mhd_respondf(connection, r, MHD_HTTP_INTERNAL_SERVER_ERROR, "%m");
 
         hostname = NULL;
         return MHD_YES;
@@ -643,16 +630,18 @@ static int setup_microhttpd_server(RemoteServer *s,
                 { MHD_OPTION_NOTIFY_COMPLETED, (intptr_t) request_meta_free},
                 { MHD_OPTION_EXTERNAL_LOGGER, (intptr_t) microhttpd_logger},
                 { MHD_OPTION_LISTEN_SOCKET, fd},
+                { MHD_OPTION_CONNECTION_MEMORY_LIMIT, 128*1024},
+                { MHD_OPTION_END},
                 { MHD_OPTION_END},
                 { MHD_OPTION_END},
                 { MHD_OPTION_END},
                 { MHD_OPTION_END}};
-        int opts_pos = 3;
+        int opts_pos = 4;
         int flags =
                 MHD_USE_DEBUG |
-                MHD_USE_PEDANTIC_CHECKS |
-                MHD_USE_EPOLL_LINUX_ONLY |
-                MHD_USE_DUAL_STACK;
+                MHD_USE_DUAL_STACK |
+                MHD_USE_EPOLL |
+                MHD_USE_ITC;
 
         const union MHD_DaemonInfo *info;
         int r, epoll_fd;
@@ -664,6 +653,20 @@ static int setup_microhttpd_server(RemoteServer *s,
         if (r < 0)
                 return log_error_errno(r, "Failed to make fd:%d nonblocking: %m", fd);
 
+/* MHD_OPTION_STRICT_FOR_CLIENT is introduced in microhttpd 0.9.54,
+ * and MHD_USE_PEDANTIC_CHECKS will be deprecated in future.
+ * If MHD_USE_PEDANTIC_CHECKS is '#define'd, then it is deprecated
+ * and we should use MHD_OPTION_STRICT_FOR_CLIENT. On the other hand,
+ * if MHD_USE_PEDANTIC_CHECKS is not '#define'd, then it is not
+ * deprecated yet and there exists an enum element with the same name.
+ * So we can safely use it. */
+#ifdef MHD_USE_PEDANTIC_CHECKS
+        opts[opts_pos++] = (struct MHD_OptionItem)
+                {MHD_OPTION_STRICT_FOR_CLIENT, 1};
+#else
+        flags |= MHD_USE_PEDANTIC_CHECKS;
+#endif
+
         if (key) {
                 assert(cert);
 
@@ -672,7 +675,7 @@ static int setup_microhttpd_server(RemoteServer *s,
                 opts[opts_pos++] = (struct MHD_OptionItem)
                         {MHD_OPTION_HTTPS_MEM_CERT, 0, (char*) cert};
 
-                flags |= MHD_USE_SSL;
+                flags |= MHD_USE_TLS;
 
                 if (trust)
                         opts[opts_pos++] = (struct MHD_OptionItem)
@@ -714,7 +717,7 @@ static int setup_microhttpd_server(RemoteServer *s,
                 goto error;
         }
 
-        r = sd_event_add_io(s->events, &d->event,
+        r = sd_event_add_io(s->events, &d->io_event,
                             epoll_fd, EPOLLIN,
                             dispatch_http_event, d);
         if (r < 0) {
@@ -722,7 +725,21 @@ static int setup_microhttpd_server(RemoteServer *s,
                 goto error;
         }
 
-        r = sd_event_source_set_description(d->event, "epoll-fd");
+        r = sd_event_source_set_description(d->io_event, "io_event");
+        if (r < 0) {
+                log_error_errno(r, "Failed to set source name: %m");
+                goto error;
+        }
+
+        r = sd_event_add_time(s->events, &d->timer_event,
+                              CLOCK_MONOTONIC, UINT64_MAX, 0,
+                              null_timer_event_handler, d);
+        if (r < 0) {
+                log_error_errno(r, "Failed to add timer_event: %m");
+                goto error;
+        }
+
+        r = sd_event_source_set_description(d->timer_event, "timer_event");
         if (r < 0) {
                 log_error_errno(r, "Failed to set source name: %m");
                 goto error;
@@ -740,7 +757,7 @@ static int setup_microhttpd_server(RemoteServer *s,
                 goto error;
         }
 
-        s->active ++;
+        s->active++;
         return 0;
 
 error:
@@ -757,11 +774,17 @@ static int setup_microhttpd_socket(RemoteServer *s,
                                    const char *trust) {
         int fd;
 
-        fd = make_socket_fd(LOG_DEBUG, address, SOCK_STREAM | SOCK_CLOEXEC);
+        fd = make_socket_fd(LOG_DEBUG, address, SOCK_STREAM, SOCK_CLOEXEC);
         if (fd < 0)
                 return fd;
 
         return setup_microhttpd_server(s, fd, key, cert, trust);
+}
+
+static int null_timer_event_handler(sd_event_source *timer_event,
+                                    uint64_t usec,
+                                    void *userdata) {
+        return dispatch_http_event(timer_event, 0, 0, userdata);
 }
 
 static int dispatch_http_event(sd_event_source *event,
@@ -770,6 +793,7 @@ static int dispatch_http_event(sd_event_source *event,
                                void *userdata) {
         MHDDaemonWrapper *d = userdata;
         int r;
+        MHD_UNSIGNED_LONG_LONG timeout = ULONG_LONG_MAX;
 
         assert(d);
 
@@ -779,6 +803,18 @@ static int dispatch_http_event(sd_event_source *event,
                 // XXX: unregister daemon
                 return -EINVAL;
         }
+        if (MHD_get_timeout(d->daemon, &timeout) == MHD_NO)
+                timeout = ULONG_LONG_MAX;
+
+        r = sd_event_source_set_time(d->timer_event, timeout);
+        if (r < 0) {
+                log_warning_errno(r, "Unable to set event loop timeout: %m, this may result in indefinite blocking!");
+                return 1;
+        }
+
+        r = sd_event_source_set_enabled(d->timer_event, SD_EVENT_ON);
+        if (r < 0)
+                log_warning_errno(r, "Unable to enable timer_event: %m, this may result in indefinite blocking!");
 
         return 1; /* work to do */
 }
@@ -871,7 +907,7 @@ static int remoteserver_init(RemoteServer *s,
                 } else if (sd_is_socket(fd, AF_UNSPEC, 0, false)) {
                         char *hostname;
 
-                        r = getnameinfo_pretty(fd, &hostname);
+                        r = getpeername_pretty(fd, false, &hostname);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to retrieve remote name: %m");
 
@@ -889,18 +925,32 @@ static int remoteserver_init(RemoteServer *s,
                                                fd);
         }
 
+        if (arg_getter) {
+                log_info("Spawning getter %s...", arg_getter);
+                fd = spawn_getter(arg_getter);
+                if (fd < 0)
+                        return fd;
+
+                r = add_source(s, fd, (char*) arg_output, false);
+                if (r < 0)
+                        return r;
+        }
+
         if (arg_url) {
-                const char *url, *hostname;
+                const char *url;
+                char *hostname, *p;
 
-                url = strjoina(arg_url, "/entries");
-
-                if (arg_getter) {
-                        log_info("Spawning getter %s...", url);
-                        fd = spawn_getter(arg_getter, url);
-                } else {
-                        log_info("Spawning curl %s...", url);
-                        fd = spawn_curl(url);
+                if (!strstr(arg_url, "/entries")) {
+                        if (endswith(arg_url, "/"))
+                                url = strjoina(arg_url, "entries");
+                        else
+                                url = strjoina(arg_url, "/entries");
                 }
+                else
+                        url = strdupa(arg_url);
+
+                log_info("Spawning curl %s...", url);
+                fd = spawn_curl(url);
                 if (fd < 0)
                         return fd;
 
@@ -909,7 +959,13 @@ static int remoteserver_init(RemoteServer *s,
                         startswith(arg_url, "http://") ?:
                         arg_url;
 
-                r = add_source(s, fd, (char*) hostname, false);
+                hostname = strdupa(hostname);
+                if ((p = strchr(hostname, '/')))
+                        *p = '\0';
+                if ((p = strchr(hostname, ':')))
+                        *p = '\0';
+
+                r = add_source(s, fd, hostname, false);
                 if (r < 0)
                         return r;
         }
@@ -956,7 +1012,7 @@ static int remoteserver_init(RemoteServer *s,
         }
 
         if (s->active == 0) {
-                log_error("Zarro sources specified");
+                log_error("Zero sources specified");
                 return -EINVAL;
         }
 
@@ -972,17 +1028,17 @@ static int remoteserver_init(RemoteServer *s,
         return 0;
 }
 
+static void MHDDaemonWrapper_free(MHDDaemonWrapper *d) {
+        MHD_stop_daemon(d->daemon);
+        sd_event_source_unref(d->io_event);
+        sd_event_source_unref(d->timer_event);
+        free(d);
+}
+
 static void server_destroy(RemoteServer *s) {
         size_t i;
-        MHDDaemonWrapper *d;
 
-        while ((d = hashmap_steal_first(s->daemons))) {
-                MHD_stop_daemon(d->daemon);
-                sd_event_source_unref(d->event);
-                free(d);
-        }
-
-        hashmap_free(s->daemons);
+        hashmap_free_with_destructor(s->daemons, MHDDaemonWrapper_free);
 
         assert(s->sources_size == 0 || s->sources);
         for (i = 0; i < s->sources_size; i++)
@@ -1018,19 +1074,19 @@ static int handle_raw_source(sd_event_source *event,
 
         assert(fd >= 0 && fd < (ssize_t) s->sources_size);
         source = s->sources[fd];
-        assert(source->fd == fd);
+        assert(source->importer.fd == fd);
 
         r = process_source(source, arg_compress, arg_seal);
-        if (source->state == STATE_EOF) {
+        if (journal_importer_eof(&source->importer)) {
                 size_t remaining;
 
-                log_debug("EOF reached with source fd:%d (%s)",
-                          source->fd, source->name);
+                log_debug("EOF reached with source %s (fd=%d)",
+                          source->importer.name, source->importer.fd);
 
-                remaining = source_non_empty(source);
+                remaining = journal_importer_bytes_remaining(&source->importer);
                 if (remaining > 0)
                         log_notice("Premature EOF. %zu bytes lost.", remaining);
-                remove_source(s, source->fd);
+                remove_source(s, source->importer.fd);
                 log_debug("%zu active sources remaining", s->active);
                 return 0;
         } else if (r == -E2BIG) {
@@ -1054,7 +1110,7 @@ static int dispatch_raw_source_until_block(sd_event_source *event,
         /* Make sure event stays around even if source is destroyed */
         sd_event_source_ref(event);
 
-        r = handle_raw_source(event, source->fd, EPOLLIN, server);
+        r = handle_raw_source(event, source->importer.fd, EPOLLIN, server);
         if (r != 1)
                 /* No more data for now */
                 sd_event_source_set_enabled(event, SD_EVENT_OFF);
@@ -1087,7 +1143,7 @@ static int dispatch_blocking_source_event(sd_event_source *event,
                                           void *userdata) {
         RemoteSource *source = userdata;
 
-        return handle_raw_source(event, source->fd, EPOLLIN, server);
+        return handle_raw_source(event, source->importer.fd, EPOLLIN, server);
 }
 
 static int accept_connection(const char* type, int fd,
@@ -1114,6 +1170,7 @@ static int accept_connection(const char* type, int fd,
 
                 r = socknameinfo_pretty(&addr->sockaddr, addr->size, &b);
                 if (r < 0) {
+                        log_error_errno(r, "Resolving hostname failed: %m");
                         close(fd2);
                         return r;
                 }
@@ -1172,16 +1229,17 @@ static DEFINE_CONFIG_PARSE_ENUM(config_parse_write_split_mode,
 
 static int parse_config(void) {
         const ConfigTableItem items[] = {
+                { "Remote",  "Seal",                   config_parse_bool,             0, &arg_seal       },
                 { "Remote",  "SplitMode",              config_parse_write_split_mode, 0, &arg_split_mode },
                 { "Remote",  "ServerKeyFile",          config_parse_path,             0, &arg_key        },
                 { "Remote",  "ServerCertificateFile",  config_parse_path,             0, &arg_cert       },
                 { "Remote",  "TrustedCertificateFile", config_parse_path,             0, &arg_trust      },
                 {}};
 
-        return config_parse_many(PKGSYSCONFDIR "/journal-remote.conf",
-                                 CONF_DIRS_NULSTR("systemd/journal-remote.conf"),
-                                 "Remote\0", config_item_table_lookup, items,
-                                 false, NULL);
+        return config_parse_many_nulstr(PKGSYSCONFDIR "/journal-remote.conf",
+                                        CONF_PATHS_NULSTR("systemd/journal-remote.conf.d"),
+                                        "Remote\0", config_item_table_lookup, items,
+                                        CONFIG_PARSE_WARN, NULL);
 }
 
 static void help(void) {
@@ -1260,9 +1318,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0 /* done */;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0 /* done */;
+                        return version();
 
                 case ARG_URL:
                         if (arg_url) {
@@ -1351,7 +1407,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (streq(optarg, "all"))
                                 arg_trust_all = true;
                         else {
-#ifdef HAVE_GNUTLS
+#if HAVE_GNUTLS
                                 arg_trust = strdup(optarg);
                                 if (!arg_trust)
                                         return log_oom();
@@ -1409,19 +1465,22 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_GNUTLS_LOG: {
-#ifdef HAVE_GNUTLS
-                        const char *word, *state;
-                        size_t size;
+#if HAVE_GNUTLS
+                        const char* p = optarg;
+                        for (;;) {
+                                _cleanup_free_ char *word = NULL;
 
-                        FOREACH_WORD_SEPARATOR(word, size, optarg, ",", state) {
-                                char *cat;
+                                r = extract_first_word(&p, &word, ",", 0);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to parse --gnutls-log= argument: %m");
 
-                                cat = strndup(word, size);
-                                if (!cat)
+                                if (r == 0)
+                                        break;
+
+                                if (strv_push(&arg_gnutls_log, word) < 0)
                                         return log_oom();
 
-                                if (strv_consume(&arg_gnutls_log, cat) < 0)
-                                        return log_oom();
+                                word = NULL;
                         }
                         break;
 #else
@@ -1456,13 +1515,26 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
                 }
 
+                if (!IN_SET(arg_split_mode, JOURNAL_WRITE_SPLIT_NONE, _JOURNAL_WRITE_SPLIT_INVALID)) {
+                        log_error("For active sources, only --split-mode=none is allowed.");
+                        return -EINVAL;
+                }
+
                 arg_split_mode = JOURNAL_WRITE_SPLIT_NONE;
         }
 
-        if (arg_split_mode == JOURNAL_WRITE_SPLIT_NONE
-            && arg_output && is_dir(arg_output, true) > 0) {
-                log_error("For SplitMode=none, output must be a file.");
-                return -EINVAL;
+        if (arg_split_mode == _JOURNAL_WRITE_SPLIT_INVALID)
+                arg_split_mode = JOURNAL_WRITE_SPLIT_HOST;
+
+        if (arg_split_mode == JOURNAL_WRITE_SPLIT_NONE && arg_output) {
+                if (is_dir(arg_output, true) > 0) {
+                        log_error("For SplitMode=none, output must be a file.");
+                        return -EINVAL;
+                }
+                if (!endswith(arg_output, ".journal")) {
+                        log_error("For SplitMode=none, output file name must end with .journal.");
+                        return -EINVAL;
+                }
         }
 
         if (arg_split_mode == JOURNAL_WRITE_SPLIT_HOST
@@ -1539,10 +1611,10 @@ int main(int argc, char **argv) {
         if (r < 0)
                 log_error_errno(r, "Failed to enable watchdog: %m");
         else
-                log_debug("Watchdog is %s.", r > 0 ? "enabled" : "disabled");
+                log_debug("Watchdog is %sd.", enable_disable(r > 0));
 
         log_debug("%s running as pid "PID_FMT,
-                  program_invocation_short_name, getpid());
+                  program_invocation_short_name, getpid_cached());
         sd_notify(false,
                   "READY=1\n"
                   "STATUS=Processing requests...");

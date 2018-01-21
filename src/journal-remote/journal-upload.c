@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,23 +18,30 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <curl/curl.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 #include "sd-daemon.h"
-#include "log.h"
-#include "util.h"
-#include "build.h"
-#include "fileio.h"
-#include "mkdir.h"
+
+#include "alloc-util.h"
 #include "conf-parser.h"
-#include "sigbus.h"
-#include "formats-util.h"
-#include "signal-util.h"
+#include "def.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "format-util.h"
+#include "glob-util.h"
 #include "journal-upload.h"
+#include "log.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "sigbus.h"
+#include "signal-util.h"
+#include "string-util.h"
+#include "util.h"
 
 #define PRIV_KEY_FILE CERTIFICATE_ROOT "/private/journal-upload.pem"
 #define CERT_FILE     CERTIFICATE_ROOT "/certs/journal-upload.pem"
@@ -71,7 +77,7 @@ static void close_fd_input(Uploader *u);
                                   curl_easy_strerror(code));            \
                         cmd;                                            \
                 }                                                       \
-        } while(0)
+        } while (0)
 
 static size_t output_callback(char *buf,
                               size_t size,
@@ -126,26 +132,31 @@ static int update_cursor_state(Uploader *u) {
 
         r = fopen_temporary(u->state_file, &f, &temp_path);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
                 "LAST_CURSOR=%s\n",
                 u->last_cursor);
 
-        fflush(f);
+        r = fflush_and_check(f);
+        if (r < 0)
+                goto fail;
 
-        if (ferror(f) || rename(temp_path, u->state_file) < 0) {
+        if (rename(temp_path, u->state_file) < 0) {
                 r = -errno;
-                unlink(u->state_file);
-                unlink(temp_path);
+                goto fail;
         }
 
-finish:
-        if (r < 0)
-                log_error_errno(r, "Failed to save state %s: %m", u->state_file);
+        return 0;
 
-        return r;
+fail:
+        if (temp_path)
+                (void) unlink(temp_path);
+
+        (void) unlink(u->state_file);
+
+        return log_error_errno(r, "Failed to save state %s: %m", u->state_file);
 }
 
 static int load_cursor_state(Uploader *u) {
@@ -238,7 +249,7 @@ int start_upload(Uploader *u,
                 easy_setopt(curl, CURLOPT_HTTPHEADER, u->header,
                             LOG_ERR, return -EXFULL);
 
-                if (_unlikely_(log_get_max_level() >= LOG_DEBUG))
+                if (DEBUG_LOGGING)
                         /* enable verbose for easier tracing */
                         easy_setopt(curl, CURLOPT_VERBOSE, 1L, LOG_WARNING, );
 
@@ -429,7 +440,7 @@ static int setup_uploader(Uploader *u, const char *url, const char *state_file) 
         }
 
         if (strchr(host, ':'))
-                u->url = strjoin(proto, url, "/upload", NULL);
+                u->url = strjoin(proto, url, "/upload");
         else {
                 char *t;
                 size_t x;
@@ -439,7 +450,7 @@ static int setup_uploader(Uploader *u, const char *url, const char *state_file) 
                 while (x > 0 && t[x - 1] == '/')
                         t[x - 1] = '\0';
 
-                u->url = strjoin(proto, t, ":" STRINGIFY(DEFAULT_PORT), "/upload", NULL);
+                u->url = strjoin(proto, t, ":" STRINGIFY(DEFAULT_PORT), "/upload");
         }
         if (!u->url)
                 return log_oom();
@@ -453,6 +464,8 @@ static int setup_uploader(Uploader *u, const char *url, const char *state_file) 
         r = setup_signals(u);
         if (r < 0)
                 return log_error_errno(r, "Failed to set up signals: %m");
+
+        (void) sd_watchdog_enabled(false, &u->watchdog_usec);
 
         return load_cursor_state(u);
 }
@@ -485,6 +498,7 @@ static int perform_upload(Uploader *u) {
 
         assert(u);
 
+        u->watchdog_timestamp = now(CLOCK_MONOTONIC);
         code = curl_easy_perform(u->easy);
         if (code) {
                 if (u->error[0])
@@ -515,9 +529,7 @@ static int perform_upload(Uploader *u) {
                 log_debug("Upload finished successfully with code %ld: %s",
                           status, strna(u->answer));
 
-        free(u->last_cursor);
-        u->last_cursor = u->current_cursor;
-        u->current_cursor = NULL;
+        free_and_replace(u->last_cursor, u->current_cursor);
 
         return update_cursor_state(u);
 }
@@ -530,10 +542,10 @@ static int parse_config(void) {
                 { "Upload",  "TrustedCertificateFile", config_parse_path,   0, &arg_trust  },
                 {}};
 
-        return config_parse_many(PKGSYSCONFDIR "/journal-upload.conf",
-                                 CONF_DIRS_NULSTR("systemd/journal-upload.conf"),
-                                 "Upload\0", config_item_table_lookup, items,
-                                 false, NULL);
+        return config_parse_many_nulstr(PKGSYSCONFDIR "/journal-upload.conf",
+                                        CONF_PATHS_NULSTR("systemd/journal-upload.conf.d"),
+                                        "Upload\0", config_item_table_lookup, items,
+                                        CONFIG_PARSE_WARN, NULL);
 }
 
 static void help(void) {
@@ -560,8 +572,6 @@ static void help(void) {
                "     --follow[=BOOL]        Do [not] wait for input\n"
                "     --save-state[=FILE]    Save uploaded cursors (default \n"
                "                            " STATE_FILE ")\n"
-               "  -h --help                 Show this help and exit\n"
-               "     --version              Print version string and exit\n"
                , program_invocation_short_name);
 }
 
@@ -614,9 +624,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0 /* done */;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0 /* done */;
+                        return version();
 
                 case 'u':
                         if (arg_url) {
@@ -803,7 +811,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
 
         log_debug("%s running as pid "PID_FMT,
-                  program_invocation_short_name, getpid());
+                  program_invocation_short_name, getpid_cached());
 
         use_journal = optind >= argc;
         if (use_journal) {
@@ -823,7 +831,7 @@ int main(int argc, char **argv) {
                   "READY=1\n"
                   "STATUS=Processing input...");
 
-        while (true) {
+        for (;;) {
                 r = sd_event_get_state(u.events);
                 if (r < 0)
                         break;

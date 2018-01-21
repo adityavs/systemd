@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,7 +18,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
+/*
+ * Priority Queue
+ * The prioq object implements a priority queue. That is, it orders objects by
+ * their priority and allows O(1) access to the object with the highest
+ * priority. Insertion and removal are Θ(log n). Optionally, the caller can
+ * provide a pointer to an index which will be kept up-to-date by the prioq.
+ *
+ * The underlying algorithm used in this implementation is a Heap.
+ */
+
+#include <errno.h>
+#include <stdlib.h>
+
+#include "alloc-util.h"
+#include "hashmap.h"
 #include "prioq.h"
 
 struct prioq_item {
@@ -50,9 +63,7 @@ Prioq* prioq_free(Prioq *q) {
                 return NULL;
 
         free(q->items);
-        free(q);
-
-        return NULL;
+        return mfree(q);
 }
 
 int prioq_ensure_allocated(Prioq **q, compare_func_t compare_func) {
@@ -101,7 +112,7 @@ static unsigned shuffle_up(Prioq *q, unsigned idx) {
 
                 k = (idx-1)/2;
 
-                if (q->compare_func(q->items[k].data, q->items[idx].data) < 0)
+                if (q->compare_func(q->items[k].data, q->items[idx].data) <= 0)
                         break;
 
                 swap(q, idx, k);

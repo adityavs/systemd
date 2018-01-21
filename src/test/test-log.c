@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -22,9 +21,19 @@
 #include <stddef.h>
 #include <unistd.h>
 
+#include "format-util.h"
 #include "log.h"
+#include "process-util.h"
 #include "util.h"
-#include "formats-util.h"
+
+assert_cc(LOG_REALM_REMOVE_LEVEL(LOG_REALM_PLUS_LEVEL(LOG_REALM_SYSTEMD, LOG_FTP | LOG_DEBUG))
+          == LOG_REALM_SYSTEMD);
+assert_cc(LOG_REALM_REMOVE_LEVEL(LOG_REALM_PLUS_LEVEL(LOG_REALM_UDEV, LOG_LOCAL7 | LOG_DEBUG))
+          == LOG_REALM_UDEV);
+assert_cc((LOG_REALM_PLUS_LEVEL(LOG_REALM_SYSTEMD, LOG_LOCAL3 | LOG_DEBUG) & LOG_FACMASK)
+          == LOG_LOCAL3);
+assert_cc((LOG_REALM_PLUS_LEVEL(LOG_REALM_UDEV, LOG_USER | LOG_INFO) & LOG_PRIMASK)
+          == LOG_INFO);
 
 int main(int argc, char* argv[]) {
 
@@ -32,7 +41,7 @@ int main(int argc, char* argv[]) {
         log_open();
 
         log_struct(LOG_INFO,
-                   "MESSAGE=Waldo PID="PID_FMT, getpid(),
+                   "MESSAGE=Waldo PID="PID_FMT, getpid_cached(),
                    "SERVICE=piepapo",
                    NULL);
 
@@ -40,12 +49,12 @@ int main(int argc, char* argv[]) {
         log_open();
 
         log_struct(LOG_INFO,
-                   "MESSAGE=Foobar PID="PID_FMT, getpid(),
+                   "MESSAGE=Foobar PID="PID_FMT, getpid_cached(),
                    "SERVICE=foobar",
                    NULL);
 
         log_struct(LOG_INFO,
-                   "MESSAGE=Foobar PID="PID_FMT, getpid(),
+                   "MESSAGE=Foobar PID="PID_FMT, getpid_cached(),
                    "FORMAT_STR_TEST=1=%i A=%c 2=%hi 3=%li 4=%lli 1=%p foo=%s 2.5=%g 3.5=%g 4.5=%Lg",
                    (int) 1, 'A', (short) 2, (long int) 3, (long long int) 4, (void*) 1, "foo", (float) 2.5f, (double) 3.5, (long double) 4.5,
                    "SUFFIX=GOT IT",

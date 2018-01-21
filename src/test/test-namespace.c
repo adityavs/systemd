@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,9 +20,12 @@
 
 #include <sys/socket.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "namespace.h"
-#include "util.h"
 #include "process-util.h"
+#include "string-util.h"
+#include "util.h"
 
 static void test_tmpdir(const char *id, const char *A, const char *B) {
         _cleanup_free_ char *a, *b;
@@ -68,8 +70,10 @@ static void test_netns(void) {
         int r, n = 0;
         siginfo_t si;
 
-        if (geteuid() > 0)
-                return;
+        if (geteuid() > 0) {
+                log_info("Skipping test: not root");
+                exit(EXIT_TEST_SKIP);
+        }
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, s) >= 0);
 
@@ -123,17 +127,20 @@ int main(int argc, char *argv[]) {
         char boot_id[SD_ID128_STRING_MAX];
         _cleanup_free_ char *x = NULL, *y = NULL, *z = NULL, *zz = NULL;
 
+        log_parse_environment();
+        log_open();
+
         assert_se(sd_id128_get_boot(&bid) >= 0);
         sd_id128_to_string(bid, boot_id);
 
-        x = strjoin("/tmp/systemd-private-", boot_id, "-abcd.service-", NULL);
-        y = strjoin("/var/tmp/systemd-private-", boot_id, "-abcd.service-", NULL);
+        x = strjoin("/tmp/systemd-private-", boot_id, "-abcd.service-");
+        y = strjoin("/var/tmp/systemd-private-", boot_id, "-abcd.service-");
         assert_se(x && y);
 
         test_tmpdir("abcd.service", x, y);
 
-        z = strjoin("/tmp/systemd-private-", boot_id, "-sys-devices-pci0000:00-0000:00:1a.0-usb3-3\\x2d1-3\\x2d1:1.0-bluetooth-hci0.device-", NULL);
-        zz = strjoin("/var/tmp/systemd-private-", boot_id, "-sys-devices-pci0000:00-0000:00:1a.0-usb3-3\\x2d1-3\\x2d1:1.0-bluetooth-hci0.device-", NULL);
+        z = strjoin("/tmp/systemd-private-", boot_id, "-sys-devices-pci0000:00-0000:00:1a.0-usb3-3\\x2d1-3\\x2d1:1.0-bluetooth-hci0.device-");
+        zz = strjoin("/var/tmp/systemd-private-", boot_id, "-sys-devices-pci0000:00-0000:00:1a.0-usb3-3\\x2d1-3\\x2d1:1.0-bluetooth-hci0.device-");
 
         assert_se(z && zz);
 

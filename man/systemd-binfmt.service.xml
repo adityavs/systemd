@@ -2,6 +2,8 @@
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2012 Lennart Poettering
@@ -54,7 +56,7 @@
   <refsect1>
     <title>Description</title>
 
-    <para><filename>systemd-binfmt.service</filename> is an early-boot
+    <para><filename>systemd-binfmt.service</filename> is an early boot
     service that registers additional binary formats for executables
     in the kernel.</para>
 

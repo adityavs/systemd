@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -24,4 +23,3 @@
 #include "sd-bus.h"
 
 int bus_container_connect_socket(sd_bus *b);
-int bus_container_connect_kernel(sd_bus *b);

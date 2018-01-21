@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -18,13 +19,15 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <stdbool.h>
+#include <stdio.h>
 
-#include "terminal-util.h"
-#include "macro.h"
-#include "util.h"
+#include "fd-util.h"
+#include "fileio.h"
 #include "log.h"
+#include "macro.h"
+#include "terminal-util.h"
+#include "util.h"
 
 static void test_default_term_for_tty(void) {
         puts(default_term_for_tty("/dev/tty23"));
@@ -48,7 +51,7 @@ static void test_read_one_char(void) {
         char name[] = "/tmp/test-read_one_char.XXXXXX";
         int fd;
 
-        fd = mkostemp_safe(name, O_RDWR|O_CLOEXEC);
+        fd = mkostemp_safe(name);
         assert_se(fd >= 0);
         file = fdopen(fd, "r+");
         assert_se(file);

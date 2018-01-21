@@ -1,4 +1,5 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
+/* SPDX-License-Identifier: LGPL-2.1+ */
+#pragma once
 
 /***
   This file is part of systemd.
@@ -20,9 +21,6 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#pragma once
-
 #include "sd-event.h"
 
 int lldp_network_bind_raw_socket(int ifindex);
-int lldp_receive_packet(sd_event_source *s, int fd, uint32_t revents, void *userdata);

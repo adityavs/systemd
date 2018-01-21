@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,8 +21,11 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 
+#include "hash-funcs.h"
 #include "macro.h"
 #include "util.h"
 
@@ -57,7 +59,7 @@ typedef struct Set Set;                       /* Stores just keys */
 typedef struct {
         unsigned idx;         /* index of an entry to be iterated next */
         const void *next_key; /* expected value of that entry's key pointer */
-#ifdef ENABLE_DEBUG_HASHMAP
+#if ENABLE_DEBUG_HASHMAP
         unsigned put_count;   /* hashmap's put_count recorded at start of iteration */
         unsigned rem_count;   /* hashmap's rem_count in previous iteration */
         unsigned prev_idx;    /* idx in previous iteration */
@@ -66,47 +68,6 @@ typedef struct {
 
 #define _IDX_ITERATOR_FIRST (UINT_MAX - 1)
 #define ITERATOR_FIRST ((Iterator) { .idx = _IDX_ITERATOR_FIRST, .next_key = NULL })
-
-typedef unsigned long (*hash_func_t)(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]);
-typedef int (*compare_func_t)(const void *a, const void *b);
-
-struct hash_ops {
-        hash_func_t hash;
-        compare_func_t compare;
-};
-
-unsigned long string_hash_func(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]) _pure_;
-int string_compare_func(const void *a, const void *b) _pure_;
-extern const struct hash_ops string_hash_ops;
-
-/* This will compare the passed pointers directly, and will not
- * dereference them. This is hence not useful for strings or
- * suchlike. */
-unsigned long trivial_hash_func(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]) _pure_;
-int trivial_compare_func(const void *a, const void *b) _const_;
-extern const struct hash_ops trivial_hash_ops;
-
-/* 32bit values we can always just embedd in the pointer itself, but
- * in order to support 32bit archs we need store 64bit values
- * indirectly, since they don't fit in a pointer. */
-unsigned long uint64_hash_func(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]) _pure_;
-int uint64_compare_func(const void *a, const void *b) _pure_;
-extern const struct hash_ops uint64_hash_ops;
-
-/* On some archs dev_t is 32bit, and on others 64bit. And sometimes
- * it's 64bit on 32bit archs, and sometimes 32bit on 64bit archs. Yuck! */
-#if SIZEOF_DEV_T != 8
-unsigned long devt_hash_func(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]) _pure_;
-int devt_compare_func(const void *a, const void *b) _pure_;
-extern const struct hash_ops devt_hash_ops = {
-        .hash = devt_hash_func,
-        .compare = devt_compare_func
-};
-#else
-#define devt_hash_func uint64_hash_func
-#define devt_compare_func uint64_compare_func
-#define devt_hash_ops uint64_hash_ops
-#endif
 
 /* Macros for type checking */
 #define PTR_COMPATIBLE_WITH_HASHMAP_BASE(h) \
@@ -129,7 +90,7 @@ extern const struct hash_ops devt_hash_ops = {
                 (Hashmap*)(h), \
                 (void)0)
 
-#ifdef ENABLE_DEBUG_HASHMAP
+#if ENABLE_DEBUG_HASHMAP
 # define HASHMAP_DEBUG_PARAMS , const char *func, const char *file, int line
 # define HASHMAP_DEBUG_SRC_ARGS   , __func__, __FILE__, __LINE__
 # define HASHMAP_DEBUG_PASS_ARGS   , func, file, line
@@ -367,6 +328,29 @@ static inline void *hashmap_first(Hashmap *h) {
 static inline void *ordered_hashmap_first(OrderedHashmap *h) {
         return internal_hashmap_first(HASHMAP_BASE(h));
 }
+
+#define hashmap_clear_with_destructor(_s, _f)                   \
+        ({                                                      \
+                void *_item;                                    \
+                while ((_item = hashmap_steal_first(_s)))       \
+                        _f(_item);                              \
+        })
+#define hashmap_free_with_destructor(_s, _f)                    \
+        ({                                                      \
+                hashmap_clear_with_destructor(_s, _f);          \
+                hashmap_free(_s);                               \
+        })
+#define ordered_hashmap_clear_with_destructor(_s, _f)                   \
+        ({                                                              \
+                void *_item;                                            \
+                while ((_item = ordered_hashmap_steal_first(_s)))       \
+                        _f(_item);                                      \
+        })
+#define ordered_hashmap_free_with_destructor(_s, _f)                    \
+        ({                                                              \
+                ordered_hashmap_clear_with_destructor(_s, _f);          \
+                ordered_hashmap_free(_s);                               \
+        })
 
 /* no hashmap_next */
 void *ordered_hashmap_next(OrderedHashmap *h, const void *key);

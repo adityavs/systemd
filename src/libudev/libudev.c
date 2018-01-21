@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,16 +18,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <ctype.h>
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
-#include <stdarg.h>
 #include <string.h>
-#include <ctype.h>
 
 #include "libudev.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "libudev-private.h"
 #include "missing.h"
+#include "string-util.h"
 
 /**
  * SECTION:libudev
@@ -90,88 +95,13 @@ _public_ void udev_set_userdata(struct udev *udev, void *userdata) {
  **/
 _public_ struct udev *udev_new(void) {
         struct udev *udev;
-        _cleanup_fclose_ FILE *f = NULL;
 
         udev = new0(struct udev, 1);
-        if (udev == NULL)
+        if (!udev) {
+                errno = ENOMEM;
                 return NULL;
-        udev->refcount = 1;
-
-        f = fopen("/etc/udev/udev.conf", "re");
-        if (f != NULL) {
-                char line[UTIL_LINE_SIZE];
-                unsigned line_nr = 0;
-
-                while (fgets(line, sizeof(line), f)) {
-                        size_t len;
-                        char *key;
-                        char *val;
-
-                        line_nr++;
-
-                        /* find key */
-                        key = line;
-                        while (isspace(key[0]))
-                                key++;
-
-                        /* comment or empty line */
-                        if (key[0] == '#' || key[0] == '\0')
-                                continue;
-
-                        /* split key/value */
-                        val = strchr(key, '=');
-                        if (val == NULL) {
-                                log_debug("/etc/udev/udev.conf:%u: missing assignment,  skipping line.", line_nr);
-                                continue;
-                        }
-                        val[0] = '\0';
-                        val++;
-
-                        /* find value */
-                        while (isspace(val[0]))
-                                val++;
-
-                        /* terminate key */
-                        len = strlen(key);
-                        if (len == 0)
-                                continue;
-                        while (isspace(key[len-1]))
-                                len--;
-                        key[len] = '\0';
-
-                        /* terminate value */
-                        len = strlen(val);
-                        if (len == 0)
-                                continue;
-                        while (isspace(val[len-1]))
-                                len--;
-                        val[len] = '\0';
-
-                        if (len == 0)
-                                continue;
-
-                        /* unquote */
-                        if (val[0] == '"' || val[0] == '\'') {
-                                if (val[len-1] != val[0]) {
-                                        log_debug("/etc/udev/udev.conf:%u: inconsistent quoting, skipping line.", line_nr);
-                                        continue;
-                                }
-                                val[len-1] = '\0';
-                                val++;
-                        }
-
-                        if (streq(key, "udev_log")) {
-                                int prio;
-
-                                prio = util_log_priority(val);
-                                if (prio < 0)
-                                        log_debug("/etc/udev/udev.conf:%u: invalid log level '%s', ignoring.", line_nr, val);
-                                else
-                                        log_set_max_level(prio);
-                                continue;
-                        }
-                }
         }
+        udev->refcount = 1;
 
         return udev;
 }
@@ -206,8 +136,7 @@ _public_ struct udev *udev_unref(struct udev *udev) {
         udev->refcount--;
         if (udev->refcount > 0)
                 return udev;
-        free(udev);
-        return NULL;
+        return mfree(udev);
 }
 
 /**

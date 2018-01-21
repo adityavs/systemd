@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,49 +19,79 @@
 ***/
 
 #include <errno.h>
+#include <pwd.h>
 #include <string.h>
 #include <unistd.h>
-#include <pwd.h>
 
 #include "sd-messages.h"
-#include "strv.h"
+
+#include "alloc-util.h"
+#include "audit-util.h"
+#include "bus-common-errors.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "dirent-util.h"
+#include "efivars.h"
+#include "escape.h"
+#include "fd-util.h"
+#include "fileio-label.h"
+#include "format-util.h"
+#include "fs-util.h"
+#include "logind.h"
 #include "mkdir.h"
 #include "path-util.h"
-#include "special.h"
-#include "sleep-config.h"
-#include "fileio-label.h"
-#include "unit-name.h"
-#include "audit.h"
-#include "bus-util.h"
-#include "bus-error.h"
-#include "bus-common-errors.h"
-#include "udev-util.h"
-#include "selinux-util.h"
-#include "efivars.h"
-#include "logind.h"
-#include "formats-util.h"
 #include "process-util.h"
+#include "selinux-util.h"
+#include "sleep-config.h"
+#include "special.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "udev-util.h"
+#include "unit-name.h"
+#include "user-util.h"
 #include "utmp-wtmp.h"
 
-int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Session **ret) {
-        _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+static int get_sender_session(Manager *m, sd_bus_message *message, sd_bus_error *error, Session **ret) {
+
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        const char *name;
         Session *session;
         int r;
+
+        /* Get client login session.  This is not what you are looking for these days,
+         * as apps may instead belong to a user service unit.  This includes terminal
+         * emulators and hence command-line apps. */
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_SESSION|SD_BUS_CREDS_AUGMENT, &creds);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_creds_get_session(creds, &name);
+        if (r == -ENXIO)
+                goto err_no_session;
+        if (r < 0)
+                return r;
+
+        session = hashmap_get(m->sessions, name);
+        if (!session)
+                goto err_no_session;
+
+        *ret = session;
+        return 0;
+
+err_no_session:
+        return sd_bus_error_setf(error, BUS_ERROR_NO_SESSION_FOR_PID,
+                                 "Caller does not belong to any known session");
+}
+
+int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Session **ret) {
+        Session *session;
 
         assert(m);
         assert(message);
         assert(ret);
 
-        if (isempty(name)) {
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_SESSION|SD_BUS_CREDS_AUGMENT, &creds);
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_creds_get_session(creds, &name);
-                if (r < 0)
-                        return r;
-        }
+        if (isempty(name))
+                return get_sender_session(m, message, error, ret);
 
         session = hashmap_get(m->sessions, name);
         if (!session)
@@ -72,30 +101,48 @@ int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const ch
         return 0;
 }
 
-int manager_get_user_from_creds(Manager *m, sd_bus_message *message, uid_t uid, sd_bus_error *error, User **ret) {
+static int get_sender_user(Manager *m, sd_bus_message *message, sd_bus_error *error, User **ret) {
+
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        uid_t uid;
         User *user;
         int r;
+
+        /* Note that we get the owner UID of the session, not the actual client UID here! */
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_OWNER_UID|SD_BUS_CREDS_AUGMENT, &creds);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_creds_get_owner_uid(creds, &uid);
+        if (r == -ENXIO)
+                goto err_no_user;
+        if (r < 0)
+                return r;
+
+        user = hashmap_get(m->users, UID_TO_PTR(uid));
+        if (!user)
+                goto err_no_user;
+
+        *ret = user;
+        return 0;
+
+err_no_user:
+        return sd_bus_error_setf(error, BUS_ERROR_NO_USER_FOR_PID, "Caller does not belong to any logged in user or lingering user");
+}
+
+int manager_get_user_from_creds(Manager *m, sd_bus_message *message, uid_t uid, sd_bus_error *error, User **ret) {
+        User *user;
 
         assert(m);
         assert(message);
         assert(ret);
 
-        if (uid == UID_INVALID) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
-
-                /* Note that we get the owner UID of the session, not the actual client UID here! */
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_OWNER_UID|SD_BUS_CREDS_AUGMENT, &creds);
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_creds_get_owner_uid(creds, &uid);
-                if (r < 0)
-                        return r;
-        }
+        if (!uid_is_valid(uid))
+                return get_sender_user(m, message, error, ret);
 
         user = hashmap_get(m->users, UID_TO_PTR(uid));
         if (!user)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_USER, "No user "UID_FMT" known or logged in", uid);
+                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_USER, "User ID "UID_FMT" is not logged in or lingering", uid);
 
         *ret = user;
         return 0;
@@ -117,7 +164,6 @@ int manager_get_seat_from_creds(Manager *m, sd_bus_message *message, const char 
                         return r;
 
                 seat = session->seat;
-
                 if (!seat)
                         return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_SEAT, "Session has no seat.");
         } else {
@@ -261,6 +307,42 @@ static int property_get_docked(
         return sd_bus_message_append(reply, "b", manager_is_docked_or_external_displays(m));
 }
 
+static int property_get_current_sessions(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+
+        assert(bus);
+        assert(reply);
+        assert(m);
+
+        return sd_bus_message_append(reply, "t", (uint64_t) hashmap_size(m->sessions));
+}
+
+static int property_get_current_inhibitors(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+
+        assert(bus);
+        assert(reply);
+        assert(m);
+
+        return sd_bus_message_append(reply, "t", (uint64_t) hashmap_size(m->inhibitors));
+}
+
 static int method_get_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_free_ char *p = NULL;
         Manager *m = userdata;
@@ -286,6 +368,9 @@ static int method_get_session(sd_bus_message *message, void *userdata, sd_bus_er
         return sd_bus_reply_method_return(message, "o", p);
 }
 
+/* Get login session of a process.  This is not what you are looking for these days,
+ * as apps may instead belong to a user service unit.  This includes terminal
+ * emulators and hence command-line apps. */
 static int method_get_session_by_pid(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_free_ char *p = NULL;
         Session *session = NULL;
@@ -301,8 +386,10 @@ static int method_get_session_by_pid(sd_bus_message *message, void *userdata, sd
         r = sd_bus_message_read(message, "u", &pid);
         if (r < 0)
                 return r;
+        if (pid < 0)
+                return -EINVAL;
 
-        if (pid <= 0) {
+        if (pid == 0) {
                 r = manager_get_session_from_creds(m, message, NULL, error, &session);
                 if (r < 0)
                         return r;
@@ -362,8 +449,10 @@ static int method_get_user_by_pid(sd_bus_message *message, void *userdata, sd_bu
         r = sd_bus_message_read(message, "u", &pid);
         if (r < 0)
                 return r;
+        if (pid < 0)
+                return -EINVAL;
 
-        if (pid <= 0) {
+        if (pid == 0) {
                 r = manager_get_user_from_creds(m, message, UID_INVALID, error, &user);
                 if (r < 0)
                         return r;
@@ -372,7 +461,9 @@ static int method_get_user_by_pid(sd_bus_message *message, void *userdata, sd_bu
                 if (r < 0)
                         return r;
                 if (!user)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_USER_FOR_PID, "PID "PID_FMT" does not belong to any known or logged in user", pid);
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_USER_FOR_PID,
+                                                 "PID "PID_FMT" does not belong to any logged in user or lingering user",
+                                                 pid);
         }
 
         p = user_bus_path(user);
@@ -408,7 +499,7 @@ static int method_get_seat(sd_bus_message *message, void *userdata, sd_bus_error
 }
 
 static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Session *session;
         Iterator i;
@@ -450,7 +541,7 @@ static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_
 }
 
 static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         User *user;
         Iterator i;
@@ -490,7 +581,7 @@ static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_err
 }
 
 static int method_list_seats(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Seat *seat;
         Iterator i;
@@ -527,7 +618,7 @@ static int method_list_seats(sd_bus_message *message, void *userdata, sd_bus_err
 }
 
 static int method_list_inhibitors(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Inhibitor *inhibitor;
         Iterator i;
@@ -566,12 +657,14 @@ static int method_list_inhibitors(sd_bus_message *message, void *userdata, sd_bu
 
 static int method_create_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         const char *service, *type, *class, *cseat, *tty, *display, *remote_user, *remote_host, *desktop;
-        uint32_t uid, leader, audit_id = 0;
+        uint32_t audit_id = 0;
         _cleanup_free_ char *id = NULL;
         Session *session = NULL;
         Manager *m = userdata;
         User *user = NULL;
         Seat *seat = NULL;
+        pid_t leader;
+        uid_t uid;
         int remote;
         uint32_t vtnr = 0;
         SessionType t;
@@ -581,11 +674,16 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
         assert(message);
         assert(m);
 
+        assert_cc(sizeof(pid_t) == sizeof(uint32_t));
+        assert_cc(sizeof(uid_t) == sizeof(uint32_t));
+
         r = sd_bus_message_read(message, "uusssssussbss", &uid, &leader, &service, &type, &class, &desktop, &cseat, &vtnr, &tty, &display, &remote, &remote_user, &remote_host);
         if (r < 0)
                 return r;
 
-        if (leader == 1)
+        if (!uid_is_valid(uid))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid UID");
+        if (leader < 0 || leader == 1)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid leader PID");
 
         if (isempty(type))
@@ -677,8 +775,8 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                         c = SESSION_USER;
         }
 
-        if (leader <= 0) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+        if (leader == 0) {
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
 
                 r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID, &creds);
                 if (r < 0)
@@ -689,48 +787,32 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                         return r;
         }
 
-        manager_get_session_by_pid(m, leader, &session);
-        if (session) {
-                _cleanup_free_ char *path = NULL;
-                _cleanup_close_ int fifo_fd = -1;
+        r = manager_get_session_by_pid(m, leader, NULL);
+        if (r > 0)
+                return sd_bus_error_setf(error, BUS_ERROR_SESSION_BUSY, "Already running in a session");
 
-                /* Session already exists, client is probably
-                 * something like "su" which changes uid but is still
-                 * the same session */
+        /*
+         * Old gdm and lightdm start the user-session on the same VT as
+         * the greeter session. But they destroy the greeter session
+         * after the user-session and want the user-session to take
+         * over the VT. We need to support this for
+         * backwards-compatibility, so make sure we allow new sessions
+         * on a VT that a greeter is running on. Furthermore, to allow
+         * re-logins, we have to allow a greeter to take over a used VT for
+         * the exact same reasons.
+         */
+        if (c != SESSION_GREETER &&
+            vtnr > 0 &&
+            vtnr < m->seat0->position_count &&
+            m->seat0->positions[vtnr] &&
+            m->seat0->positions[vtnr]->class != SESSION_GREETER)
+                return sd_bus_error_setf(error, BUS_ERROR_SESSION_BUSY, "Already occupied by a session");
 
-                fifo_fd = session_create_fifo(session);
-                if (fifo_fd < 0)
-                        return fifo_fd;
+        if (hashmap_size(m->sessions) >= m->sessions_max)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Maximum number of sessions (%" PRIu64 ") reached, refusing further sessions.", m->sessions_max);
 
-                path = session_bus_path(session);
-                if (!path)
-                        return -ENOMEM;
-
-                log_debug("Sending reply about an existing session: "
-                          "id=%s object_path=%s uid=%u runtime_path=%s "
-                          "session_fd=%d seat=%s vtnr=%u",
-                          session->id,
-                          path,
-                          (uint32_t) session->user->uid,
-                          session->user->runtime_path,
-                          fifo_fd,
-                          session->seat ? session->seat->id : "",
-                          (uint32_t) session->vtnr);
-
-                return sd_bus_reply_method_return(
-                                message, "soshusub",
-                                session->id,
-                                path,
-                                session->user->runtime_path,
-                                fifo_fd,
-                                (uint32_t) session->user->uid,
-                                session->seat ? session->seat->id : "",
-                                (uint32_t) session->vtnr,
-                                true);
-        }
-
-        audit_session_from_pid(leader, &audit_id);
-        if (audit_id > 0) {
+        (void) audit_session_from_pid(leader, &audit_id);
+        if (audit_session_is_valid(audit_id)) {
                 /* Keep our session IDs and the audit session IDs in sync */
 
                 if (asprintf(&id, "%"PRIu32, audit_id) < 0)
@@ -742,17 +824,15 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                  * ID */
                 if (hashmap_get(m->sessions, id)) {
                         log_warning("Existing logind session ID %s used by new audit session, ignoring", id);
-                        audit_id = 0;
+                        audit_id = AUDIT_SESSION_INVALID;
 
-                        free(id);
-                        id = NULL;
+                        id = mfree(id);
                 }
         }
 
         if (!id) {
                 do {
-                        free(id);
-                        id = NULL;
+                        id = mfree(id);
 
                         if (asprintf(&id, "c%lu", ++m->session_counter) < 0)
                                 return -ENOMEM;
@@ -963,6 +1043,7 @@ static int method_lock_sessions(sd_bus_message *message, void *userdata, sd_bus_
                         message,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.login1.lock-sessions",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->polkit_registry,
@@ -1080,13 +1161,13 @@ static int method_terminate_seat(sd_bus_message *message, void *userdata, sd_bus
 }
 
 static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         _cleanup_free_ char *cc = NULL;
         Manager *m = userdata;
-        int b, r;
+        int r, b, interactive;
         struct passwd *pw;
         const char *path;
-        uint32_t uid;
-        int interactive;
+        uint32_t uid, auth_uid;
 
         assert(message);
         assert(m);
@@ -1095,28 +1176,35 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        if (uid == UID_INVALID) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_EUID |
+                                               SD_BUS_CREDS_OWNER_UID|SD_BUS_CREDS_AUGMENT, &creds);
+        if (r < 0)
+                return r;
 
-                /* Note that we get the owner UID of the session, not the actual client UID here! */
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_OWNER_UID|SD_BUS_CREDS_AUGMENT, &creds);
-                if (r < 0)
-                        return r;
-
+        if (!uid_is_valid(uid)) {
+                /* Note that we get the owner UID of the session or user unit,
+                 * not the actual client UID here! */
                 r = sd_bus_creds_get_owner_uid(creds, &uid);
                 if (r < 0)
                         return r;
         }
 
+        /* owner_uid is racy, so for authorization we must use euid */
+        r = sd_bus_creds_get_euid(creds, &auth_uid);
+        if (r < 0)
+                return r;
+
         errno = 0;
         pw = getpwuid(uid);
         if (!pw)
-                return errno ? -errno : -ENOENT;
+                return errno > 0 ? -errno : -ENOENT;
 
         r = bus_verify_polkit_async(
                         message,
                         CAP_SYS_ADMIN,
-                        "org.freedesktop.login1.set-user-linger",
+                        uid == auth_uid ? "org.freedesktop.login1.set-self-linger" :
+                                          "org.freedesktop.login1.set-user-linger",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &m->polkit_registry,
@@ -1128,7 +1216,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
 
         mkdir_p_label("/var/lib/systemd", 0755);
 
-        r = mkdir_safe_label("/var/lib/systemd/linger", 0755, 0, 0);
+        r = mkdir_safe_label("/var/lib/systemd/linger", 0755, 0, 0, false);
         if (r < 0)
                 return r;
 
@@ -1194,7 +1282,7 @@ static int trigger_device(Manager *m, struct udev_device *d) {
                 if (!t)
                         return -ENOMEM;
 
-                write_string_file(t, "change");
+                (void) write_string_file(t, "change", 0);
         }
 
         return 0;
@@ -1228,7 +1316,6 @@ static int attach_device(Manager *m, const char *seat, const char *sysfs) {
                 return -ENOMEM;
 
         mkdir_p_label("/etc/udev/rules.d", 0755);
-        mac_selinux_init("/etc");
         r = write_string_file_atomic_label(file, rule);
         if (r < 0)
                 return r;
@@ -1248,8 +1335,7 @@ static int flush_devices(Manager *m) {
         } else {
                 struct dirent *de;
 
-                while ((de = readdir(d))) {
-
+                FOREACH_DIRENT_ALL(de, d, break) {
                         if (!dirent_is_file(de))
                                 continue;
 
@@ -1289,6 +1375,7 @@ static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_
                         message,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.login1.attach-device",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &m->polkit_registry,
@@ -1320,6 +1407,7 @@ static int method_flush_devices(sd_bus_message *message, void *userdata, sd_bus_
                         message,
                         CAP_SYS_ADMIN,
                         "org.freedesktop.login1.flush-devices",
+                        NULL,
                         interactive,
                         UID_INVALID,
                         &m->polkit_registry,
@@ -1357,7 +1445,6 @@ static int have_multiple_sessions(
 
 static int bus_manager_log_shutdown(
                 Manager *m,
-                InhibitWhat w,
                 const char *unit_name) {
 
         const char *p, *q;
@@ -1365,28 +1452,30 @@ static int bus_manager_log_shutdown(
         assert(m);
         assert(unit_name);
 
-        if (w != INHIBIT_SHUTDOWN)
-                return 0;
-
         if (streq(unit_name, SPECIAL_POWEROFF_TARGET)) {
-                p = "MESSAGE=System is powering down.";
+                p = "MESSAGE=System is powering down";
                 q = "SHUTDOWN=power-off";
-        } else if (streq(unit_name, SPECIAL_HALT_TARGET)) {
-                p = "MESSAGE=System is halting.";
-                q = "SHUTDOWN=halt";
         } else if (streq(unit_name, SPECIAL_REBOOT_TARGET)) {
-                p = "MESSAGE=System is rebooting.";
+                p = "MESSAGE=System is rebooting";
                 q = "SHUTDOWN=reboot";
+        } else if (streq(unit_name, SPECIAL_HALT_TARGET)) {
+                p = "MESSAGE=System is halting";
+                q = "SHUTDOWN=halt";
         } else if (streq(unit_name, SPECIAL_KEXEC_TARGET)) {
-                p = "MESSAGE=System is rebooting with kexec.";
+                p = "MESSAGE=System is rebooting with kexec";
                 q = "SHUTDOWN=kexec";
         } else {
-                p = "MESSAGE=System is shutting down.";
+                p = "MESSAGE=System is shutting down";
                 q = NULL;
         }
 
+        if (isempty(m->wall_message))
+                p = strjoina(p, ".");
+        else
+                p = strjoina(p, " (", m->wall_message, ").");
+
         return log_struct(LOG_NOTICE,
-                          LOG_MESSAGE_ID(SD_MESSAGE_SHUTDOWN),
+                          "MESSAGE_ID=" SD_MESSAGE_SHUTDOWN_STR,
                           p,
                           q,
                           NULL);
@@ -1437,23 +1526,46 @@ int manager_set_lid_switch_ignore(Manager *m, usec_t until) {
         return r;
 }
 
+static int send_prepare_for(Manager *m, InhibitWhat w, bool _active) {
+
+        static const char * const signal_name[_INHIBIT_WHAT_MAX] = {
+                [INHIBIT_SHUTDOWN] = "PrepareForShutdown",
+                [INHIBIT_SLEEP] = "PrepareForSleep"
+        };
+
+        int active = _active;
+
+        assert(m);
+        assert(w >= 0);
+        assert(w < _INHIBIT_WHAT_MAX);
+        assert(signal_name[w]);
+
+        return sd_bus_emit_signal(m->bus,
+                                  "/org/freedesktop/login1",
+                                  "org.freedesktop.login1.Manager",
+                                  signal_name[w],
+                                  "b",
+                                  active);
+}
+
 static int execute_shutdown_or_sleep(
                 Manager *m,
                 InhibitWhat w,
                 const char *unit_name,
                 sd_bus_error *error) {
 
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        char *c = NULL;
         const char *p;
-        char *c;
         int r;
 
         assert(m);
-        assert(w >= 0);
+        assert(w > 0);
         assert(w < _INHIBIT_WHAT_MAX);
         assert(unit_name);
 
-        bus_manager_log_shutdown(m, w, unit_name);
+        if (w == INHIBIT_SHUTDOWN)
+                bus_manager_log_shutdown(m, unit_name);
 
         r = sd_bus_call_method(
                         m->bus,
@@ -1465,15 +1577,17 @@ static int execute_shutdown_or_sleep(
                         &reply,
                         "ss", unit_name, "replace-irreversibly");
         if (r < 0)
-                return r;
+                goto error;
 
         r = sd_bus_message_read(reply, "o", &p);
         if (r < 0)
-                return r;
+                goto error;
 
         c = strdup(p);
-        if (!c)
-                return -ENOMEM;
+        if (!c) {
+                r = -ENOMEM;
+                goto error;
+        }
 
         m->action_unit = unit_name;
         free(m->action_job);
@@ -1484,26 +1598,30 @@ static int execute_shutdown_or_sleep(
         manager_set_lid_switch_ignore(m, now(CLOCK_MONOTONIC) + m->holdoff_timeout_usec);
 
         return 0;
+
+error:
+        /* Tell people that they now may take a lock again */
+        (void) send_prepare_for(m, w, false);
+
+        return r;
 }
 
-static int manager_inhibit_timeout_handler(
-                        sd_event_source *s,
-                        uint64_t usec,
-                        void *userdata) {
+int manager_dispatch_delayed(Manager *manager, bool timeout) {
 
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         Inhibitor *offending = NULL;
-        Manager *manager = userdata;
         int r;
 
         assert(manager);
-        assert(manager->inhibit_timeout_source == s);
 
         if (manager->action_what == 0 || manager->action_job)
                 return 0;
 
         if (manager_is_inhibited(manager, manager->action_what, INHIBIT_DELAY, NULL, false, false, 0, &offending)) {
                 _cleanup_free_ char *comm = NULL, *u = NULL;
+
+                if (!timeout)
+                        return 0;
 
                 (void) get_process_comm(offending->pid, &comm);
                 u = uid_to_name(offending->uid);
@@ -1516,13 +1634,30 @@ static int manager_inhibit_timeout_handler(
         /* Actually do the operation */
         r = execute_shutdown_or_sleep(manager, manager->action_what, manager->action_unit, &error);
         if (r < 0) {
-                log_warning("Failed to send delayed message: %s", bus_error_message(&error, r));
+                log_warning("Error during inhibitor-delayed operation (already returned success to client): %s",
+                            bus_error_message(&error, r));
 
                 manager->action_unit = NULL;
                 manager->action_what = 0;
+                return r;
         }
 
-        return 0;
+        return 1;
+}
+
+static int manager_inhibit_timeout_handler(
+                        sd_event_source *s,
+                        uint64_t usec,
+                        void *userdata) {
+
+        Manager *manager = userdata;
+        int r;
+
+        assert(manager);
+        assert(manager->inhibit_timeout_source == s);
+
+        r = manager_dispatch_delayed(manager, true);
+        return (r < 0) ? r : 0;
 }
 
 static int delay_shutdown_or_sleep(
@@ -1561,28 +1696,6 @@ static int delay_shutdown_or_sleep(
         return 0;
 }
 
-static int send_prepare_for(Manager *m, InhibitWhat w, bool _active) {
-
-        static const char * const signal_name[_INHIBIT_WHAT_MAX] = {
-                [INHIBIT_SHUTDOWN] = "PrepareForShutdown",
-                [INHIBIT_SLEEP] = "PrepareForSleep"
-        };
-
-        int active = _active;
-
-        assert(m);
-        assert(w >= 0);
-        assert(w < _INHIBIT_WHAT_MAX);
-        assert(signal_name[w]);
-
-        return sd_bus_emit_signal(m->bus,
-                                  "/org/freedesktop/login1",
-                                  "org.freedesktop.login1.Manager",
-                                  signal_name[w],
-                                  "b",
-                                  active);
-}
-
 int bus_manager_shutdown_or_sleep_now_or_later(
                 Manager *m,
                 const char *unit_name,
@@ -1594,12 +1707,12 @@ int bus_manager_shutdown_or_sleep_now_or_later(
 
         assert(m);
         assert(unit_name);
-        assert(w >= 0);
+        assert(w > 0);
         assert(w <= _INHIBIT_WHAT_MAX);
         assert(!m->action_job);
 
         /* Tell everybody to prepare for shutdown/sleep */
-        send_prepare_for(m, w, true);
+        (void) send_prepare_for(m, w, true);
 
         delayed =
                 m->inhibit_delay_max > 0 &&
@@ -1627,7 +1740,7 @@ static int verify_shutdown_creds(
                 const char *action_ignore_inhibit,
                 sd_bus_error *error) {
 
-        _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         bool multiple_sessions, blocked;
         uid_t uid;
         int r;
@@ -1653,7 +1766,7 @@ static int verify_shutdown_creds(
         blocked = manager_is_inhibited(m, w, INHIBIT_BLOCK, NULL, false, true, uid, NULL);
 
         if (multiple_sessions && action_multiple_sessions) {
-                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action_multiple_sessions, interactive, UID_INVALID, &m->polkit_registry, error);
+                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action_multiple_sessions, NULL, interactive, UID_INVALID, &m->polkit_registry, error);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1661,7 +1774,7 @@ static int verify_shutdown_creds(
         }
 
         if (blocked && action_ignore_inhibit) {
-                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action_ignore_inhibit, interactive, UID_INVALID, &m->polkit_registry, error);
+                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action_ignore_inhibit, NULL, interactive, UID_INVALID, &m->polkit_registry, error);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1669,7 +1782,7 @@ static int verify_shutdown_creds(
         }
 
         if (!multiple_sessions && !blocked && action) {
-                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action, interactive, UID_INVALID, &m->polkit_registry, error);
+                r = bus_verify_polkit_async(message, CAP_SYS_BOOT, action, NULL, interactive, UID_INVALID, &m->polkit_registry, error);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1755,6 +1868,20 @@ static int method_reboot(sd_bus_message *message, void *userdata, sd_bus_error *
                         error);
 }
 
+static int method_halt(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+
+        return method_do_shutdown_or_sleep(
+                        m, message,
+                        SPECIAL_HALT_TARGET,
+                        INHIBIT_SHUTDOWN,
+                        "org.freedesktop.login1.halt",
+                        "org.freedesktop.login1.halt-multiple-sessions",
+                        "org.freedesktop.login1.halt-ignore-inhibit",
+                        NULL,
+                        error);
+}
+
 static int method_suspend(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
 
@@ -1767,243 +1894,6 @@ static int method_suspend(sd_bus_message *message, void *userdata, sd_bus_error 
                         "org.freedesktop.login1.suspend-ignore-inhibit",
                         "suspend",
                         error);
-}
-
-static int nologin_timeout_handler(
-                        sd_event_source *s,
-                        uint64_t usec,
-                        void *userdata) {
-
-        Manager *m = userdata;
-        int r;
-
-        log_info("Creating /run/nologin, blocking further logins...");
-
-        r = write_string_file_atomic("/run/nologin", "System is going down.");
-        if (r < 0)
-                log_error_errno(r, "Failed to create /run/nologin: %m");
-        else
-                m->unlink_nologin = true;
-
-        return 0;
-}
-
-static int update_schedule_file(Manager *m) {
-
-        int r;
-        _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_free_ char *t = NULL, *temp_path = NULL;
-
-        assert(m);
-
-        r = mkdir_safe_label("/run/systemd/shutdown", 0755, 0, 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create shutdown subdirectory: %m");
-
-        t = cescape(m->wall_message);
-        if (!t)
-                return log_oom();
-
-        r = fopen_temporary("/run/systemd/shutdown/scheduled", &f, &temp_path);
-        if (r < 0)
-                return log_error_errno(r, "Failed to save information about scheduled shutdowns: %m");
-
-        (void) fchmod(fileno(f), 0644);
-
-        fprintf(f,
-                "USEC="USEC_FMT"\n"
-                "WARN_WALL=%i\n"
-                "MODE=%s\n",
-                m->scheduled_shutdown_timeout,
-                m->enable_wall_messages,
-                m->scheduled_shutdown_type);
-
-        if (!isempty(m->wall_message))
-                fprintf(f, "WALL_MESSAGE=%s\n", t);
-
-        (void) fflush_and_check(f);
-
-        if (ferror(f) || rename(temp_path, "/run/systemd/shutdown/scheduled") < 0) {
-                log_error_errno(errno, "Failed to write information about scheduled shutdowns: %m");
-                r = -errno;
-
-                (void) unlink(temp_path);
-                (void) unlink("/run/systemd/shutdown/scheduled");
-        }
-
-        return r;
-}
-
-static int manager_scheduled_shutdown_handler(
-                        sd_event_source *s,
-                        uint64_t usec,
-                        void *userdata) {
-
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        Manager *m = userdata;
-        const char *target;
-        int r;
-
-        assert(m);
-
-        if (isempty(m->scheduled_shutdown_type))
-                return 0;
-
-        if (streq(m->scheduled_shutdown_type, "halt"))
-                target = SPECIAL_HALT_TARGET;
-        else if (streq(m->scheduled_shutdown_type, "poweroff"))
-                target = SPECIAL_POWEROFF_TARGET;
-        else
-                target = SPECIAL_REBOOT_TARGET;
-
-        r = execute_shutdown_or_sleep(m, 0, target, &error);
-        if (r < 0)
-                return log_error_errno(r, "Unable to execute transition to %s: %m", target);
-
-        return 0;
-}
-
-static int method_schedule_shutdown(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Manager *m = userdata;
-        _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
-        const char *action_multiple_sessions = NULL;
-        const char *action_ignore_inhibit = NULL;
-        const char *action = NULL;
-        uint64_t elapse;
-        char *type;
-        int r;
-
-        assert(m);
-        assert(message);
-
-        r = sd_bus_message_read(message, "st", &type, &elapse);
-        if (r < 0)
-                return r;
-
-        if (streq(type, "reboot")) {
-                action = "org.freedesktop.login1.reboot";
-                action_multiple_sessions = "org.freedesktop.login1.reboot-multiple-sessions";
-                action_ignore_inhibit = "org.freedesktop.login1.reboot-ignore-inhibit";
-        } else if (streq(type, "halt")) {
-                action = "org.freedesktop.login1.halt";
-                action_multiple_sessions = "org.freedesktop.login1.halt-multiple-sessions";
-                action_ignore_inhibit = "org.freedesktop.login1.halt-ignore-inhibit";
-        } else if (streq(type, "poweroff")) {
-                action = "org.freedesktop.login1.poweroff";
-                action_multiple_sessions = "org.freedesktop.login1.poweroff-multiple-sessions";
-                action_ignore_inhibit = "org.freedesktop.login1.poweroff-ignore-inhibit";
-        } else
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unsupported shutdown type");
-
-        r = verify_shutdown_creds(m, message, INHIBIT_SHUTDOWN, false,
-                                  action, action_multiple_sessions, action_ignore_inhibit, error);
-        if (r != 0)
-                return r;
-
-        if (m->scheduled_shutdown_timeout_source) {
-                r = sd_event_source_set_time(m->scheduled_shutdown_timeout_source, elapse);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_source_set_time() failed: %m");
-
-                r = sd_event_source_set_enabled(m->scheduled_shutdown_timeout_source, SD_EVENT_ONESHOT);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_source_set_enabled() failed: %m");
-        } else {
-                r = sd_event_add_time(m->event, &m->scheduled_shutdown_timeout_source,
-                                      CLOCK_REALTIME, elapse, 0, manager_scheduled_shutdown_handler, m);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_add_time() failed: %m");
-        }
-
-        r = free_and_strdup(&m->scheduled_shutdown_type, type);
-        if (r < 0) {
-                m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
-                return log_oom();
-        }
-
-        if (m->nologin_timeout_source) {
-                r = sd_event_source_set_time(m->nologin_timeout_source, elapse);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_source_set_time() failed: %m");
-
-                r = sd_event_source_set_enabled(m->nologin_timeout_source, SD_EVENT_ONESHOT);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_source_set_enabled() failed: %m");
-        } else {
-                r = sd_event_add_time(m->event, &m->nologin_timeout_source,
-                                      CLOCK_REALTIME, elapse - 5 * USEC_PER_MINUTE, 0, nologin_timeout_handler, m);
-                if (r < 0)
-                        return log_error_errno(r, "sd_event_add_time() failed: %m");
-        }
-
-        m->scheduled_shutdown_timeout = elapse;
-
-        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_AUGMENT|SD_BUS_CREDS_TTY|SD_BUS_CREDS_UID, &creds);
-        if (r >= 0) {
-                const char *tty;
-
-                (void) sd_bus_creds_get_uid(creds, &m->scheduled_shutdown_uid);
-                (void) sd_bus_creds_get_tty(creds, &tty);
-
-                r = free_and_strdup(&m->scheduled_shutdown_tty, tty);
-                if (r < 0) {
-                        m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
-                        return log_oom();
-                }
-        }
-
-        r = manager_setup_wall_message_timer(m);
-        if (r < 0)
-                return r;
-
-        if (!isempty(type)) {
-                r = update_schedule_file(m);
-                if (r < 0)
-                        return r;
-        } else
-                (void) unlink("/run/systemd/shutdown/scheduled");
-
-        return sd_bus_reply_method_return(message, NULL);
-}
-
-static int method_cancel_scheduled_shutdown(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Manager *m = userdata;
-        bool cancelled;
-
-        assert(m);
-        assert(message);
-
-        cancelled = m->scheduled_shutdown_type != NULL;
-
-        m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
-        m->wall_message_timeout_source = sd_event_source_unref(m->wall_message_timeout_source);
-        m->nologin_timeout_source = sd_event_source_unref(m->nologin_timeout_source);
-        free(m->scheduled_shutdown_type);
-        m->scheduled_shutdown_type = NULL;
-        m->scheduled_shutdown_timeout = 0;
-
-        if (m->unlink_nologin) {
-                (void) unlink("/run/nologin");
-                m->unlink_nologin = false;
-        }
-
-        if (cancelled) {
-                _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
-                const char *tty = NULL;
-                uid_t uid = 0;
-                int r;
-
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_AUGMENT|SD_BUS_CREDS_TTY|SD_BUS_CREDS_UID, &creds);
-                if (r >= 0) {
-                        (void) sd_bus_creds_get_uid(creds, &uid);
-                        (void) sd_bus_creds_get_tty(creds, &tty);
-                }
-
-                utmp_wall("The system shutdown has been cancelled",
-                          lookup_uid(uid), tty, logind_wall_tty_filter, m);
-        }
-
-        return sd_bus_reply_method_return(message, "b", cancelled);
 }
 
 static int method_hibernate(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -2034,6 +1924,293 @@ static int method_hybrid_sleep(sd_bus_message *message, void *userdata, sd_bus_e
                         error);
 }
 
+static int nologin_timeout_handler(
+                        sd_event_source *s,
+                        uint64_t usec,
+                        void *userdata) {
+
+        Manager *m = userdata;
+        int r;
+
+        log_info("Creating /run/nologin, blocking further logins...");
+
+        r = write_string_file_atomic_label("/run/nologin", "System is going down.");
+        if (r < 0)
+                log_error_errno(r, "Failed to create /run/nologin: %m");
+        else
+                m->unlink_nologin = true;
+
+        return 0;
+}
+
+static int update_schedule_file(Manager *m) {
+        _cleanup_free_ char *temp_path = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        int r;
+
+        assert(m);
+
+        r = mkdir_safe_label("/run/systemd/shutdown", 0755, 0, 0, false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create shutdown subdirectory: %m");
+
+        r = fopen_temporary("/run/systemd/shutdown/scheduled", &f, &temp_path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to save information about scheduled shutdowns: %m");
+
+        (void) fchmod(fileno(f), 0644);
+
+        fprintf(f,
+                "USEC="USEC_FMT"\n"
+                "WARN_WALL=%i\n"
+                "MODE=%s\n",
+                m->scheduled_shutdown_timeout,
+                m->enable_wall_messages,
+                m->scheduled_shutdown_type);
+
+        if (!isempty(m->wall_message)) {
+                _cleanup_free_ char *t;
+
+                t = cescape(m->wall_message);
+                if (!t) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
+
+                fprintf(f, "WALL_MESSAGE=%s\n", t);
+        }
+
+        r = fflush_and_check(f);
+        if (r < 0)
+                goto fail;
+
+        if (rename(temp_path, "/run/systemd/shutdown/scheduled") < 0) {
+                r = -errno;
+                goto fail;
+        }
+
+        return 0;
+
+fail:
+        (void) unlink(temp_path);
+        (void) unlink("/run/systemd/shutdown/scheduled");
+
+        return log_error_errno(r, "Failed to write information about scheduled shutdowns: %m");
+}
+
+static void reset_scheduled_shutdown(Manager *m) {
+        assert(m);
+
+        m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
+        m->wall_message_timeout_source = sd_event_source_unref(m->wall_message_timeout_source);
+        m->nologin_timeout_source = sd_event_source_unref(m->nologin_timeout_source);
+
+        m->scheduled_shutdown_type = mfree(m->scheduled_shutdown_type);
+        m->scheduled_shutdown_timeout = 0;
+        m->shutdown_dry_run = false;
+
+        if (m->unlink_nologin) {
+                (void) unlink("/run/nologin");
+                m->unlink_nologin = false;
+        }
+
+        (void) unlink("/run/systemd/shutdown/scheduled");
+}
+
+static int manager_scheduled_shutdown_handler(
+                        sd_event_source *s,
+                        uint64_t usec,
+                        void *userdata) {
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        Manager *m = userdata;
+        const char *target;
+        int r;
+
+        assert(m);
+
+        if (isempty(m->scheduled_shutdown_type))
+                return 0;
+
+        if (streq(m->scheduled_shutdown_type, "poweroff"))
+                target = SPECIAL_POWEROFF_TARGET;
+        else if (streq(m->scheduled_shutdown_type, "reboot"))
+                target = SPECIAL_REBOOT_TARGET;
+        else if (streq(m->scheduled_shutdown_type, "halt"))
+                target = SPECIAL_HALT_TARGET;
+        else
+                assert_not_reached("unexpected shutdown type");
+
+        /* Don't allow multiple jobs being executed at the same time */
+        if (m->action_what) {
+                r = -EALREADY;
+                log_error("Scheduled shutdown to %s failed: shutdown or sleep operation already in progress", target);
+                goto error;
+        }
+
+        if (m->shutdown_dry_run) {
+                /* We do not process delay inhibitors here.  Otherwise, we
+                 * would have to be considered "in progress" (like the check
+                 * above) for some seconds after our admin has seen the final
+                 * wall message. */
+
+                bus_manager_log_shutdown(m, target);
+                log_info("Running in dry run, suppressing action.");
+                reset_scheduled_shutdown(m);
+
+                return 0;
+        }
+
+        r = bus_manager_shutdown_or_sleep_now_or_later(m, target, INHIBIT_SHUTDOWN, &error);
+        if (r < 0) {
+                log_error_errno(r, "Scheduled shutdown to %s failed: %m", target);
+                goto error;
+        }
+
+        return 0;
+
+error:
+        reset_scheduled_shutdown(m);
+        return r;
+}
+
+static int method_schedule_shutdown(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        const char *action_multiple_sessions = NULL;
+        const char *action_ignore_inhibit = NULL;
+        const char *action = NULL;
+        uint64_t elapse;
+        char *type;
+        int r;
+        bool dry_run = false;
+
+        assert(m);
+        assert(message);
+
+        r = sd_bus_message_read(message, "st", &type, &elapse);
+        if (r < 0)
+                return r;
+
+        if (startswith(type, "dry-")) {
+                type += 4;
+                dry_run = true;
+        }
+
+        if (streq(type, "poweroff")) {
+                action = "org.freedesktop.login1.power-off";
+                action_multiple_sessions = "org.freedesktop.login1.power-off-multiple-sessions";
+                action_ignore_inhibit = "org.freedesktop.login1.power-off-ignore-inhibit";
+        } else if (streq(type, "reboot")) {
+                action = "org.freedesktop.login1.reboot";
+                action_multiple_sessions = "org.freedesktop.login1.reboot-multiple-sessions";
+                action_ignore_inhibit = "org.freedesktop.login1.reboot-ignore-inhibit";
+        } else if (streq(type, "halt")) {
+                action = "org.freedesktop.login1.halt";
+                action_multiple_sessions = "org.freedesktop.login1.halt-multiple-sessions";
+                action_ignore_inhibit = "org.freedesktop.login1.halt-ignore-inhibit";
+        } else
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unsupported shutdown type");
+
+        r = verify_shutdown_creds(m, message, INHIBIT_SHUTDOWN, false,
+                                  action, action_multiple_sessions, action_ignore_inhibit, error);
+        if (r != 0)
+                return r;
+
+        if (m->scheduled_shutdown_timeout_source) {
+                r = sd_event_source_set_time(m->scheduled_shutdown_timeout_source, elapse);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_source_set_time() failed: %m");
+
+                r = sd_event_source_set_enabled(m->scheduled_shutdown_timeout_source, SD_EVENT_ONESHOT);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_source_set_enabled() failed: %m");
+        } else {
+                r = sd_event_add_time(m->event, &m->scheduled_shutdown_timeout_source,
+                                      CLOCK_REALTIME, elapse, 0, manager_scheduled_shutdown_handler, m);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_add_time() failed: %m");
+        }
+
+        r = free_and_strdup(&m->scheduled_shutdown_type, type);
+        if (r < 0) {
+                m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
+                return log_oom();
+        }
+
+        m->shutdown_dry_run = dry_run;
+
+        if (m->nologin_timeout_source) {
+                r = sd_event_source_set_time(m->nologin_timeout_source, elapse);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_source_set_time() failed: %m");
+
+                r = sd_event_source_set_enabled(m->nologin_timeout_source, SD_EVENT_ONESHOT);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_source_set_enabled() failed: %m");
+        } else {
+                r = sd_event_add_time(m->event, &m->nologin_timeout_source,
+                                      CLOCK_REALTIME, elapse - 5 * USEC_PER_MINUTE, 0, nologin_timeout_handler, m);
+                if (r < 0)
+                        return log_error_errno(r, "sd_event_add_time() failed: %m");
+        }
+
+        m->scheduled_shutdown_timeout = elapse;
+
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_AUGMENT|SD_BUS_CREDS_TTY|SD_BUS_CREDS_UID, &creds);
+        if (r >= 0) {
+                const char *tty = NULL;
+
+                (void) sd_bus_creds_get_uid(creds, &m->scheduled_shutdown_uid);
+                (void) sd_bus_creds_get_tty(creds, &tty);
+
+                r = free_and_strdup(&m->scheduled_shutdown_tty, tty);
+                if (r < 0) {
+                        m->scheduled_shutdown_timeout_source = sd_event_source_unref(m->scheduled_shutdown_timeout_source);
+                        return log_oom();
+                }
+        }
+
+        r = manager_setup_wall_message_timer(m);
+        if (r < 0)
+                return r;
+
+        r = update_schedule_file(m);
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+static int method_cancel_scheduled_shutdown(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        bool cancelled;
+
+        assert(m);
+        assert(message);
+
+        cancelled = m->scheduled_shutdown_type != NULL;
+        reset_scheduled_shutdown(m);
+
+        if (cancelled) {
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+                const char *tty = NULL;
+                uid_t uid = 0;
+                int r;
+
+                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_AUGMENT|SD_BUS_CREDS_TTY|SD_BUS_CREDS_UID, &creds);
+                if (r >= 0) {
+                        (void) sd_bus_creds_get_uid(creds, &uid);
+                        (void) sd_bus_creds_get_tty(creds, &tty);
+                }
+
+                utmp_wall("The system shutdown has been cancelled",
+                          uid_to_name(uid), tty, logind_wall_tty_filter, m);
+        }
+
+        return sd_bus_reply_method_return(message, "b", cancelled);
+}
+
 static int method_can_shutdown_or_sleep(
                 Manager *m,
                 sd_bus_message *message,
@@ -2044,7 +2221,7 @@ static int method_can_shutdown_or_sleep(
                 const char *sleep_verb,
                 sd_bus_error *error) {
 
-        _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         bool multiple_sessions, challenge, blocked;
         const char *result = NULL;
         uid_t uid;
@@ -2082,7 +2259,7 @@ static int method_can_shutdown_or_sleep(
         blocked = manager_is_inhibited(m, w, INHIBIT_BLOCK, NULL, false, true, uid, NULL);
 
         if (multiple_sessions) {
-                r = bus_test_polkit(message, CAP_SYS_BOOT, action_multiple_sessions, UID_INVALID, &challenge, error);
+                r = bus_test_polkit(message, CAP_SYS_BOOT, action_multiple_sessions, NULL, UID_INVALID, &challenge, error);
                 if (r < 0)
                         return r;
 
@@ -2095,7 +2272,7 @@ static int method_can_shutdown_or_sleep(
         }
 
         if (blocked) {
-                r = bus_test_polkit(message, CAP_SYS_BOOT, action_ignore_inhibit, UID_INVALID, &challenge, error);
+                r = bus_test_polkit(message, CAP_SYS_BOOT, action_ignore_inhibit, NULL, UID_INVALID, &challenge, error);
                 if (r < 0)
                         return r;
 
@@ -2111,7 +2288,7 @@ static int method_can_shutdown_or_sleep(
                 /* If neither inhibit nor multiple sessions
                  * apply then just check the normal policy */
 
-                r = bus_test_polkit(message, CAP_SYS_BOOT, action, UID_INVALID, &challenge, error);
+                r = bus_test_polkit(message, CAP_SYS_BOOT, action, NULL, UID_INVALID, &challenge, error);
                 if (r < 0)
                         return r;
 
@@ -2148,6 +2325,19 @@ static int method_can_reboot(sd_bus_message *message, void *userdata, sd_bus_err
                         "org.freedesktop.login1.reboot",
                         "org.freedesktop.login1.reboot-multiple-sessions",
                         "org.freedesktop.login1.reboot-ignore-inhibit",
+                        NULL,
+                        error);
+}
+
+static int method_can_halt(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+
+        return method_can_shutdown_or_sleep(
+                        m, message,
+                        INHIBIT_SHUTDOWN,
+                        "org.freedesktop.login1.halt",
+                        "org.freedesktop.login1.halt-multiple-sessions",
+                        "org.freedesktop.login1.halt-ignore-inhibit",
                         NULL,
                         error);
 }
@@ -2207,7 +2397,7 @@ static int property_get_reboot_to_firmware_setup(
 
         r = efi_get_reboot_to_firmware();
         if (r < 0 && r != -EOPNOTSUPP)
-                return r;
+                log_warning_errno(r, "Failed to determine reboot-to-firmware state: %m");
 
         return sd_bus_message_append(reply, "b", r > 0);
 }
@@ -2230,6 +2420,7 @@ static int method_set_reboot_to_firmware_setup(
         r = bus_verify_polkit_async(message,
                                     CAP_SYS_ADMIN,
                                     "org.freedesktop.login1.set-reboot-to-firmware-setup",
+                                    NULL,
                                     false,
                                     UID_INVALID,
                                     &m->polkit_registry,
@@ -2260,14 +2451,17 @@ static int method_can_reboot_to_firmware_setup(
         assert(m);
 
         r = efi_reboot_to_firmware_supported();
-        if (r == -EOPNOTSUPP)
+        if (r < 0) {
+                if (r != -EOPNOTSUPP)
+                        log_warning_errno(errno, "Failed to determine whether reboot to firmware is supported: %m");
+
                 return sd_bus_reply_method_return(message, "s", "na");
-        else if (r < 0)
-                return r;
+        }
 
         r = bus_test_polkit(message,
                             CAP_SYS_ADMIN,
                             "org.freedesktop.login1.set-reboot-to-firmware-setup",
+                            NULL,
                             UID_INVALID,
                             &challenge,
                             error);
@@ -2284,8 +2478,47 @@ static int method_can_reboot_to_firmware_setup(
         return sd_bus_reply_method_return(message, "s", result);
 }
 
+static int method_set_wall_message(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        int r;
+        Manager *m = userdata;
+        char *wall_message;
+        int enable_wall_messages;
+
+        assert(message);
+        assert(m);
+
+        r = sd_bus_message_read(message, "sb", &wall_message, &enable_wall_messages);
+        if (r < 0)
+                return r;
+
+        r = bus_verify_polkit_async(message,
+                                    CAP_SYS_ADMIN,
+                                    "org.freedesktop.login1.set-wall-message",
+                                    NULL,
+                                    false,
+                                    UID_INVALID,
+                                    &m->polkit_registry,
+                                    error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        r = free_and_strdup(&m->wall_message, empty_to_null(wall_message));
+        if (r < 0)
+                return log_oom();
+
+        m->enable_wall_messages = enable_wall_messages;
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
 static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_bus_creds_unref_ sd_bus_creds *creds = NULL;
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         const char *who, *why, *what, *mode;
         _cleanup_free_ char *id = NULL;
         _cleanup_close_ int fifo_fd = -1;
@@ -2333,6 +2566,7 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
                         w == INHIBIT_HANDLE_SUSPEND_KEY   ? "org.freedesktop.login1.inhibit-handle-suspend-key" :
                         w == INHIBIT_HANDLE_HIBERNATE_KEY ? "org.freedesktop.login1.inhibit-handle-hibernate-key" :
                                                             "org.freedesktop.login1.inhibit-handle-lid-switch",
+                        NULL,
                         false,
                         UID_INVALID,
                         &m->polkit_registry,
@@ -2354,9 +2588,11 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
         if (r < 0)
                 return r;
 
+        if (hashmap_size(m->inhibitors) >= m->inhibitors_max)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Maximum number of inhibitors (%" PRIu64 ") reached, refusing further inhibitors.", m->inhibitors_max);
+
         do {
-                free(id);
-                id = NULL;
+                id = mfree(id);
 
                 if (asprintf(&id, "%lu", ++m->inhibit_counter) < 0)
                         return -ENOMEM;
@@ -2425,6 +2661,13 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_PROPERTY("PreparingForSleep", "b", property_get_preparing, 0, 0),
         SD_BUS_PROPERTY("ScheduledShutdown", "(st)", property_get_scheduled_shutdown, 0, 0),
         SD_BUS_PROPERTY("Docked", "b", property_get_docked, 0, 0),
+        SD_BUS_PROPERTY("RemoveIPC", "b", bus_property_get_bool, offsetof(Manager, remove_ipc), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RuntimeDirectorySize", "t", bus_property_get_size, offsetof(Manager, runtime_dir_size), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("InhibitorsMax", "t", NULL, offsetof(Manager, inhibitors_max), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("NCurrentInhibitors", "t", property_get_current_inhibitors, 0, 0),
+        SD_BUS_PROPERTY("SessionsMax", "t", NULL, offsetof(Manager, sessions_max), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("NCurrentSessions", "t", property_get_current_sessions, 0, 0),
+        SD_BUS_PROPERTY("UserTasksMax", "t", NULL, offsetof(Manager, user_tasks_max), SD_BUS_VTABLE_PROPERTY_CONST),
 
         SD_BUS_METHOD("GetSession", "s", "o", method_get_session, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetSessionByPID", "u", "o", method_get_session_by_pid, SD_BUS_VTABLE_UNPRIVILEGED),
@@ -2453,19 +2696,22 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_METHOD("FlushDevices", "b", NULL, method_flush_devices, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("PowerOff", "b", NULL, method_poweroff, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Reboot", "b", NULL, method_reboot, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Halt", "b", NULL, method_halt, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Suspend", "b", NULL, method_suspend, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ScheduleShutdown", "st", NULL, method_schedule_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CancelScheduledShutdown", NULL, "b", method_cancel_scheduled_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Hibernate", "b", NULL, method_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("HybridSleep", "b", NULL, method_hybrid_sleep, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanPowerOff", NULL, "s", method_can_poweroff, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanReboot", NULL, "s", method_can_reboot, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("CanHalt", NULL, "s", method_can_halt, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanSuspend", NULL, "s", method_can_suspend, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanHibernate", NULL, "s", method_can_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanHybridSleep", NULL, "s", method_can_hybrid_sleep, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ScheduleShutdown", "st", NULL, method_schedule_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("CancelScheduledShutdown", NULL, "b", method_cancel_scheduled_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Inhibit", "ssss", "h", method_inhibit, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CanRebootToFirmwareSetup", NULL, "s", method_can_reboot_to_firmware_setup, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("SetRebootToFirmwareSetup", "b", NULL, method_set_reboot_to_firmware_setup, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("SetWallMessage", "sb", NULL, method_set_wall_message, SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_SIGNAL("SessionNew", "so", 0),
         SD_BUS_SIGNAL("SessionRemoved", "so", 0),
@@ -2491,7 +2737,7 @@ static int session_jobs_reply(Session *s, const char *unit, const char *result) 
         if (streq(result, "done"))
                 r = session_send_create_reply(s, NULL);
         else {
-                _cleanup_bus_error_free_ sd_bus_error e = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
 
                 sd_bus_error_setf(&e, BUS_ERROR_JOB_FAILED, "Start job for unit %s failed with '%s'", unit, result);
                 r = session_send_create_reply(s, &e);
@@ -2514,30 +2760,24 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
         r = sd_bus_message_read(message, "uoss", &id, &path, &unit, &result);
         if (r < 0) {
                 bus_log_parse_error(r);
-                return r;
+                return 0;
         }
 
         if (m->action_job && streq(m->action_job, path)) {
-                log_info("Operation finished.");
+                log_info("Operation '%s' finished.", inhibit_what_to_string(m->action_what));
 
                 /* Tell people that they now may take a lock again */
-                send_prepare_for(m, m->action_what, false);
+                (void) send_prepare_for(m, m->action_what, false);
 
-                free(m->action_job);
-                m->action_job = NULL;
+                m->action_job = mfree(m->action_job);
                 m->action_unit = NULL;
                 m->action_what = 0;
                 return 0;
         }
 
         session = hashmap_get(m->session_units, unit);
-        if (session) {
-
-                if (streq_ptr(path, session->scope_job)) {
-                        free(session->scope_job);
-                        session->scope_job = NULL;
-                }
-
+        if (session && streq_ptr(path, session->scope_job)) {
+                session->scope_job = mfree(session->scope_job);
                 session_jobs_reply(session, unit, result);
 
                 session_save(session);
@@ -2546,21 +2786,18 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
         }
 
         user = hashmap_get(m->user_units, unit);
-        if (user) {
+        if (user &&
+            (streq_ptr(path, user->service_job) ||
+             streq_ptr(path, user->slice_job))) {
 
-                if (streq_ptr(path, user->service_job)) {
-                        free(user->service_job);
-                        user->service_job = NULL;
-                }
+                if (streq_ptr(path, user->service_job))
+                        user->service_job = mfree(user->service_job);
 
-                if (streq_ptr(path, user->slice_job)) {
-                        free(user->slice_job);
-                        user->slice_job = NULL;
-                }
+                if (streq_ptr(path, user->slice_job))
+                        user->slice_job = mfree(user->slice_job);
 
-                LIST_FOREACH(sessions_by_user, session, user->sessions) {
+                LIST_FOREACH(sessions_by_user, session, user->sessions)
                         session_jobs_reply(session, unit, result);
-                }
 
                 user_save(user);
                 user_add_to_gc_queue(user);
@@ -2582,7 +2819,7 @@ int match_unit_removed(sd_bus_message *message, void *userdata, sd_bus_error *er
         r = sd_bus_message_read(message, "so", &unit, &path);
         if (r < 0) {
                 bus_log_parse_error(r);
-                return r;
+                return 0;
         }
 
         session = hashmap_get(m->session_units, unit);
@@ -2614,8 +2851,10 @@ int match_properties_changed(sd_bus_message *message, void *userdata, sd_bus_err
         r = unit_name_from_dbus_path(path, &unit);
         if (r == -EINVAL) /* not a unit */
                 return 0;
-        if (r < 0)
-                return r;
+        if (r < 0) {
+                log_oom();
+                return 0;
+        }
 
         session = hashmap_get(m->session_units, unit);
         if (session)
@@ -2640,7 +2879,7 @@ int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error
         r = sd_bus_message_read(message, "b", &b);
         if (r < 0) {
                 bus_log_parse_error(r);
-                return r;
+                return 0;
         }
 
         if (b)
@@ -2651,41 +2890,6 @@ int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error
 
         HASHMAP_FOREACH(session, m->sessions, i)
                 session_add_to_gc_queue(session);
-
-        return 0;
-}
-
-int match_name_owner_changed(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        const char *name, *old, *new;
-        Manager *m = userdata;
-        Session *session;
-        Iterator i;
-        int r;
-        char *key;
-
-        assert(message);
-        assert(m);
-
-        r = sd_bus_message_read(message, "sss", &name, &old, &new);
-        if (r < 0) {
-                bus_log_parse_error(r);
-                return r;
-        }
-
-        if (isempty(old) || !isempty(new))
-                return 0;
-
-        key = set_remove(m->busnames, (char*) old);
-        if (!key)
-                return 0;
-
-        /* Drop all controllers owned by this name */
-
-        free(key);
-
-        HASHMAP_FOREACH(session, m->sessions, i)
-                if (session_is_controller(session, old))
-                        session_drop_controller(session);
 
         return 0;
 }
@@ -2704,22 +2908,114 @@ int manager_send_changed(Manager *manager, const char *property, ...) {
                         l);
 }
 
+static int strdup_job(sd_bus_message *reply, char **job) {
+        const char *j;
+        char *copy;
+        int r;
+
+        r = sd_bus_message_read(reply, "o", &j);
+        if (r < 0)
+                return r;
+
+        copy = strdup(j);
+        if (!copy)
+                return -ENOMEM;
+
+        *job = copy;
+        return 1;
+}
+
+int manager_start_slice(
+                Manager *manager,
+                const char *slice,
+                const char *description,
+                const char *after,
+                const char *after2,
+                uint64_t tasks_max,
+                sd_bus_error *error,
+                char **job) {
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
+        int r;
+
+        assert(manager);
+        assert(slice);
+        assert(job);
+
+        r = sd_bus_message_new_method_call(
+                        manager->bus,
+                        &m,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "StartTransientUnit");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(m, "ss", strempty(slice), "fail");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(m, 'a', "(sv)");
+        if (r < 0)
+                return r;
+
+        if (!isempty(description)) {
+                r = sd_bus_message_append(m, "(sv)", "Description", "s", description);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!isempty(after)) {
+                r = sd_bus_message_append(m, "(sv)", "After", "as", 1, after);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!isempty(after2)) {
+                r = sd_bus_message_append(m, "(sv)", "After", "as", 1, after2);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_bus_message_append(m, "(sv)", "TasksMax", "t", tasks_max);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(m, "a(sa(sv))", 0);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_call(manager->bus, m, 0, error, &reply);
+        if (r < 0)
+                return r;
+
+        return strdup_job(reply, job);
+}
+
 int manager_start_scope(
                 Manager *manager,
                 const char *scope,
                 pid_t pid,
                 const char *slice,
                 const char *description,
-                const char *after, const char *after2,
+                const char *after,
+                const char *after2,
+                uint64_t tasks_max,
                 sd_bus_error *error,
                 char **job) {
 
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         int r;
 
         assert(manager);
         assert(scope);
         assert(pid > 1);
+        assert(job);
 
         r = sd_bus_message_new_method_call(
                         manager->bus,
@@ -2778,6 +3074,10 @@ int manager_start_scope(
         if (r < 0)
                 return r;
 
+        r = sd_bus_message_append(m, "(sv)", "TasksMax", "t", tasks_max);
+        if (r < 0)
+                return r;
+
         r = sd_bus_message_close_container(m);
         if (r < 0)
                 return r;
@@ -2790,30 +3090,16 @@ int manager_start_scope(
         if (r < 0)
                 return r;
 
-        if (job) {
-                const char *j;
-                char *copy;
-
-                r = sd_bus_message_read(reply, "o", &j);
-                if (r < 0)
-                        return r;
-
-                copy = strdup(j);
-                if (!copy)
-                        return -ENOMEM;
-
-                *job = copy;
-        }
-
-        return 1;
+        return strdup_job(reply, job);
 }
 
 int manager_start_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
 
         assert(manager);
         assert(unit);
+        assert(job);
 
         r = sd_bus_call_method(
                         manager->bus,
@@ -2823,34 +3109,20 @@ int manager_start_unit(Manager *manager, const char *unit, sd_bus_error *error, 
                         "StartUnit",
                         error,
                         &reply,
-                        "ss", unit, "fail");
+                        "ss", unit, "replace");
         if (r < 0)
                 return r;
 
-        if (job) {
-                const char *j;
-                char *copy;
-
-                r = sd_bus_message_read(reply, "o", &j);
-                if (r < 0)
-                        return r;
-
-                copy = strdup(j);
-                if (!copy)
-                        return -ENOMEM;
-
-                *job = copy;
-        }
-
-        return 1;
+        return strdup_job(reply, job);
 }
 
 int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job) {
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
 
         assert(manager);
         assert(unit);
+        assert(job);
 
         r = sd_bus_call_method(
                         manager->bus,
@@ -2865,9 +3137,7 @@ int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, c
                 if (sd_bus_error_has_name(error, BUS_ERROR_NO_SUCH_UNIT) ||
                     sd_bus_error_has_name(error, BUS_ERROR_LOAD_FAILED)) {
 
-                        if (job)
-                                *job = NULL;
-
+                        *job = NULL;
                         sd_bus_error_free(error);
                         return 0;
                 }
@@ -2875,22 +3145,7 @@ int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, c
                 return r;
         }
 
-        if (job) {
-                const char *j;
-                char *copy;
-
-                r = sd_bus_message_read(reply, "o", &j);
-                if (r < 0)
-                        return r;
-
-                copy = strdup(j);
-                if (!copy)
-                        return -ENOMEM;
-
-                *job = copy;
-        }
-
-        return 1;
+        return strdup_job(reply, job);
 }
 
 int manager_abandon_scope(Manager *manager, const char *scope, sd_bus_error *error) {
@@ -2943,8 +3198,8 @@ int manager_kill_unit(Manager *manager, const char *unit, KillWho who, int signo
 }
 
 int manager_unit_is_active(Manager *manager, const char *unit) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_free_ char *path = NULL;
         const char *state;
         int r;
@@ -2989,8 +3244,8 @@ int manager_unit_is_active(Manager *manager, const char *unit) {
 }
 
 int manager_job_is_active(Manager *manager, const char *path) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
 
         assert(manager);

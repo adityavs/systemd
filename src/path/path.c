@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,16 +18,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <getopt.h>
 #include <errno.h>
+#include <getopt.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "sd-path.h"
-#include "build.h"
-#include "macro.h"
-#include "util.h"
+
+#include "alloc-util.h"
 #include "log.h"
+#include "macro.h"
+#include "string-util.h"
+#include "util.h"
 
 static const char *arg_suffix = NULL;
 
@@ -155,9 +156,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case ARG_SUFFIX:
                         arg_suffix = optarg;

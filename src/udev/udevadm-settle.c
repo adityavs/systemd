@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * Copyright (C) 2006-2009 Kay Sievers <kay@vrfy.org>
  * Copyright (C) 2009 Canonical Ltd.
@@ -17,23 +18,25 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
-#include <stddef.h>
-#include <string.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
+#include "parse-util.h"
 #include "udev.h"
+#include "udevadm-util.h"
 #include "util.h"
 
 static void help(void) {
-        printf("%s settle OPTIONS\n\n"
+        printf("%s settle [OPTIONS]\n\n"
                "Wait for pending udev events.\n\n"
                "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
+               "  -V --version              Show package version\n"
                "  -t --timeout=SECONDS      Maximum time to wait for events\n"
                "  -E --exit-if-exists=FILE  Stop waiting if file exists\n"
                , program_invocation_short_name);
@@ -43,6 +46,7 @@ static int adm_settle(struct udev *udev, int argc, char *argv[]) {
         static const struct option options[] = {
                 { "timeout",        required_argument, NULL, 't' },
                 { "exit-if-exists", required_argument, NULL, 'E' },
+                { "version",        no_argument,       NULL, 'V' },
                 { "help",           no_argument,       NULL, 'h' },
                 { "seq-start",      required_argument, NULL, 's' }, /* removed */
                 { "seq-end",        required_argument, NULL, 'e' }, /* removed */
@@ -57,7 +61,7 @@ static int adm_settle(struct udev *udev, int argc, char *argv[]) {
         struct udev_queue *queue;
         int rc = EXIT_FAILURE;
 
-        while ((c = getopt_long(argc, argv, "t:E:hs:e:q", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "t:E:Vhs:e:q", options, NULL)) >= 0) {
                 switch (c) {
 
                 case 't': {
@@ -65,16 +69,19 @@ static int adm_settle(struct udev *udev, int argc, char *argv[]) {
 
                         r = safe_atou(optarg, &timeout);
                         if (r < 0) {
-                                fprintf(stderr, "Invalid timeout value '%s': %s\n",
-                                        optarg, strerror(-r));
-                                exit(EXIT_FAILURE);
-                        };
+                                log_error_errno(r, "Invalid timeout value '%s': %m", optarg);
+                                return EXIT_FAILURE;
+                        }
                         break;
                 }
 
                 case 'E':
                         exists = optarg;
                         break;
+
+                case 'V':
+                        print_version();
+                        return EXIT_SUCCESS;
 
                 case 'h':
                         help();

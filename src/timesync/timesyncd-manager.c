@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,31 +18,36 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
 #include <errno.h>
-#include <time.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <resolv.h>
+#include <stdlib.h>
+#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/timex.h>
-#include <sys/socket.h>
-#include <resolv.h>
 #include <sys/types.h>
+#include <time.h>
 
-#include "missing.h"
-#include "util.h"
-#include "sparse-endian.h"
-#include "log.h"
-#include "socket-util.h"
-#include "list.h"
-#include "ratelimit.h"
-#include "strv.h"
 #include "sd-daemon.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
+#include "list.h"
+#include "log.h"
+#include "missing.h"
 #include "network-util.h"
+#include "ratelimit.h"
+#include "socket-util.h"
+#include "sparse-endian.h"
+#include "string-util.h"
+#include "strv.h"
+#include "time-util.h"
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
-#include "time-util.h"
+#include "util.h"
 
 #ifndef ADJ_SETOFFSET
 #define ADJ_SETOFFSET                   0x0100  /* add 'time' to current time */
@@ -53,15 +57,8 @@
 #define NTP_ACCURACY_SEC                0.2
 
 /*
- * "A client MUST NOT under any conditions use a poll interval less
- * than 15 seconds."
- */
-#define NTP_POLL_INTERVAL_MIN_SEC       32
-#define NTP_POLL_INTERVAL_MAX_SEC       2048
-
-/*
  * Maximum delta in seconds which the system clock is gradually adjusted
- * (slew) to approach the network time. Deltas larger that this are set by
+ * (slewed) to approach the network time. Deltas larger that this are set by
  * letting the system time jump. The kernel's limit for adjtime is 0.5s.
  */
 #define NTP_MAX_ADJUST                  0.4
@@ -77,8 +74,8 @@
 #define NTP_FIELD_MODE(f)               ((f) & 7)
 #define NTP_FIELD(l, v, m)              (((l) << 6) | ((v) << 3) | (m))
 
-/* Maximum acceptable root distance in seconds. */
-#define NTP_MAX_ROOT_DISTANCE           5.0
+/* Default of maximum acceptable root distance in microseconds. */
+#define NTP_MAX_ROOT_DISTANCE           (5 * USEC_PER_SEC)
 
 /* Maximum number of missed replies before selecting another source. */
 #define NTP_MAX_MISSED_REPLIES          2
@@ -201,10 +198,10 @@ static int manager_send_request(Manager *m) {
 
         /* re-arm timer with increasing timeout, in case the packets never arrive back */
         if (m->retry_interval > 0) {
-                if (m->retry_interval < NTP_POLL_INTERVAL_MAX_SEC * USEC_PER_SEC)
+                if (m->retry_interval < m->poll_interval_max_usec)
                         m->retry_interval *= 2;
         } else
-                m->retry_interval = NTP_POLL_INTERVAL_MIN_SEC * USEC_PER_SEC;
+                m->retry_interval = m->poll_interval_min_usec;
 
         r = manager_arm_timer(m, m->retry_interval);
         if (r < 0)
@@ -327,11 +324,13 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
                 tmx.esterror = 0;
                 log_debug("  adjust (slew): %+.3f sec", offset);
         } else {
-                tmx.modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET;
+                tmx.modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET | ADJ_MAXERROR | ADJ_ESTERROR;
 
                 /* ADJ_NANO uses nanoseconds in the microseconds field */
                 tmx.time.tv_sec = (long)offset;
                 tmx.time.tv_usec = (offset - tmx.time.tv_sec) * NSEC_PER_SEC;
+                tmx.maxerror = 0;
+                tmx.esterror = 0;
 
                 /* the kernel expects -0.3s as {-1, 7000.000.000} */
                 if (tmx.time.tv_usec < 0) {
@@ -365,19 +364,20 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
 
         r = clock_adjtime(CLOCK_REALTIME, &tmx);
         if (r < 0)
-                return r;
+                return -errno;
 
-        touch("/var/lib/systemd/clock");
+        /* If touch fails, there isn't much we can do. Maybe it'll work next time. */
+        (void) touch("/var/lib/systemd/timesync/clock");
 
         m->drift_ppm = tmx.freq / 65536;
 
         log_debug("  status       : %04i %s\n"
-                  "  time now     : %li.%03llu\n"
-                  "  constant     : %li\n"
+                  "  time now     : %"PRI_TIME".%03"PRI_USEC"\n"
+                  "  constant     : %"PRI_TIMEX"\n"
                   "  offset       : %+.3f sec\n"
-                  "  freq offset  : %+li (%i ppm)\n",
+                  "  freq offset  : %+"PRI_TIMEX" (%i ppm)\n",
                   tmx.status, tmx.status & STA_UNSYNC ? "unsync" : "sync",
-                  tmx.time.tv_sec, (unsigned long long) (tmx.time.tv_usec / NSEC_PER_MSEC),
+                  tmx.time.tv_sec, tmx.time.tv_usec / NSEC_PER_MSEC,
                   tmx.constant,
                   (double)tmx.offset / NSEC_PER_SEC,
                   tmx.freq, m->drift_ppm);
@@ -440,27 +440,27 @@ static void manager_adjust_poll(Manager *m, double offset, bool spike) {
         assert(m);
 
         if (m->poll_resync) {
-                m->poll_interval_usec = NTP_POLL_INTERVAL_MIN_SEC * USEC_PER_SEC;
+                m->poll_interval_usec = m->poll_interval_min_usec;
                 m->poll_resync = false;
                 return;
         }
 
         /* set to minimal poll interval */
         if (!spike && fabs(offset) > NTP_ACCURACY_SEC) {
-                m->poll_interval_usec = NTP_POLL_INTERVAL_MIN_SEC * USEC_PER_SEC;
+                m->poll_interval_usec = m->poll_interval_min_usec;
                 return;
         }
 
         /* increase polling interval */
         if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) {
-                if (m->poll_interval_usec < NTP_POLL_INTERVAL_MAX_SEC * USEC_PER_SEC)
+                if (m->poll_interval_usec < m->poll_interval_max_usec)
                         m->poll_interval_usec *= 2;
                 return;
         }
 
         /* decrease polling interval */
         if (spike || fabs(offset) > NTP_ACCURACY_SEC * 0.75) {
-                if (m->poll_interval_usec > NTP_POLL_INTERVAL_MIN_SEC * USEC_PER_SEC)
+                if (m->poll_interval_usec > m->poll_interval_min_usec)
                         m->poll_interval_usec /= 2;
                 return;
         }
@@ -552,7 +552,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
 
         /* check our "time cookie" (we just stored nanoseconds in the fraction field) */
         if (be32toh(ntpmsg.origin_time.sec) != m->trans_time.tv_sec + OFFSET_1900_1970 ||
-            be32toh(ntpmsg.origin_time.frac) != m->trans_time.tv_nsec) {
+            be32toh(ntpmsg.origin_time.frac) != (unsigned long) m->trans_time.tv_nsec) {
                 log_debug("Invalid reply; not our transmit time. Ignoring.");
                 return 0;
         }
@@ -582,7 +582,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         }
 
         root_distance = ntp_ts_short_to_d(&ntpmsg.root_delay) / 2 + ntp_ts_short_to_d(&ntpmsg.root_dispersion);
-        if (root_distance > NTP_MAX_ROOT_DISTANCE) {
+        if (root_distance > (double) m->max_root_distance_usec / (double) USEC_PER_SEC) {
                 log_debug("Server has too large root distance. Disconnecting.");
                 return manager_connect(m);
         }
@@ -662,7 +662,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 m->sync = true;
                 r = manager_adjust_clock(m, offset, leap_sec);
                 if (r < 0)
-                        log_error_errno(errno, "Failed to call clock_adjtime(): %m");
+                        log_error_errno(r, "Failed to call clock_adjtime(): %m");
         }
 
         log_debug("interval/delta/delay/jitter/drift " USEC_FMT "s/%+.3fs/%.3fs/%.3fs/%+ippm%s",
@@ -737,7 +737,7 @@ static int manager_begin(Manager *m) {
         m->good = false;
         m->missed_replies = NTP_MAX_MISSED_REPLIES;
         if (m->poll_interval_usec == 0)
-                m->poll_interval_usec = NTP_POLL_INTERVAL_MIN_SEC * USEC_PER_SEC;
+                m->poll_interval_usec = m->poll_interval_min_usec;
 
         server_address_pretty(m->current_server_address, &pretty);
         log_debug("Connecting to time server %s (%s).", strna(pretty), m->current_server_name->string);
@@ -915,7 +915,7 @@ int manager_connect(Manager *m) {
                                 m->exhausted_servers = true;
 
                                 /* Increase the polling interval */
-                                if (m->poll_interval_usec < NTP_POLL_INTERVAL_MAX_SEC * USEC_PER_SEC)
+                                if (m->poll_interval_usec < m->poll_interval_max_usec)
                                         m->poll_interval_usec *= 2;
 
                                 return 0;
@@ -1086,6 +1086,10 @@ static int manager_network_monitor_listen(Manager *m) {
         assert(m);
 
         r = sd_network_monitor_new(&m->network_monitor, NULL);
+        if (r == -ENOENT) {
+                log_info("systemd does not appear to be running, not listening for systemd-networkd events.");
+                return 0;
+        }
         if (r < 0)
                 return r;
 
@@ -1114,13 +1118,13 @@ int manager_new(Manager **ret) {
         if (!m)
                 return -ENOMEM;
 
+        m->max_root_distance_usec = NTP_MAX_ROOT_DISTANCE;
+        m->poll_interval_min_usec = NTP_POLL_INTERVAL_MIN_USEC;
+        m->poll_interval_max_usec = NTP_POLL_INTERVAL_MAX_USEC;
+
         m->server_socket = m->clock_watch_fd = -1;
 
         RATELIMIT_INIT(m->ratelimit, RATELIMIT_INTERVAL_USEC, RATELIMIT_BURST);
-
-        r = manager_parse_server_string(m, SERVER_FALLBACK, NTP_SERVERS);
-        if (r < 0)
-                return r;
 
         r = sd_event_default(&m->event);
         if (r < 0)

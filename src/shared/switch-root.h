@@ -1,7 +1,7 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
+#include <stdbool.h>
 /***
   This file is part of systemd.
 

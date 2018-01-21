@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,18 +18,17 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdbool.h>
 #include <errno.h>
-#include <string.h>
+#include <fcntl.h>
 #include <stdio.h>
-#include <limits.h>
-#include <getopt.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "log.h"
-#include "util.h"
+#include "fd-util.h"
 #include "fileio.h"
-#include "build.h"
+#include "log.h"
+#include "macro.h"
+#include "string-util.h"
 #include "sysctl-util.h"
 
 char *sysctl_normalize(char *s) {
@@ -59,6 +57,7 @@ char *sysctl_normalize(char *s) {
 
 int sysctl_write(const char *property, const char *value) {
         char *p;
+        _cleanup_close_ int fd = -1;
 
         assert(property);
         assert(value);
@@ -66,7 +65,17 @@ int sysctl_write(const char *property, const char *value) {
         log_debug("Setting '%s' to '%s'", property, value);
 
         p = strjoina("/proc/sys/", property);
-        return write_string_file(p, value);
+        fd = open(p, O_WRONLY|O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+
+        if (!endswith(value, "\n"))
+                value = strjoina(value, "\n");
+
+        if (write(fd, value, strlen(value)) < 0)
+                return -errno;
+
+        return 0;
 }
 
 int sysctl_read(const char *property, char **content) {

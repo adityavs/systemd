@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,17 +19,19 @@
 ***/
 
 #include <errno.h>
-#include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <string.h>
 #include <stdio.h>
-
-#include "util.h"
-#include "errno-list.h"
+#include <stdlib.h>
+#include <string.h>
 
 #include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "errno-list.h"
+#include "string-util.h"
+#include "util.h"
 
 BUS_ERROR_MAP_ELF_REGISTER const sd_bus_error_map bus_standard_errors[] = {
         SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.Failed",                           EACCES),
@@ -70,11 +71,9 @@ BUS_ERROR_MAP_ELF_REGISTER const sd_bus_error_map bus_standard_errors[] = {
         SD_BUS_ERROR_MAP_END
 };
 
-/* GCC maps this magically to the beginning and end of the BUS_ERROR_MAP section.
- * Hide them; for currently unknown reasons they get exported to the shared libries
- * even without being listed in the sym file. */
-extern const sd_bus_error_map __start_BUS_ERROR_MAP[] _hidden_;
-extern const sd_bus_error_map __stop_BUS_ERROR_MAP[] _hidden_;
+/* GCC maps this magically to the beginning and end of the BUS_ERROR_MAP section */
+extern const sd_bus_error_map __start_BUS_ERROR_MAP[];
+extern const sd_bus_error_map __stop_BUS_ERROR_MAP[];
 
 /* Additional maps registered with sd_bus_error_add_map() are in this
  * NULL terminated array */
@@ -91,14 +90,14 @@ static int bus_error_name_to_errno(const char *name) {
         p = startswith(name, "System.Error.");
         if (p) {
                 r = errno_from_name(p);
-                if (r <= 0)
+                if (r < 0)
                         return EIO;
 
                 return r;
         }
 
-        if (additional_error_maps) {
-                for (map = additional_error_maps; *map; map++) {
+        if (additional_error_maps)
+                for (map = additional_error_maps; *map; map++)
                         for (m = *map;; m++) {
                                 /* For additional error maps the end marker is actually the end marker */
                                 if (m->code == BUS_ERROR_MAP_END_MARKER)
@@ -107,15 +106,13 @@ static int bus_error_name_to_errno(const char *name) {
                                 if (streq(m->name, name))
                                         return m->code;
                         }
-                }
-        }
 
         m = __start_BUS_ERROR_MAP;
         while (m < __stop_BUS_ERROR_MAP) {
                 /* For magic ELF error maps, the end marker might
                  * appear in the middle of things, since multiple maps
                  * might appear in the same section. Hence, let's skip
-                 * over it, but realign the pointer to the netx 8byte
+                 * over it, but realign the pointer to the next 8 byte
                  * boundary, which is the selected alignment for the
                  * arrays. */
                 if (m->code == BUS_ERROR_MAP_END_MARKER) {
@@ -256,25 +253,24 @@ int bus_error_setfv(sd_bus_error *e, const char *name, const char *format, va_li
 
         if (!name)
                 return 0;
-        if (!e)
-                goto finish;
 
-        assert_return(!bus_error_is_dirty(e), -EINVAL);
+        if (e) {
+                assert_return(!bus_error_is_dirty(e), -EINVAL);
 
-        e->name = strdup(name);
-        if (!e->name) {
-                *e = BUS_ERROR_OOM;
-                return -ENOMEM;
+                e->name = strdup(name);
+                if (!e->name) {
+                        *e = BUS_ERROR_OOM;
+                        return -ENOMEM;
+                }
+
+                /* If we hit OOM on formatting the pretty message, we ignore
+                 * this, since we at least managed to write the error name */
+                if (format)
+                        (void) vasprintf((char**) &e->message, format, ap);
+
+                e->_need_free = 1;
         }
 
-        /* If we hit OOM on formatting the pretty message, we ignore
-         * this, since we at least managed to write the error name */
-        if (format)
-                (void) vasprintf((char**) &e->message, format, ap);
-
-        e->_need_free = 1;
-
-finish:
         return -bus_error_name_to_errno(name);
 }
 
@@ -565,7 +561,7 @@ _public_ int sd_bus_error_set_errnof(sd_bus_error *e, int error, const char *for
 const char *bus_error_message(const sd_bus_error *e, int error) {
 
         if (e) {
-                /* Sometimes the D-Bus server is a little bit too verbose with
+                /* Sometimes, the D-Bus server is a little bit too verbose with
                  * its error messages, so let's override them here */
                 if (sd_bus_error_has_name(e, SD_BUS_ERROR_ACCESS_DENIED))
                         return "Access denied";
@@ -580,26 +576,28 @@ const char *bus_error_message(const sd_bus_error *e, int error) {
         return strerror(error);
 }
 
+static bool map_ok(const sd_bus_error_map *map) {
+        for (; map->code != BUS_ERROR_MAP_END_MARKER; map++)
+                if (!map->name || map->code <=0)
+                        return false;
+        return true;
+}
+
 _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
         const sd_bus_error_map **maps = NULL;
         unsigned n = 0;
 
         assert_return(map, -EINVAL);
+        assert_return(map_ok(map), -EINVAL);
 
-        if (additional_error_maps) {
-                for (;; n++) {
-                        if (additional_error_maps[n] == NULL)
-                                break;
-
+        if (additional_error_maps)
+                for (; additional_error_maps[n] != NULL; n++)
                         if (additional_error_maps[n] == map)
                                 return 0;
-                }
-        }
 
         maps = realloc_multiply(additional_error_maps, sizeof(struct sd_bus_error_map*), n + 2);
         if (!maps)
                 return -ENOMEM;
-
 
         maps[n] = map;
         maps[n+1] = NULL;

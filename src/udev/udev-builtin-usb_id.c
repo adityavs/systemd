@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * USB device properties and persistent device path
  *
@@ -20,15 +21,18 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <unistd.h>
 #include <string.h>
-#include <ctype.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "string-util.h"
 #include "udev.h"
 
 static void set_usb_iftype(char *to, int if_class_num, size_t len) {
@@ -304,7 +308,7 @@ static int builtin_usb_id(struct udev_device *dev, int argc, char *argv[], bool 
         dev_if_packed_info(dev_usb, packed_if_str, sizeof(packed_if_str));
 
         /* mass storage : SCSI or ATAPI */
-        if (protocol == 6 || protocol == 2) {
+        if (IN_SET(protocol, 6, 2)) {
                 struct udev_device *dev_scsi;
                 const char *scsi_model, *scsi_vendor, *scsi_type, *scsi_rev;
                 int host, bus, target, lun;

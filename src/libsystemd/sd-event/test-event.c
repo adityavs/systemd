@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,11 +18,16 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <sys/wait.h>
+
 #include "sd-event.h"
+
+#include "fd-util.h"
 #include "log.h"
-#include "util.h"
 #include "macro.h"
 #include "signal-util.h"
+#include "util.h"
+#include "process-util.h"
 
 static int prepare_handler(sd_event_source *s, void *userdata) {
         log_info("preparing %c", PTR_TO_INT(userdata));
@@ -94,7 +98,7 @@ static int signal_handler(sd_event_source *s, const struct signalfd_siginfo *si,
         assert_se(pid >= 0);
 
         if (pid == 0)
-                _exit(0);
+                _exit(EXIT_SUCCESS);
 
         assert_se(sd_event_add_child(sd_event_source_get_event(s), &p, pid, WEXITED, child_handler, INT_TO_PTR('f')) >= 0);
         assert_se(sd_event_source_set_enabled(p, SD_EVENT_ONESHOT) >= 0);
@@ -156,11 +160,23 @@ static int exit_handler(sd_event_source *s, void *userdata) {
         return 3;
 }
 
-int main(int argc, char *argv[]) {
+static bool got_post = false;
+
+static int post_handler(sd_event_source *s, void *userdata) {
+        log_info("got post handler");
+
+        got_post = true;
+
+        return 2;
+}
+
+static void test_basic(void) {
         sd_event *e = NULL;
         sd_event_source *w = NULL, *x = NULL, *y = NULL, *z = NULL, *q = NULL, *t = NULL;
         static const char ch = 'x';
         int a[2] = { -1, -1 }, b[2] = { -1, -1}, d[2] = { -1, -1}, k[2] = { -1, -1 };
+        uint64_t event_now;
+        int64_t priority;
 
         assert_se(pipe(a) >= 0);
         assert_se(pipe(b) >= 0);
@@ -168,6 +184,7 @@ int main(int argc, char *argv[]) {
         assert_se(pipe(k) >= 0);
 
         assert_se(sd_event_default(&e) >= 0);
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &event_now) > 0);
 
         assert_se(sd_event_set_watchdog(e, true) >= 0);
 
@@ -197,6 +214,8 @@ int main(int argc, char *argv[]) {
         assert_se(sd_event_add_exit(e, &q, exit_handler, INT_TO_PTR('g')) >= 0);
 
         assert_se(sd_event_source_set_priority(x, 99) >= 0);
+        assert_se(sd_event_source_get_priority(x, &priority) >= 0);
+        assert_se(priority == 99);
         assert_se(sd_event_source_set_enabled(y, SD_EVENT_ONESHOT) >= 0);
         assert_se(sd_event_source_set_prepare(x, prepare_handler) >= 0);
         assert_se(sd_event_source_set_priority(z, 50) >= 0);
@@ -228,10 +247,14 @@ int main(int argc, char *argv[]) {
         sd_event_source_unref(y);
 
         do_quit = true;
-        assert_se(sd_event_source_set_time(z, now(CLOCK_MONOTONIC) + 200 * USEC_PER_MSEC) >= 0);
+        assert_se(sd_event_add_post(e, NULL, post_handler, NULL) >= 0);
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &event_now) == 0);
+        assert_se(sd_event_source_set_time(z, event_now + 200 * USEC_PER_MSEC) >= 0);
         assert_se(sd_event_source_set_enabled(z, SD_EVENT_ONESHOT) >= 0);
 
         assert_se(sd_event_loop(e) >= 0);
+        assert_se(got_post);
+        assert_se(got_exit);
 
         sd_event_source_unref(z);
         sd_event_source_unref(q);
@@ -244,6 +267,102 @@ int main(int argc, char *argv[]) {
         safe_close_pair(b);
         safe_close_pair(d);
         safe_close_pair(k);
+}
+
+static void test_sd_event_now(void) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        uint64_t event_now;
+
+        assert_se(sd_event_new(&e) >= 0);
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &event_now) > 0);
+        assert_se(sd_event_now(e, CLOCK_REALTIME, &event_now) > 0);
+        assert_se(sd_event_now(e, CLOCK_REALTIME_ALARM, &event_now) > 0);
+        if (clock_boottime_supported()) {
+                assert_se(sd_event_now(e, CLOCK_BOOTTIME, &event_now) > 0);
+                assert_se(sd_event_now(e, CLOCK_BOOTTIME_ALARM, &event_now) > 0);
+        }
+        assert_se(sd_event_now(e, -1, &event_now) == -EOPNOTSUPP);
+        assert_se(sd_event_now(e, 900 /* arbitrary big number */, &event_now) == -EOPNOTSUPP);
+
+        assert_se(sd_event_run(e, 0) == 0);
+
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &event_now) == 0);
+        assert_se(sd_event_now(e, CLOCK_REALTIME, &event_now) == 0);
+        assert_se(sd_event_now(e, CLOCK_REALTIME_ALARM, &event_now) == 0);
+        if (clock_boottime_supported()) {
+                assert_se(sd_event_now(e, CLOCK_BOOTTIME, &event_now) == 0);
+                assert_se(sd_event_now(e, CLOCK_BOOTTIME_ALARM, &event_now) == 0);
+        }
+        assert_se(sd_event_now(e, -1, &event_now) == -EOPNOTSUPP);
+        assert_se(sd_event_now(e, 900 /* arbitrary big number */, &event_now) == -EOPNOTSUPP);
+}
+
+static int last_rtqueue_sigval = 0;
+static int n_rtqueue = 0;
+
+static int rtqueue_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
+        last_rtqueue_sigval = si->ssi_int;
+        n_rtqueue++;
+        return 0;
+}
+
+static void test_rtqueue(void) {
+        sd_event_source *u = NULL, *v = NULL, *s = NULL;
+        sd_event *e = NULL;
+
+        assert_se(sd_event_default(&e) >= 0);
+
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN+2, SIGRTMIN+3, SIGUSR2, -1) >= 0);
+        assert_se(sd_event_add_signal(e, &u, SIGRTMIN+2, rtqueue_handler, NULL) >= 0);
+        assert_se(sd_event_add_signal(e, &v, SIGRTMIN+3, rtqueue_handler, NULL) >= 0);
+        assert_se(sd_event_add_signal(e, &s, SIGUSR2, rtqueue_handler, NULL) >= 0);
+
+        assert_se(sd_event_source_set_priority(v, -10) >= 0);
+
+        assert_se(sigqueue(getpid_cached(), SIGRTMIN+2, (union sigval) { .sival_int = 1 }) >= 0);
+        assert_se(sigqueue(getpid_cached(), SIGRTMIN+3, (union sigval) { .sival_int = 2 }) >= 0);
+        assert_se(sigqueue(getpid_cached(), SIGUSR2, (union sigval) { .sival_int = 3 }) >= 0);
+        assert_se(sigqueue(getpid_cached(), SIGRTMIN+3, (union sigval) { .sival_int = 4 }) >= 0);
+        assert_se(sigqueue(getpid_cached(), SIGUSR2, (union sigval) { .sival_int = 5 }) >= 0);
+
+        assert_se(n_rtqueue == 0);
+        assert_se(last_rtqueue_sigval == 0);
+
+        assert_se(sd_event_run(e, (uint64_t) -1) >= 1);
+        assert_se(n_rtqueue == 1);
+        assert_se(last_rtqueue_sigval == 2); /* first SIGRTMIN+3 */
+
+        assert_se(sd_event_run(e, (uint64_t) -1) >= 1);
+        assert_se(n_rtqueue == 2);
+        assert_se(last_rtqueue_sigval == 4); /* second SIGRTMIN+3 */
+
+        assert_se(sd_event_run(e, (uint64_t) -1) >= 1);
+        assert_se(n_rtqueue == 3);
+        assert_se(last_rtqueue_sigval == 3); /* first SIGUSR2 */
+
+        assert_se(sd_event_run(e, (uint64_t) -1) >= 1);
+        assert_se(n_rtqueue == 4);
+        assert_se(last_rtqueue_sigval == 1); /* SIGRTMIN+2 */
+
+        assert_se(sd_event_run(e, 0) == 0); /* the other SIGUSR2 is dropped, because the first one was still queued */
+        assert_se(n_rtqueue == 4);
+        assert_se(last_rtqueue_sigval == 1);
+
+        sd_event_source_unref(u);
+        sd_event_source_unref(v);
+        sd_event_source_unref(s);
+
+        sd_event_unref(e);
+}
+
+int main(int argc, char *argv[]) {
+
+        log_set_max_level(LOG_DEBUG);
+        log_parse_environment();
+
+        test_basic();
+        test_sd_event_now();
+        test_rtqueue();
 
         return 0;
 }

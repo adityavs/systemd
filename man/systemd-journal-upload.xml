@@ -1,8 +1,13 @@
 <?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
-"http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+"http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+<!ENTITY % entities SYSTEM "custom-entities.ent" >
+%entities;
+]>
 
 <!--
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   Copyright 2014 Zbigniew Jędrzejewski-Szmek
@@ -169,6 +174,43 @@
         </para></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><option>--follow</option><optional>=<replaceable>BOOL</replaceable></optional></term>
+
+        <listitem><para>
+          If set to yes, then <command>systemd-journal-upload</command> waits for input.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--key=</option></term>
+
+        <listitem><para>
+          Takes a path to a SSL key file in PEM format.
+          Defaults to <filename>&CERTIFICATE_ROOT;/private/journal-upload.pem</filename>.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--cert=</option></term>
+
+        <listitem><para>
+          Takes a path to a SSL certificate file in PEM format.
+          Defaults to <filename>&CERTIFICATE_ROOT;/certs/journal-upload.pem</filename>.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--trust=</option></term>
+
+        <listitem><para>
+          Takes a path to a SSL CA certificate file in PEM format,
+          or <option>all</option>. If <option>all</option> is set,
+          then certificate checking will be disabled.
+          Defaults to <filename>&CERTIFICATE_ROOT;/ca/trusted.pem</filename>.
+        </para></listitem>
+      </varlistentry>
+
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -196,7 +238,7 @@
       <programlisting>openssl req -newkey rsa:2048 -days 3650 -x509 -nodes \
       -out ca.pem -keyout ca.key -subj '/CN=Certificate authority/'
 
-cat >ca.conf &lt;&lt;EOF
+cat &gt;ca.conf &lt;&lt;EOF
 [ ca ]
 default_ca = this
 
@@ -221,7 +263,7 @@ emailAddress            = optional
 EOF
 
 touch index
-echo 0001 > serial
+echo 0001 &gt;serial
 
 SERVER=server
 CLIENT=client
@@ -244,7 +286,7 @@ openssl ca -batch -config ca.conf -notext -in $CLIENT.csr -out $CLIENT.pem
       <varname>ServerCertificateFile=</varname>,
       <varname>ServerKeyFile=</varname>, in
       <filename>/etc/systemd/journal-remote.conf</filename> and
-      <filename>/etc/systemd/journal-upload.conf</filename>
+      <filename>/etc/systemd/journal-upload.conf</filename>,
       respectively. The default locations can be queried by using
       <command>systemd-journal-remote --help</command> and
       <command>systemd-journal-upload --help</command>.</para>

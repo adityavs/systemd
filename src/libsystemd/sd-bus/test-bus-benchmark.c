@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -21,21 +20,22 @@
 
 #include <sys/wait.h>
 
-#include "def.h"
-#include "util.h"
-#include "time-util.h"
-
 #include "sd-bus.h"
-#include "bus-kernel.h"
+
+#include "alloc-util.h"
 #include "bus-internal.h"
+#include "bus-kernel.h"
 #include "bus-util.h"
+#include "def.h"
+#include "fd-util.h"
+#include "time-util.h"
+#include "util.h"
 
 #define MAX_SIZE (2*1024*1024)
 
 static usec_t arg_loop_usec = 100 * USEC_PER_MSEC;
 
 typedef enum Type {
-        TYPE_KDBUS,
         TYPE_LEGACY,
         TYPE_DIRECT,
 } Type;
@@ -44,7 +44,7 @@ static void server(sd_bus *b, size_t *result) {
         int r;
 
         for (;;) {
-                _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
 
                 r = sd_bus_process(b, &m);
                 assert_se(r >= 0);
@@ -78,7 +78,7 @@ static void server(sd_bus *b, size_t *result) {
 }
 
 static void transaction(sd_bus *b, size_t sz, const char *server_name) {
-        _cleanup_bus_message_unref_ sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         uint8_t *p;
 
         assert_se(sd_bus_message_new_method_call(b, &m, server_name, "/", "benchmark.server", "Work") >= 0);
@@ -90,7 +90,7 @@ static void transaction(sd_bus *b, size_t sz, const char *server_name) {
 }
 
 static void client_bisect(const char *address, const char *server_name) {
-        _cleanup_bus_message_unref_ sd_bus_message *x = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *x = NULL;
         size_t lsize, rsize, csize;
         sd_bus *b;
         int r;
@@ -164,7 +164,7 @@ static void client_bisect(const char *address, const char *server_name) {
 }
 
 static void client_chart(Type type, const char *address, const char *server_name, int fd) {
-        _cleanup_bus_message_unref_ sd_bus_message *x = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *x = NULL;
         size_t csize;
         sd_bus *b;
         int r;
@@ -190,9 +190,6 @@ static void client_chart(Type type, const char *address, const char *server_name
         assert_se(r >= 0);
 
         switch (type) {
-        case TYPE_KDBUS:
-                printf("SIZE\tCOPY\tMEMFD\n");
-                break;
         case TYPE_LEGACY:
                 printf("SIZE\tLEGACY\n");
                 break;
@@ -203,24 +200,9 @@ static void client_chart(Type type, const char *address, const char *server_name
 
         for (csize = 1; csize <= MAX_SIZE; csize *= 2) {
                 usec_t t;
-                unsigned n_copying, n_memfd;
+                unsigned n_memfd;
 
                 printf("%zu\t", csize);
-
-                if (type == TYPE_KDBUS) {
-                        b->use_memfd = 0;
-
-                        t = now(CLOCK_MONOTONIC);
-                        for (n_copying = 0;; n_copying++) {
-                                transaction(b, csize, server_name);
-                                if (now(CLOCK_MONOTONIC) >= t + arg_loop_usec)
-                                        break;
-                        }
-
-                        printf("%u\t", (unsigned) ((n_copying * USEC_PER_SEC) / arg_loop_usec));
-
-                        b->use_memfd = -1;
-                }
 
                 t = now(CLOCK_MONOTONIC);
                 for (n_memfd = 0;; n_memfd++) {
@@ -245,9 +227,9 @@ int main(int argc, char *argv[]) {
                 MODE_BISECT,
                 MODE_CHART,
         } mode = MODE_BISECT;
-        Type type = TYPE_KDBUS;
+        Type type = TYPE_LEGACY;
         int i, pair[2] = { -1, -1 };
-        _cleanup_free_ char *name = NULL, *bus_name = NULL, *address = NULL, *server_name = NULL;
+        _cleanup_free_ char *address = NULL, *server_name = NULL;
         _cleanup_close_ int bus_ref = -1;
         const char *unique;
         cpu_set_t cpuset;
@@ -271,22 +253,9 @@ int main(int argc, char *argv[]) {
                 assert_se(parse_sec(argv[i], &arg_loop_usec) >= 0);
         }
 
-        assert_se(!MODE_BISECT || TYPE_KDBUS);
-
         assert_se(arg_loop_usec > 0);
 
-        if (type == TYPE_KDBUS) {
-                assert_se(asprintf(&name, "deine-mutter-%u", (unsigned) getpid()) >= 0);
-
-                bus_ref = bus_kernel_create_bus(name, false, &bus_name);
-                if (bus_ref == -ENOENT)
-                        exit(EXIT_TEST_SKIP);
-
-                assert_se(bus_ref >= 0);
-
-                address = strappend("kernel:path=", bus_name);
-                assert_se(address);
-        } else if (type == TYPE_LEGACY) {
+        if (type == TYPE_LEGACY) {
                 const char *e;
 
                 e = secure_getenv("DBUS_SESSION_BUS_ADDRESS");
@@ -350,7 +319,7 @@ int main(int argc, char *argv[]) {
                         break;
                 }
 
-                _exit(0);
+                _exit(EXIT_SUCCESS);
         }
 
         CPU_ZERO(&cpuset);

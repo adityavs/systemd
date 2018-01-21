@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,7 +18,9 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "device-nodes.h"
 #include "utf8.h"
@@ -39,7 +40,7 @@ int whitelisted_char_for_devnode(char c, const char *white) {
 int encode_devnode_name(const char *str, char *str_enc, size_t len) {
         size_t i, j;
 
-        if (str == NULL || str_enc == NULL)
+        if (!str || !str_enc)
                 return -EINVAL;
 
         for (i = 0, j = 0; str[i] != '\0'; i++) {

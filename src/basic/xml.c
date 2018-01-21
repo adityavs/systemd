@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,9 +18,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
+#include <stddef.h>
 #include <string.h>
 
-#include "util.h"
+#include "macro.h"
+#include "string-util.h"
 #include "xml.h"
 
 enum {
@@ -207,7 +209,7 @@ int xml_tokenize(const char **p, char **name, void **state, unsigned *line) {
                         if (*c == '=') {
                                 c++;
 
-                                if (*c == '\'' || *c == '\"') {
+                                if (IN_SET(*c, '\'', '\"')) {
                                         /* Tag with a quoted value */
 
                                         e = strchr(c+1, *c);

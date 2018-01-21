@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,12 +21,16 @@
 ***/
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <sys/types.h>
 
 #include "sd-journal.h"
 
-#include "util.h"
+#include "macro.h"
 #include "output-mode.h"
+#include "time-util.h"
+#include "util.h"
 
 int output_journal(
                 FILE *f,
@@ -35,6 +38,7 @@ int output_journal(
                 OutputMode mode,
                 unsigned n_columns,
                 OutputFlags flags,
+                char **output_fields,
                 bool *ellipsized);
 
 int add_match_this_boot(sd_journal *j, const char *machine);
@@ -66,6 +70,3 @@ void json_escape(
                 const char* p,
                 size_t l,
                 OutputFlags flags);
-
-const char* output_mode_to_string(OutputMode m) _const_;
-OutputMode output_mode_from_string(const char *s) _pure_;

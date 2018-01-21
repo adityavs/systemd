@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,17 +18,22 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "missing.h"
-#include "journald-audit.h"
+#include "alloc-util.h"
 #include "audit-type.h"
+#include "fd-util.h"
+#include "hexdecoct.h"
+#include "io-util.h"
+#include "journald-audit.h"
+#include "missing.h"
+#include "string-util.h"
 
 typedef struct MapField {
         const char *audit_field;
         const char *journal_field;
-        int (*map)(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov);
+        int (*map)(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov);
 } MapField;
 
-static int map_simple_field(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov) {
+static int map_simple_field(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov) {
         _cleanup_free_ char *c = NULL;
         size_t l = 0, allocated = 0;
         const char *e;
@@ -46,7 +50,7 @@ static int map_simple_field(const char *field, const char **p, struct iovec **io
                 return -ENOMEM;
 
         memcpy(c, field, l);
-        for (e = *p; *e != ' ' && *e != 0; e++) {
+        for (e = *p; !IN_SET(*e, 0, ' '); e++) {
                 if (!GREEDY_REALLOC(c, allocated, l+2))
                         return -ENOMEM;
 
@@ -58,9 +62,7 @@ static int map_simple_field(const char *field, const char **p, struct iovec **io
         if (!GREEDY_REALLOC(*iov, *n_iov_allocated, *n_iov + 1))
                 return -ENOMEM;
 
-        (*iov)[*n_iov].iov_base = c;
-        (*iov)[*n_iov].iov_len = l;
-        (*n_iov) ++;
+        (*iov)[(*n_iov)++] = IOVEC_MAKE(c, l);
 
         *p = e;
         c = NULL;
@@ -68,7 +70,7 @@ static int map_simple_field(const char *field, const char **p, struct iovec **io
         return 1;
 }
 
-static int map_string_field_internal(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov, bool filter_printable) {
+static int map_string_field_internal(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov, bool filter_printable) {
         _cleanup_free_ char *c = NULL;
         const char *s, *e;
         size_t l;
@@ -107,7 +109,7 @@ static int map_string_field_internal(const char *field, const char **p, struct i
                         return -ENOMEM;
 
                 memcpy(c, field, l);
-                for (e = *p; *e != ' ' && *e != 0; e += 2) {
+                for (e = *p; !IN_SET(*e, 0, ' '); e += 2) {
                         int a, b;
                         uint8_t x;
 
@@ -137,9 +139,7 @@ static int map_string_field_internal(const char *field, const char **p, struct i
         if (!GREEDY_REALLOC(*iov, *n_iov_allocated, *n_iov + 1))
                 return -ENOMEM;
 
-        (*iov)[*n_iov].iov_base = c;
-        (*iov)[*n_iov].iov_len = l;
-        (*n_iov) ++;
+        (*iov)[(*n_iov)++] = IOVEC_MAKE(c, l);
 
         *p = e;
         c = NULL;
@@ -147,15 +147,15 @@ static int map_string_field_internal(const char *field, const char **p, struct i
         return 1;
 }
 
-static int map_string_field(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov) {
+static int map_string_field(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov) {
         return map_string_field_internal(field, p, iov, n_iov_allocated, n_iov, false);
 }
 
-static int map_string_field_printable(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov) {
+static int map_string_field_printable(const char *field, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov) {
         return map_string_field_internal(field, p, iov, n_iov_allocated, n_iov, true);
 }
 
-static int map_generic_field(const char *prefix, const char **p, struct iovec **iov, size_t *n_iov_allocated, unsigned *n_iov) {
+static int map_generic_field(const char *prefix, const char **p, struct iovec **iov, size_t *n_iov_allocated, size_t *n_iov) {
         const char *e, *f;
         char *c, *t;
         int r;
@@ -164,7 +164,7 @@ static int map_generic_field(const char *prefix, const char **p, struct iovec **
 
         for (e = *p; e < *p + 16; e++) {
 
-                if (*e == 0 || *e == ' ')
+                if (IN_SET(*e, 0, ' '))
                         return 0;
 
                 if (*e == '=')
@@ -173,7 +173,7 @@ static int map_generic_field(const char *prefix, const char **p, struct iovec **
                 if (!((*e >= 'a' && *e <= 'z') ||
                       (*e >= 'A' && *e <= 'Z') ||
                       (*e >= '0' && *e <= '9') ||
-                      *e == '_' || *e == '-'))
+                      IN_SET(*e, '_', '-')))
                         return 0;
         }
 
@@ -197,7 +197,7 @@ static int map_generic_field(const char *prefix, const char **p, struct iovec **
         }
         strcpy(t, "=");
 
-        e ++;
+        e++;
 
         r = map_simple_field(c, &e, iov, n_iov_allocated, n_iov);
         if (r < 0)
@@ -215,29 +215,29 @@ static const MapField map_fields_kernel[] = {
 
         /* First, we map certain well-known audit fields into native
          * well-known fields */
-        { "pid=",       "_PID=",                   map_simple_field },
-        { "ppid=",      "_PPID=",                  map_simple_field },
-        { "uid=",       "_UID=",                   map_simple_field },
-        { "euid=",      "_EUID=",                  map_simple_field },
-        { "fsuid=",     "_FSUID=",                 map_simple_field },
-        { "gid=",       "_GID=",                   map_simple_field },
-        { "egid=",      "_EGID=",                  map_simple_field },
-        { "fsgid=",     "_FSGID=",                 map_simple_field },
-        { "tty=",       "_TTY=",                   map_simple_field },
-        { "ses=",       "_AUDIT_SESSION=",         map_simple_field },
-        { "auid=",      "_AUDIT_LOGINUID=",        map_simple_field },
-        { "subj=",      "_SELINUX_CONTEXT=",       map_simple_field },
-        { "comm=",      "_COMM=",                  map_string_field },
-        { "exe=",       "_EXE=",                   map_string_field },
-        { "proctitle=", "_CMDLINE=",               map_string_field_printable },
+        { "pid=",       "_PID=",              map_simple_field },
+        { "ppid=",      "_PPID=",             map_simple_field },
+        { "uid=",       "_UID=",              map_simple_field },
+        { "euid=",      "_EUID=",             map_simple_field },
+        { "fsuid=",     "_FSUID=",            map_simple_field },
+        { "gid=",       "_GID=",              map_simple_field },
+        { "egid=",      "_EGID=",             map_simple_field },
+        { "fsgid=",     "_FSGID=",            map_simple_field },
+        { "tty=",       "_TTY=",              map_simple_field },
+        { "ses=",       "_AUDIT_SESSION=",    map_simple_field },
+        { "auid=",      "_AUDIT_LOGINUID=",   map_simple_field },
+        { "subj=",      "_SELINUX_CONTEXT=",  map_simple_field },
+        { "comm=",      "_COMM=",             map_string_field },
+        { "exe=",       "_EXE=",              map_string_field },
+        { "proctitle=", "_CMDLINE=",          map_string_field_printable },
 
         /* Some fields don't map to native well-known fields. However,
          * we know that they are string fields, hence let's undo
          * string field escaping for them, though we stick to the
          * generic field names. */
-        { "path=",      "_AUDIT_FIELD_PATH=",      map_string_field },
-        { "dev=",       "_AUDIT_FIELD_DEV=",       map_string_field },
-        { "name=",      "_AUDIT_FIELD_NAME=",      map_string_field },
+        { "path=",      "_AUDIT_FIELD_PATH=", map_string_field },
+        { "dev=",       "_AUDIT_FIELD_DEV=",  map_string_field },
+        { "name=",      "_AUDIT_FIELD_NAME=", map_string_field },
         {}
 };
 
@@ -245,11 +245,11 @@ static const MapField map_fields_kernel[] = {
  * msg='. All of these fields are untrusted, hence carry no "_"
  * prefix. We map the fields we don't know to AUDIT_FIELD_XYZ= */
 static const MapField map_fields_userspace[] = {
-        { "cwd=",       "AUDIT_FIELD_CWD=",  map_string_field },
-        { "cmd=",       "AUDIT_FIELD_CMD=",  map_string_field },
-        { "acct=",      "AUDIT_FIELD_ACCT=", map_string_field },
-        { "exe=",       "AUDIT_FIELD_EXE=",  map_string_field },
-        { "comm=",      "AUDIT_FIELD_COMM=", map_string_field },
+        { "cwd=",       "AUDIT_FIELD_CWD=",   map_string_field },
+        { "cmd=",       "AUDIT_FIELD_CMD=",   map_string_field },
+        { "acct=",      "AUDIT_FIELD_ACCT=",  map_string_field },
+        { "exe=",       "AUDIT_FIELD_EXE=",   map_string_field },
+        { "comm=",      "AUDIT_FIELD_COMM=",  map_string_field },
         {}
 };
 
@@ -260,7 +260,7 @@ static int map_all_fields(
                 bool handle_msg,
                 struct iovec **iov,
                 size_t *n_iov_allocated,
-                unsigned *n_iov) {
+                size_t *n_iov) {
 
         int r;
 
@@ -324,25 +324,23 @@ static int map_all_fields(
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to parse audit array: %m");
 
-                        if (r == 0) {
+                        if (r == 0)
                                 /* Couldn't process as generic field, let's just skip over it */
                                 p += strcspn(p, WHITESPACE);
-                        }
                 }
         }
 }
 
 static void process_audit_string(Server *s, int type, const char *data, size_t size) {
+        size_t n_iov_allocated = 0, n_iov = 0, z;
         _cleanup_free_ struct iovec *iov = NULL;
-        size_t n_iov_allocated = 0;
-        unsigned n_iov = 0, k;
         uint64_t seconds, msec, id;
         const char *p, *type_name;
-        unsigned z;
         char id_field[sizeof("_AUDIT_ID=") + DECIMAL_STR_MAX(uint64_t)],
              type_field[sizeof("_AUDIT_TYPE=") + DECIMAL_STR_MAX(int)],
              source_time_field[sizeof("_SOURCE_REALTIME_TIMESTAMP=") + DECIMAL_STR_MAX(usec_t)];
         char *m;
+        int k;
 
         assert(s);
 
@@ -381,26 +379,26 @@ static void process_audit_string(Server *s, int type, const char *data, size_t s
                 return;
         }
 
-        IOVEC_SET_STRING(iov[n_iov++], "_TRANSPORT=audit");
+        iov[n_iov++] = IOVEC_MAKE_STRING("_TRANSPORT=audit");
 
         sprintf(source_time_field, "_SOURCE_REALTIME_TIMESTAMP=%" PRIu64,
                 (usec_t) seconds * USEC_PER_SEC + (usec_t) msec * USEC_PER_MSEC);
-        IOVEC_SET_STRING(iov[n_iov++], source_time_field);
+        iov[n_iov++] = IOVEC_MAKE_STRING(source_time_field);
 
         sprintf(type_field, "_AUDIT_TYPE=%i", type);
-        IOVEC_SET_STRING(iov[n_iov++], type_field);
+        iov[n_iov++] = IOVEC_MAKE_STRING(type_field);
 
         sprintf(id_field, "_AUDIT_ID=%" PRIu64, id);
-        IOVEC_SET_STRING(iov[n_iov++], id_field);
+        iov[n_iov++] = IOVEC_MAKE_STRING(id_field);
 
-        assert_cc(32 == LOG_AUTH);
-        IOVEC_SET_STRING(iov[n_iov++], "SYSLOG_FACILITY=32");
-        IOVEC_SET_STRING(iov[n_iov++], "SYSLOG_IDENTIFIER=audit");
+        assert_cc(4 == LOG_FAC(LOG_AUTH));
+        iov[n_iov++] = IOVEC_MAKE_STRING("SYSLOG_FACILITY=4");
+        iov[n_iov++] = IOVEC_MAKE_STRING("SYSLOG_IDENTIFIER=audit");
 
         type_name = audit_type_name_alloca(type);
 
         m = strjoina("MESSAGE=", type_name, " ", p);
-        IOVEC_SET_STRING(iov[n_iov++], m);
+        iov[n_iov++] = IOVEC_MAKE_STRING(m);
 
         z = n_iov;
 
@@ -411,7 +409,7 @@ static void process_audit_string(Server *s, int type, const char *data, size_t s
                 goto finish;
         }
 
-        server_dispatch_message(s, iov, n_iov, n_iov_allocated, NULL, NULL, NULL, 0, NULL, LOG_NOTICE, 0);
+        server_dispatch_message(s, iov, n_iov, n_iov_allocated, NULL, NULL, LOG_NOTICE, 0);
 
 finish:
         /* free() all entries that map_all_fields() added. All others
@@ -526,7 +524,7 @@ int server_open_audit(Server *s) {
 
                 s->audit_fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_AUDIT);
                 if (s->audit_fd < 0) {
-                        if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT)
+                        if (IN_SET(errno, EAFNOSUPPORT, EPROTONOSUPPORT))
                                 log_debug("Audit not supported in the kernel.");
                         else
                                 log_warning_errno(errno, "Failed to create audit socket, ignoring: %m");

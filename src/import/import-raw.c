@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,18 +22,27 @@
 
 #include "sd-daemon.h"
 #include "sd-event.h"
-#include "util.h"
-#include "path-util.h"
+
+#include "alloc-util.h"
 #include "btrfs-util.h"
+#include "chattr-util.h"
 #include "copy.h"
-#include "mkdir.h"
-#include "rm-rf.h"
-#include "ratelimit.h"
-#include "machine-pool.h"
-#include "qcow2-util.h"
-#include "import-compress.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
+#include "hostname-util.h"
 #include "import-common.h"
+#include "import-compress.h"
 #include "import-raw.h"
+#include "io-util.h"
+#include "machine-pool.h"
+#include "mkdir.h"
+#include "path-util.h"
+#include "qcow2-util.h"
+#include "ratelimit.h"
+#include "rm-rf.h"
+#include "string-util.h"
+#include "util.h"
 
 struct RawImport {
         sd_event *event;
@@ -93,9 +101,7 @@ RawImport* raw_import_unref(RawImport *i) {
         free(i->final_path);
         free(i->image_root);
         free(i->local);
-        free(i);
-
-        return NULL;
+        return mfree(i);
 }
 
 int raw_import_new(
@@ -190,7 +196,7 @@ static int raw_import_maybe_convert_qcow2(RawImport *i) {
 
         r = chattr_fd(converted_fd, FS_NOCOW_FL, FS_NOCOW_FL);
         if (r < 0)
-                log_warning_errno(errno, "Failed to set file attributes on %s: %m", t);
+                log_warning_errno(r, "Failed to set file attributes on %s: %m", t);
 
         log_info("Unpacking QCOW2 file.");
 
@@ -201,9 +207,7 @@ static int raw_import_maybe_convert_qcow2(RawImport *i) {
         }
 
         (void) unlink(i->temp_path);
-        free(i->temp_path);
-        i->temp_path = t;
-        t = NULL;
+        free_and_replace(i->temp_path, t);
 
         safe_close(i->output_fd);
         i->output_fd = converted_fd;
@@ -248,8 +252,7 @@ static int raw_import_finish(RawImport *i) {
         if (r < 0)
                 return log_error_errno(r, "Failed to move image into place: %m");
 
-        free(i->temp_path);
-        i->temp_path = NULL;
+        i->temp_path = mfree(i->temp_path);
 
         return 0;
 }
@@ -263,7 +266,7 @@ static int raw_import_open_disk(RawImport *i) {
         assert(!i->temp_path);
         assert(i->output_fd < 0);
 
-        i->final_path = strjoin(i->image_root, "/", i->local, ".raw", NULL);
+        i->final_path = strjoin(i->image_root, "/", i->local, ".raw");
         if (!i->final_path)
                 return log_oom();
 
@@ -279,7 +282,7 @@ static int raw_import_open_disk(RawImport *i) {
 
         r = chattr_fd(i->output_fd, FS_NOCOW_FL, FS_NOCOW_FL);
         if (r < 0)
-                log_warning_errno(errno, "Failed to set file attributes on %s: %m", i->temp_path);
+                log_warning_errno(r, "Failed to set file attributes on %s: %m", i->temp_path);
 
         return 0;
 }
@@ -351,7 +354,7 @@ static int raw_import_process(RawImport *i) {
         }
         if (l == 0) {
                 if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
-                        log_error("Premature end of file: %m");
+                        log_error("Premature end of file.");
                         r = -EIO;
                         goto finish;
                 }
@@ -365,7 +368,7 @@ static int raw_import_process(RawImport *i) {
         if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
                 r = import_uncompress_detect(&i->compress, i->buffer, i->buffer_size);
                 if (r < 0) {
-                        log_error("Failed to detect file compression: %m");
+                        log_error_errno(r, "Failed to detect file compression: %m");
                         goto finish;
                 }
                 if (r == 0) /* Need more data */

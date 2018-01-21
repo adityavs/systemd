@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -23,31 +22,34 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
 #include <libaudit.h>
 #endif
 
 #include "sd-bus.h"
 
+#include "alloc-util.h"
+#include "bus-error.h"
+#include "bus-util.h"
+#include "format-util.h"
 #include "log.h"
 #include "macro.h"
-#include "util.h"
+#include "process-util.h"
 #include "special.h"
-#include "utmp-wtmp.h"
-#include "bus-util.h"
-#include "bus-error.h"
+#include "strv.h"
 #include "unit-name.h"
-#include "formats-util.h"
+#include "util.h"
+#include "utmp-wtmp.h"
 
 typedef struct Context {
         sd_bus *bus;
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         int audit_fd;
 #endif
 } Context;
 
 static usec_t get_startup_time(Context *c) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         usec_t t = 0;
         int r;
 
@@ -62,7 +64,7 @@ static usec_t get_startup_time(Context *c) {
                         &error,
                         't', &t);
         if (r < 0) {
-                log_error("Failed to get timestamp: %s", bus_error_message(&error, -r));
+                log_error_errno(r, "Failed to get timestamp: %s", bus_error_message(&error, r));
                 return 0;
         }
 
@@ -84,7 +86,7 @@ static int get_current_runlevel(Context *c) {
                 { '1', SPECIAL_RESCUE_TARGET     },
         };
 
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
         unsigned i;
 
@@ -105,12 +107,10 @@ static int get_current_runlevel(Context *c) {
                                 "ActiveState",
                                 &error,
                                 &state);
-                if (r < 0) {
-                        log_warning("Failed to get state: %s", bus_error_message(&error, -r));
-                        return r;
-                }
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to get state: %s", bus_error_message(&error, r));
 
-                if (streq(state, "active") || streq(state, "reloading"))
+                if (STR_IN_SET(state, "active", "reloading"))
                         return table[i].runlevel;
         }
 
@@ -126,12 +126,11 @@ static int on_reboot(Context *c) {
         /* We finished start-up, so let's write the utmp
          * record and send the audit msg */
 
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         if (c->audit_fd >= 0)
                 if (audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_BOOT, "", "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 &&
                     errno != EPERM) {
-                        log_error_errno(errno, "Failed to send audit message: %m");
-                        r = -errno;
+                        r = log_error_errno(errno, "Failed to send audit message: %m");
                 }
 #endif
 
@@ -156,12 +155,11 @@ static int on_shutdown(Context *c) {
         /* We started shut-down, so let's write the utmp
          * record and send the audit msg */
 
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         if (c->audit_fd >= 0)
                 if (audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_SHUTDOWN, "", "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 &&
                     errno != EPERM) {
-                        log_error_errno(errno, "Failed to send audit message: %m");
-                        r = -errno;
+                        r = log_error_errno(errno, "Failed to send audit message: %m");
                 }
 #endif
 
@@ -186,7 +184,7 @@ static int on_runlevel(Context *c) {
         q = utmp_get_runlevel(&previous, NULL);
 
         if (q < 0) {
-                if (q != -ESRCH && q != -ENOENT)
+                if (!IN_SET(q, -ESRCH, -ENOENT))
                         return log_error_errno(q, "Failed to get current runlevel: %m");
 
                 previous = 0;
@@ -201,7 +199,7 @@ static int on_runlevel(Context *c) {
         if (previous == runlevel)
                 return 0;
 
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         if (c->audit_fd >= 0) {
                 _cleanup_free_ char *s = NULL;
 
@@ -210,16 +208,13 @@ static int on_runlevel(Context *c) {
                              runlevel > 0 ? runlevel : 'N') < 0)
                         return log_oom();
 
-                if (audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_RUNLEVEL, s, "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 &&
-                    errno != EPERM) {
-                        log_error_errno(errno, "Failed to send audit message: %m");
-                        r = -errno;
-                }
+                if (audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_RUNLEVEL, s, "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 && errno != EPERM)
+                        r = log_error_errno(errno, "Failed to send audit message: %m");
         }
 #endif
 
         q = utmp_put_runlevel(runlevel, previous);
-        if (q < 0 && q != -ESRCH && q != -ENOENT) {
+        if (q < 0 && !IN_SET(q, -ESRCH, -ENOENT)) {
                 log_error_errno(q, "Failed to write utmp record: %m");
                 r = q;
         }
@@ -229,7 +224,7 @@ static int on_runlevel(Context *c) {
 
 int main(int argc, char *argv[]) {
         Context c = {
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
                 .audit_fd = -1
 #endif
         };
@@ -251,21 +246,21 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         /* If the kernel lacks netlink or audit support,
          * don't worry about it. */
         c.audit_fd = audit_open();
-        if (c.audit_fd < 0 && errno != EAFNOSUPPORT && errno != EPROTONOSUPPORT)
+        if (c.audit_fd < 0 && !IN_SET(errno, EAFNOSUPPORT, EPROTONOSUPPORT))
                 log_error_errno(errno, "Failed to connect to audit log: %m");
 #endif
-        r = bus_open_system_systemd(&c.bus);
+        r = bus_connect_system_systemd(&c.bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to get D-Bus connection: %m");
                 r = -EIO;
                 goto finish;
         }
 
-        log_debug("systemd-update-utmp running as pid "PID_FMT, getpid());
+        log_debug("systemd-update-utmp running as pid "PID_FMT, getpid_cached());
 
         if (streq(argv[1], "reboot"))
                 r = on_reboot(&c);
@@ -278,16 +273,14 @@ int main(int argc, char *argv[]) {
                 r = -EINVAL;
         }
 
-        log_debug("systemd-update-utmp stopped as pid "PID_FMT, getpid());
+        log_debug("systemd-update-utmp stopped as pid "PID_FMT, getpid_cached());
 
 finish:
-#ifdef HAVE_AUDIT
+#if HAVE_AUDIT
         if (c.audit_fd >= 0)
                 audit_close(c.audit_fd);
 #endif
 
-        if (c.bus)
-                sd_bus_unref(c.bus);
-
+        sd_bus_flush_close_unref(c.bus);
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

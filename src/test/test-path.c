@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -17,16 +18,22 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
 #include <stdbool.h>
+#include <stdio.h>
 
-#include "unit.h"
-#include "manager.h"
-#include "util.h"
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
 #include "macro.h"
-#include "strv.h"
+#include "manager.h"
 #include "mkdir.h"
 #include "rm-rf.h"
+#include "string-util.h"
+#include "strv.h"
+#include "test-helper.h"
+#include "tests.h"
+#include "unit.h"
+#include "util.h"
 
 typedef void (*test_function_t)(Manager *m);
 
@@ -39,9 +46,15 @@ static int setup_test(Manager **m) {
 
         assert_se(m);
 
-        r = manager_new(MANAGER_USER, true, &tmp);
-        if (IN_SET(r, -EPERM, -EACCES, -EADDRINUSE, -EHOSTDOWN, -ENOENT)) {
-                printf("Skipping test: manager_new: %s", strerror(-r));
+        r = enter_cgroup_subroot();
+        if (r == -ENOMEDIUM) {
+                log_notice_errno(r, "Skipping test: cgroupfs not available");
+                return -EXIT_TEST_SKIP;
+        }
+
+        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_MINIMAL, &tmp);
+        if (MANAGER_SKIP_TEST(r)) {
+                log_notice_errno(r, "Skipping test: manager_new: %m");
                 return -EXIT_TEST_SKIP;
         }
         assert_se(r >= 0);
@@ -50,7 +63,7 @@ static int setup_test(Manager **m) {
         STRV_FOREACH(test_path, tests_path) {
                 _cleanup_free_ char *p = NULL;
 
-                p = strjoin("/tmp/test-path_", *test_path, NULL);
+                p = strjoin("/tmp/test-path_", *test_path);
                 assert_se(p);
 
                 (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL);
@@ -88,7 +101,7 @@ static void check_stop_unlink(Manager *m, Unit *unit, const char *test_path, con
 
         ts = now(CLOCK_MONOTONIC);
         /* We process events until the service related to the path has been successfully started */
-        while(service->result != SERVICE_SUCCESS || service->state != SERVICE_START) {
+        while (service->result != SERVICE_SUCCESS || service->state != SERVICE_START) {
                 usec_t n;
                 int r;
 
@@ -238,7 +251,7 @@ static void test_path_makedirectory_directorymode(Manager *m) {
 }
 
 int main(int argc, char *argv[]) {
-        test_function_t tests[] = {
+        static const test_function_t tests[] = {
                 test_path_exists,
                 test_path_existsglob,
                 test_path_changed,
@@ -248,13 +261,16 @@ int main(int argc, char *argv[]) {
                 test_path_makedirectory_directorymode,
                 NULL,
         };
-        test_function_t *test = NULL;
+
+        _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
+        const test_function_t *test = NULL;
         Manager *m = NULL;
 
         log_parse_environment();
         log_open();
 
-        assert_se(set_unit_path(TEST_DIR) >= 0);
+        assert_se(set_unit_path(get_testdata_dir("/test-path")) >= 0);
+        assert_se(runtime_dir = setup_fake_runtime_dir());
 
         for (test = tests; test && *test; test++) {
                 int r;

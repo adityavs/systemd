@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -22,8 +21,9 @@
 ***/
 
 #include "sd-event.h"
-#include "macro.h"
+
 #include "import-util.h"
+#include "macro.h"
 
 typedef struct TarPull TarPull;
 
@@ -34,4 +34,4 @@ TarPull* tar_pull_unref(TarPull *pull);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(TarPull*, tar_pull_unref);
 
-int tar_pull_start(TarPull *pull, const char *url, const char *local, bool force_local, ImportVerify verify);
+int tar_pull_start(TarPull *pull, const char *url, const char *local, bool force_local, ImportVerify verify, bool settings);

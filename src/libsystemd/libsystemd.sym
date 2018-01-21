@@ -1,4 +1,6 @@
 /***
+  SPDX-License-Identifier: LGPL-2.1+
+
   This file is part of systemd.
 
   systemd is free software; you can redistribute it and/or modify it
@@ -459,3 +461,89 @@ global:
         sd_event_source_get_signal;
         sd_event_source_get_child_pid;
 } LIBSYSTEMD_220;
+
+LIBSYSTEMD_222 {
+global:
+        /* sd-bus */
+        sd_bus_emit_object_added;
+        sd_bus_emit_object_removed;
+        sd_bus_flush_close_unref;
+} LIBSYSTEMD_221;
+
+LIBSYSTEMD_226 {
+global:
+        sd_pid_get_cgroup;
+        sd_peer_get_cgroup;
+} LIBSYSTEMD_222;
+
+LIBSYSTEMD_227 {
+global:
+        sd_bus_default_flush_close;
+        sd_bus_path_decode_many;
+        sd_bus_path_encode_many;
+        sd_listen_fds_with_names;
+} LIBSYSTEMD_226;
+
+LIBSYSTEMD_229 {
+global:
+        sd_journal_has_runtime_files;
+        sd_journal_has_persistent_files;
+        sd_journal_enumerate_fields;
+        sd_journal_restart_fields;
+} LIBSYSTEMD_227;
+
+LIBSYSTEMD_230 {
+global:
+        sd_journal_open_directory_fd;
+        sd_journal_open_files_fd;
+} LIBSYSTEMD_229;
+
+LIBSYSTEMD_231 {
+global:
+        sd_event_get_iteration;
+} LIBSYSTEMD_230;
+
+LIBSYSTEMD_232 {
+global:
+        sd_bus_track_set_recursive;
+        sd_bus_track_get_recursive;
+        sd_bus_track_count_name;
+        sd_bus_track_count_sender;
+        sd_bus_set_exit_on_disconnect;
+        sd_bus_get_exit_on_disconnect;
+        sd_id128_get_invocation;
+} LIBSYSTEMD_231;
+
+LIBSYSTEMD_233 {
+global:
+        sd_id128_get_machine_app_specific;
+        sd_is_socket_sockaddr;
+} LIBSYSTEMD_232;
+
+LIBSYSTEMD_234 {
+global:
+        sd_bus_message_appendv;
+} LIBSYSTEMD_233;
+
+LIBSYSTEMD_236 {
+global:
+        sd_bus_message_new;
+        sd_bus_message_seal;
+} LIBSYSTEMD_234;
+
+LIBSYSTEMD_237 {
+global:
+        sd_bus_set_watch_bind;
+        sd_bus_get_watch_bind;
+        sd_bus_request_name_async;
+        sd_bus_release_name_async;
+        sd_bus_add_match_async;
+        sd_bus_match_signal;
+        sd_bus_match_signal_async;
+        sd_bus_is_ready;
+        sd_bus_set_connected_signal;
+        sd_bus_get_connected_signal;
+        sd_bus_set_sender;
+        sd_bus_get_sender;
+        sd_bus_message_set_sender;
+} LIBSYSTEMD_236;

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,21 +18,23 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
-#include <stdio.h>
 #include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
 
-#ifdef HAVE_SELINUX
+#if HAVE_SELINUX
 #include <selinux/selinux.h>
 #endif
 
+#include "log.h"
+#include "macro.h"
 #include "selinux-setup.h"
 #include "selinux-util.h"
-#include "macro.h"
+#include "string-util.h"
 #include "util.h"
-#include "log.h"
 
-#ifdef HAVE_SELINUX
+#if HAVE_SELINUX
+_printf_(2,3)
 static int null_log(int type, const char *fmt, ...) {
         return 0;
 }
@@ -41,10 +42,10 @@ static int null_log(int type, const char *fmt, ...) {
 
 int mac_selinux_setup(bool *loaded_policy) {
 
-#ifdef HAVE_SELINUX
+#if HAVE_SELINUX
         int enforce = 0;
         usec_t before_load, after_load;
-        security_context_t con;
+        char *con;
         int r;
         union selinux_callback cb;
         bool initialized = false;
@@ -77,24 +78,22 @@ int mac_selinux_setup(bool *loaded_policy) {
         before_load = now(CLOCK_MONOTONIC);
         r = selinux_init_load_policy(&enforce);
         if (r == 0) {
+                _cleanup_(mac_selinux_freep) char *label = NULL;
                 char timespan[FORMAT_TIMESPAN_MAX];
-                char *label;
 
                 mac_selinux_retest();
 
                 /* Transition to the new context */
                 r = mac_selinux_get_create_label_from_exe(SYSTEMD_BINARY_PATH, &label);
-                if (r < 0 || label == NULL) {
+                if (r < 0 || !label) {
                         log_open();
                         log_error("Failed to compute init label, ignoring.");
                 } else {
-                        r = setcon(label);
+                        r = setcon_raw(label);
 
                         log_open();
                         if (r < 0)
                                 log_error("Failed to transition into init label '%s', ignoring.", label);
-
-                        mac_selinux_free(label);
                 }
 
                 after_load = now(CLOCK_MONOTONIC);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -19,29 +18,45 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
+#include <stdio_ext.h>
 
 #include "sd-messages.h"
 
-#include "util.h"
-#include "mkdir.h"
-#include "hashmap.h"
-#include "fileio.h"
-#include "special.h"
-#include "unit-name.h"
-#include "bus-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
-#include "machine.h"
+#include "bus-util.h"
+#include "escape.h"
+#include "extract-word.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "format-util.h"
+#include "hashmap.h"
 #include "machine-dbus.h"
-#include "formats-util.h"
+#include "machine.h"
+#include "mkdir.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "special.h"
+#include "stdio-util.h"
+#include "string-table.h"
+#include "terminal-util.h"
+#include "unit-name.h"
+#include "user-util.h"
+#include "util.h"
 
-Machine* machine_new(Manager *manager, const char *name) {
+Machine* machine_new(Manager *manager, MachineClass class, const char *name) {
         Machine *m;
 
         assert(manager);
+        assert(class < _MACHINE_CLASS_MAX);
         assert(name);
+
+        /* Passing class == _MACHINE_CLASS_INVALID here is fine. It
+         * means as much as "we don't know yet", and that we'll figure
+         * it out later when loading the state file. */
 
         m = new0(Machine, 1);
         if (!m)
@@ -51,14 +66,17 @@ Machine* machine_new(Manager *manager, const char *name) {
         if (!m->name)
                 goto fail;
 
-        m->state_file = strappend("/run/systemd/machines/", m->name);
-        if (!m->state_file)
-                goto fail;
+        if (class != MACHINE_HOST) {
+                m->state_file = strappend("/run/systemd/machines/", m->name);
+                if (!m->state_file)
+                        goto fail;
+        }
+
+        m->class = class;
 
         if (hashmap_put(manager->machines, m->name, m) < 0)
                 goto fail;
 
-        m->class = _MACHINE_CLASS_INVALID;
         m->manager = manager;
 
         return m;
@@ -66,16 +84,14 @@ Machine* machine_new(Manager *manager, const char *name) {
 fail:
         free(m->state_file);
         free(m->name);
-        free(m);
-
-        return NULL;
+        return mfree(m);
 }
 
 void machine_free(Machine *m) {
         assert(m);
 
         while (m->operations)
-                machine_operation_unref(m->operations);
+                operation_free(m->operations);
 
         if (m->in_gc_queue)
                 LIST_REMOVE(gc_queue, m->manager->machine_gc_queue, m);
@@ -86,8 +102,11 @@ void machine_free(Machine *m) {
 
         (void) hashmap_remove(m->manager->machines, m->name);
 
+        if (m->manager->host_machine == m)
+                m->manager->host_machine = NULL;
+
         if (m->leader > 0)
-                (void) hashmap_remove_value(m->manager->machine_leaders, UINT_TO_PTR(m->leader), m);
+                (void) hashmap_remove_value(m->manager->machine_leaders, PID_TO_PTR(m->leader), m);
 
         sd_bus_message_unref(m->create_message);
 
@@ -105,20 +124,23 @@ int machine_save(Machine *m) {
         int r;
 
         assert(m);
-        assert(m->state_file);
+
+        if (!m->state_file)
+                return 0;
 
         if (!m->started)
                 return 0;
 
-        r = mkdir_safe_label("/run/systemd/machines", 0755, 0, 0);
+        r = mkdir_safe_label("/run/systemd/machines", 0755, 0, 0, false);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         r = fopen_temporary(m->state_file, &f, &temp_path);
         if (r < 0)
-                goto finish;
+                goto fail;
 
-        fchmod(fileno(f), 0644);
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
@@ -131,7 +153,7 @@ int machine_save(Machine *m) {
                 escaped = cescape(m->unit);
                 if (!escaped) {
                         r = -ENOMEM;
-                        goto finish;
+                        goto fail;
                 }
 
                 fprintf(f, "SCOPE=%s\n", escaped); /* We continue to call this "SCOPE=" because it is internal only, and we want to stay compatible with old files */
@@ -146,7 +168,7 @@ int machine_save(Machine *m) {
                 escaped = cescape(m->service);
                 if (!escaped) {
                         r = -ENOMEM;
-                        goto finish;
+                        goto fail;
                 }
                 fprintf(f, "SERVICE=%s\n", escaped);
         }
@@ -157,12 +179,12 @@ int machine_save(Machine *m) {
                 escaped = cescape(m->root_directory);
                 if (!escaped) {
                         r = -ENOMEM;
-                        goto finish;
+                        goto fail;
                 }
                 fprintf(f, "ROOT=%s\n", escaped);
         }
 
-        if (!sd_id128_equal(m->id, SD_ID128_NULL))
+        if (!sd_id128_is_null(m->id))
                 fprintf(f, "ID=" SD_ID128_FORMAT_STR "\n", SD_ID128_FORMAT_VAL(m->id));
 
         if (m->leader != 0)
@@ -195,15 +217,12 @@ int machine_save(Machine *m) {
 
         r = fflush_and_check(f);
         if (r < 0)
-                goto finish;
+                goto fail;
 
         if (rename(temp_path, m->state_file) < 0) {
                 r = -errno;
-                goto finish;
+                goto fail;
         }
-
-        free(temp_path);
-        temp_path = NULL;
 
         if (m->unit) {
                 char *sl;
@@ -215,14 +234,15 @@ int machine_save(Machine *m) {
                 (void) symlink(m->name, sl);
         }
 
-finish:
+        return 0;
+
+fail:
+        (void) unlink(m->state_file);
+
         if (temp_path)
-                unlink(temp_path);
+                (void) unlink(temp_path);
 
-        if (r < 0)
-                log_error_errno(r, "Failed to save machine data %s: %m", m->state_file);
-
-        return r;
+        return log_error_errno(r, "Failed to save machine data %s: %m", m->state_file);
 }
 
 static void machine_unlink(Machine *m) {
@@ -233,11 +253,11 @@ static void machine_unlink(Machine *m) {
                 char *sl;
 
                 sl = strjoina("/run/systemd/machines/unit:", m->unit);
-                unlink(sl);
+                (void) unlink(sl);
         }
 
         if (m->state_file)
-                unlink(m->state_file);
+                (void) unlink(m->state_file);
 }
 
 int machine_load(Machine *m) {
@@ -245,6 +265,9 @@ int machine_load(Machine *m) {
         int r;
 
         assert(m);
+
+        if (!m->state_file)
+                return 0;
 
         r = parse_env_file(m->state_file, NEWLINE,
                            "SCOPE",     &m->unit,
@@ -279,32 +302,32 @@ int machine_load(Machine *m) {
                         m->class = c;
         }
 
-        if (realtime) {
-                unsigned long long l;
-                if (sscanf(realtime, "%llu", &l) > 0)
-                        m->timestamp.realtime = l;
-        }
-
-        if (monotonic) {
-                unsigned long long l;
-                if (sscanf(monotonic, "%llu", &l) > 0)
-                        m->timestamp.monotonic = l;
-        }
+        if (realtime)
+                timestamp_deserialize(realtime, &m->timestamp.realtime);
+        if (monotonic)
+                timestamp_deserialize(monotonic, &m->timestamp.monotonic);
 
         if (netif) {
-                size_t l, allocated = 0, nr = 0;
-                const char *word, *state;
+                size_t allocated = 0, nr = 0;
+                const char *p;
                 int *ni = NULL;
 
-                FOREACH_WORD(word, l, netif, state) {
-                        char buf[l+1];
+                p = netif;
+                for (;;) {
+                        _cleanup_free_ char *word = NULL;
                         int ifi;
 
-                        *(char*) (mempcpy(buf, word, l)) = 0;
+                        r = extract_first_word(&p, &word, NULL, 0);
+                        if (r == 0)
+                                break;
+                        if (r == -ENOMEM)
+                                return log_oom();
+                        if (r < 0) {
+                                log_warning_errno(r, "Failed to parse NETIF: %s", netif);
+                                break;
+                        }
 
-                        if (safe_atoi(buf, &ifi) < 0)
-                                continue;
-                        if (ifi <= 0)
+                        if (parse_ifindex(word, &ifi) < 0)
                                 continue;
 
                         if (!GREEDY_REALLOC(ni, allocated, nr+1)) {
@@ -327,6 +350,7 @@ static int machine_start_scope(Machine *m, sd_bus_message *properties, sd_bus_er
         int r = 0;
 
         assert(m);
+        assert(m->class != MACHINE_HOST);
 
         if (!m->unit) {
                 _cleanup_free_ char *escaped = NULL;
@@ -336,7 +360,7 @@ static int machine_start_scope(Machine *m, sd_bus_message *properties, sd_bus_er
                 if (!escaped)
                         return log_oom();
 
-                scope = strjoin("machine-", escaped, ".scope", NULL);
+                scope = strjoin("machine-", escaped, ".scope");
                 if (!scope)
                         return log_oom();
 
@@ -366,10 +390,13 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
 
         assert(m);
 
+        if (!IN_SET(m->class, MACHINE_CONTAINER, MACHINE_VM))
+                return -EOPNOTSUPP;
+
         if (m->started)
                 return 0;
 
-        r = hashmap_put(m->manager->machine_leaders, UINT_TO_PTR(m->leader), m);
+        r = hashmap_put(m->manager->machine_leaders, PID_TO_PTR(m->leader), m);
         if (r < 0)
                 return r;
 
@@ -379,7 +406,7 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
                 return r;
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_MACHINE_START),
+                   "MESSAGE_ID=" SD_MESSAGE_MACHINE_START_STR,
                    "NAME=%s", m->name,
                    "LEADER="PID_FMT, m->leader,
                    LOG_MESSAGE("New machine %s.", m->name),
@@ -399,11 +426,12 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
 }
 
 static int machine_stop_scope(Machine *m) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         char *job = NULL;
         int r;
 
         assert(m);
+        assert(m->class != MACHINE_HOST);
 
         if (!m->unit)
                 return 0;
@@ -421,35 +449,48 @@ static int machine_stop_scope(Machine *m) {
 }
 
 int machine_stop(Machine *m) {
-        int r = 0, k;
+        int r;
+        assert(m);
+
+        if (!IN_SET(m->class, MACHINE_CONTAINER, MACHINE_VM))
+                return -EOPNOTSUPP;
+
+        r = machine_stop_scope(m);
+
+        m->stopping = true;
+
+        machine_save(m);
+
+        return r;
+}
+
+int machine_finalize(Machine *m) {
         assert(m);
 
         if (m->started)
                 log_struct(LOG_INFO,
-                           LOG_MESSAGE_ID(SD_MESSAGE_MACHINE_STOP),
+                           "MESSAGE_ID=" SD_MESSAGE_MACHINE_STOP_STR,
                            "NAME=%s", m->name,
                            "LEADER="PID_FMT, m->leader,
                            LOG_MESSAGE("Machine %s terminated.", m->name),
                            NULL);
 
-        /* Kill cgroup */
-        k = machine_stop_scope(m);
-        if (k < 0)
-                r = k;
-
         machine_unlink(m);
         machine_add_to_gc_queue(m);
 
-        if (m->started)
+        if (m->started) {
                 machine_send_signal(m, false);
+                m->started = false;
+        }
 
-        m->started = false;
-
-        return r;
+        return 0;
 }
 
 bool machine_check_gc(Machine *m, bool drop_not_started) {
         assert(m);
+
+        if (m->class == MACHINE_HOST)
+                return true;
 
         if (drop_not_started && !m->started)
                 return false;
@@ -476,14 +517,23 @@ void machine_add_to_gc_queue(Machine *m) {
 MachineState machine_get_state(Machine *s) {
         assert(s);
 
+        if (s->class == MACHINE_HOST)
+                return MACHINE_RUNNING;
+
+        if (s->stopping)
+                return MACHINE_CLOSING;
+
         if (s->scope_job)
-                return s->started ? MACHINE_OPENING : MACHINE_CLOSING;
+                return MACHINE_OPENING;
 
         return MACHINE_RUNNING;
 }
 
 int machine_kill(Machine *m, KillWho who, int signo) {
         assert(m);
+
+        if (!IN_SET(m->class, MACHINE_VM, MACHINE_CONTAINER))
+                return -EOPNOTSUPP;
 
         if (!m->unit)
                 return -ESRCH;
@@ -497,30 +547,56 @@ int machine_kill(Machine *m, KillWho who, int signo) {
                 return 0;
         }
 
-        /* Otherwise make PID 1 do it for us, for the entire cgroup */
+        /* Otherwise, make PID 1 do it for us, for the entire cgroup */
         return manager_kill_unit(m->manager, m->unit, signo, NULL);
 }
 
-MachineOperation *machine_operation_unref(MachineOperation *o) {
-        if (!o)
-                return NULL;
+int machine_openpt(Machine *m, int flags) {
+        assert(m);
 
-        sd_event_source_unref(o->event_source);
+        switch (m->class) {
 
-        safe_close(o->errno_fd);
+        case MACHINE_HOST: {
+                int fd;
 
-        if (o->pid > 1)
-                (void) kill(o->pid, SIGKILL);
+                fd = posix_openpt(flags);
+                if (fd < 0)
+                        return -errno;
 
-        sd_bus_message_unref(o->message);
+                if (unlockpt(fd) < 0)
+                        return -errno;
 
-        if (o->machine) {
-                LIST_REMOVE(operations, o->machine->operations, o);
-                o->machine->n_operations--;
+                return fd;
         }
 
-        free(o);
-        return NULL;
+        case MACHINE_CONTAINER:
+                if (m->leader <= 0)
+                        return -EINVAL;
+
+                return openpt_in_namespace(m->leader, flags);
+
+        default:
+                return -EOPNOTSUPP;
+        }
+}
+
+int machine_open_terminal(Machine *m, const char *path, int mode) {
+        assert(m);
+
+        switch (m->class) {
+
+        case MACHINE_HOST:
+                return open_terminal(path, mode);
+
+        case MACHINE_CONTAINER:
+                if (m->leader <= 0)
+                        return -EINVAL;
+
+                return open_terminal_in_namespace(m->leader, path, mode);
+
+        default:
+                return -EOPNOTSUPP;
+        }
 }
 
 void machine_release_unit(Machine *m) {
@@ -530,13 +606,103 @@ void machine_release_unit(Machine *m) {
                 return;
 
         (void) hashmap_remove(m->manager->machine_units, m->unit);
-        free(m->unit);
-        m->unit = NULL;
+        m->unit = mfree(m->unit);
+}
+
+int machine_get_uid_shift(Machine *m, uid_t *ret) {
+        char p[STRLEN("/proc//uid_map") + DECIMAL_STR_MAX(pid_t) + 1];
+        uid_t uid_base, uid_shift, uid_range;
+        gid_t gid_base, gid_shift, gid_range;
+        _cleanup_fclose_ FILE *f = NULL;
+        int k;
+
+        assert(m);
+        assert(ret);
+
+        /* Return the base UID/GID of the specified machine. Note that this only works for containers with simple
+         * mappings. In most cases setups should be simple like this, and administrators should only care about the
+         * basic offset a container has relative to the host. This is what this function exposes.
+         *
+         * If we encounter any more complex mappings we politely refuse this with ENXIO. */
+
+        if (m->class == MACHINE_HOST) {
+                *ret = 0;
+                return 0;
+        }
+
+        if (m->class != MACHINE_CONTAINER)
+                return -EOPNOTSUPP;
+
+        xsprintf(p, "/proc/" PID_FMT "/uid_map", m->leader);
+        f = fopen(p, "re");
+        if (!f) {
+                if (errno == ENOENT) {
+                        /* If the file doesn't exist, user namespacing is off in the kernel, return a zero mapping hence. */
+                        *ret = 0;
+                        return 0;
+                }
+
+                return -errno;
+        }
+
+        /* Read the first line. There's at least one. */
+        errno = 0;
+        k = fscanf(f, UID_FMT " " UID_FMT " " UID_FMT "\n", &uid_base, &uid_shift, &uid_range);
+        if (k != 3) {
+                if (ferror(f))
+                        return -errno;
+
+                return -EBADMSG;
+        }
+
+        /* Not a mapping starting at 0? Then it's a complex mapping we can't expose here. */
+        if (uid_base != 0)
+                return -ENXIO;
+        /* Insist that at least the nobody user is mapped, everything else is weird, and hence complex, and we don't support it */
+        if (uid_range < UID_NOBODY)
+                return -ENXIO;
+
+        /* If there's more than one line, then we don't support this mapping. */
+        if (fgetc(f) != EOF)
+                return -ENXIO;
+
+        fclose(f);
+
+        xsprintf(p, "/proc/" PID_FMT "/gid_map", m->leader);
+        f = fopen(p, "re");
+        if (!f)
+                return -errno;
+
+        /* Read the first line. There's at least one. */
+        errno = 0;
+        k = fscanf(f, GID_FMT " " GID_FMT " " GID_FMT "\n", &gid_base, &gid_shift, &gid_range);
+        if (k != 3) {
+                if (ferror(f))
+                        return -errno;
+
+                return -EBADMSG;
+        }
+
+        /* If there's more than one line, then we don't support this file. */
+        if (fgetc(f) != EOF)
+                return -ENXIO;
+
+        /* If the UID and GID mapping doesn't match, we don't support this mapping. */
+        if (uid_base != (uid_t) gid_base)
+                return -ENXIO;
+        if (uid_shift != (uid_t) gid_shift)
+                return -ENXIO;
+        if (uid_range != (uid_t) gid_range)
+                return -ENXIO;
+
+        *ret = uid_shift;
+        return 0;
 }
 
 static const char* const machine_class_table[_MACHINE_CLASS_MAX] = {
         [MACHINE_CONTAINER] = "container",
-        [MACHINE_VM] = "vm"
+        [MACHINE_VM] = "vm",
+        [MACHINE_HOST] = "host",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(machine_class, MachineClass);

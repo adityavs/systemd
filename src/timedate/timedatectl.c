@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,20 +19,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <stdbool.h>
 #include <getopt.h>
 #include <locale.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 #include "sd-bus.h"
-#include "bus-util.h"
+
 #include "bus-error.h"
-#include "util.h"
-#include "spawn-polkit-agent.h"
-#include "build.h"
-#include "strv.h"
+#include "bus-util.h"
 #include "pager.h"
+#include "parse-util.h"
+#include "spawn-polkit-agent.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "util.h"
 
 static bool arg_no_pager = false;
 static bool arg_ask_password = true;
@@ -41,36 +41,16 @@ static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static char *arg_host = NULL;
 static bool arg_adjust_system_clock = false;
 
-static void pager_open_if_enabled(void) {
-
-        if (arg_no_pager)
-                return;
-
-        pager_open(false);
-}
-
-static void polkit_agent_open_if_enabled(void) {
-
-        /* Open the polkit agent as a child process if necessary */
-        if (!arg_ask_password)
-                return;
-
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
-                return;
-
-        polkit_agent_open();
-}
-
 typedef struct StatusInfo {
         usec_t time;
         char *timezone;
 
         usec_t rtc_time;
-        bool rtc_local;
+        int rtc_local;
 
-        bool ntp_enabled;
-        bool ntp_capable;
-        bool ntp_synced;
+        int ntp_enabled;
+        int ntp_capable;
+        int ntp_synced;
 } StatusInfo;
 
 static void status_info_clear(StatusInfo *info) {
@@ -81,12 +61,13 @@ static void status_info_clear(StatusInfo *info) {
 }
 
 static void print_status_info(const StatusInfo *i) {
-        char a[FORMAT_TIMESTAMP_MAX];
+        char a[LINE_MAX];
         struct tm tm;
         time_t sec;
         bool have_time = false;
         const char *old_tz = NULL, *tz;
         int r;
+        size_t n;
 
         assert(i);
 
@@ -96,7 +77,7 @@ static void print_status_info(const StatusInfo *i) {
                 old_tz = strdupa(tz);
 
         /* Set the new $TZ */
-        if (setenv("TZ", i->timezone, true) < 0)
+        if (setenv("TZ", isempty(i->timezone) ? "UTC" : i->timezone, true) < 0)
                 log_warning_errno(errno, "Failed to set TZ environment variable, ignoring: %m");
         else
                 tzset();
@@ -111,27 +92,27 @@ static void print_status_info(const StatusInfo *i) {
                 log_warning("Could not get time from timedated and not operating locally, ignoring.");
 
         if (have_time) {
-                xstrftime(a, "%a %Y-%m-%d %H:%M:%S %Z", localtime_r(&sec, &tm));
-                printf("      Local time: %.*s\n", (int) sizeof(a), a);
+                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S %Z", localtime_r(&sec, &tm));
+                printf("                      Local time: %s\n", n > 0 ? a : "n/a");
 
-                xstrftime(a, "%a %Y-%m-%d %H:%M:%S UTC", gmtime_r(&sec, &tm));
-                printf("  Universal time: %.*s\n", (int) sizeof(a), a);
+                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S UTC", gmtime_r(&sec, &tm));
+                printf("                  Universal time: %s\n", n > 0 ? a : "n/a");
         } else {
-                printf("      Local time: %s\n", "n/a");
-                printf("  Universal time: %s\n", "n/a");
+                printf("                      Local time: %s\n", "n/a");
+                printf("                  Universal time: %s\n", "n/a");
         }
 
         if (i->rtc_time > 0) {
                 time_t rtc_sec;
 
                 rtc_sec = (time_t) (i->rtc_time / USEC_PER_SEC);
-                xstrftime(a, "%a %Y-%m-%d %H:%M:%S", gmtime_r(&rtc_sec, &tm));
-                printf("        RTC time: %.*s\n", (int) sizeof(a), a);
+                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S", gmtime_r(&rtc_sec, &tm));
+                printf("                        RTC time: %s\n", n > 0 ? a : "n/a");
         } else
-                printf("        RTC time: %s\n", "n/a");
+                printf("                        RTC time: %s\n", "n/a");
 
         if (have_time)
-                xstrftime(a, "%Z, %z", localtime_r(&sec, &tm));
+                n = strftime(a, sizeof a, "%Z, %z", localtime_r(&sec, &tm));
 
         /* Restore the $TZ */
         if (old_tz)
@@ -143,22 +124,23 @@ static void print_status_info(const StatusInfo *i) {
         else
                 tzset();
 
-        printf("       Time zone: %s (%.*s)\n"
-               " Network time on: %s\n"
-               "NTP synchronized: %s\n"
-               " RTC in local TZ: %s\n",
-               strna(i->timezone), (int) sizeof(a), have_time ? a : "n/a",
-               i->ntp_capable ? yes_no(i->ntp_enabled) : "n/a",
+        printf("                       Time zone: %s (%s)\n"
+               "       System clock synchronized: %s\n"
+               "systemd-timesyncd.service active: %s\n"
+               "                 RTC in local TZ: %s\n",
+               strna(i->timezone), have_time && n > 0 ? a : "n/a",
                yes_no(i->ntp_synced),
+               i->ntp_capable ? yes_no(i->ntp_enabled) : "n/a",
                yes_no(i->rtc_local));
 
         if (i->rtc_local)
-                fputs("\n" ANSI_HIGHLIGHT_ON
-                      "Warning: The system is configured to read the RTC time in the local time zone. This\n"
-                      "         mode can not be fully supported. It will create various problems with time\n"
-                      "         zone changes and daylight saving time adjustments. The RTC time is never updated,\n"
-                      "         it relies on external facilities to maintain it. If at all possible, use\n"
-                      "         RTC in UTC by calling 'timedatectl set-local-rtc 0'" ANSI_HIGHLIGHT_OFF ".\n", stdout);
+                printf("\n%s"
+                       "Warning: The system is configured to read the RTC time in the local time zone.\n"
+                       "         This mode can not be fully supported. It will create various problems\n"
+                       "         with time zone changes and daylight saving time adjustments. The RTC\n"
+                       "         time is never updated, it relies on external facilities to maintain it.\n"
+                       "         If at all possible, use RTC in UTC by calling\n"
+                       "         'timedatectl set-local-rtc 0'.%s\n", ansi_highlight(), ansi_normal());
 }
 
 static int show_status(sd_bus *bus, char **args, unsigned n) {
@@ -173,6 +155,8 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
                 { "RTCTimeUSec",     "t", NULL, offsetof(StatusInfo, rtc_time) },
                 {}
         };
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(bus);
@@ -181,9 +165,10 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
                                    "org.freedesktop.timedate1",
                                    "/org/freedesktop/timedate1",
                                    map,
+                                   &error,
                                    &info);
         if (r < 0)
-                return log_error_errno(r, "Failed to query server: %m");
+                return log_error_errno(r, "Failed to query server: %s", bus_error_message(&error, r));
 
         print_status_info(&info);
 
@@ -191,7 +176,7 @@ static int show_status(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_time(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         bool relative = false, interactive = arg_ask_password;
         usec_t t;
         int r;
@@ -199,7 +184,7 @@ static int set_time(sd_bus *bus, char **args, unsigned n) {
         assert(args);
         assert(n == 2);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = parse_timestamp(args[1], &t);
         if (r < 0) {
@@ -222,13 +207,13 @@ static int set_time(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_timezone(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(args);
         assert(n == 2);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call_method(bus,
                                "org.freedesktop.timedate1",
@@ -245,13 +230,13 @@ static int set_timezone(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_local_rtc(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r, b;
 
         assert(args);
         assert(n == 2);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         b = parse_boolean(args[1]);
         if (b < 0) {
@@ -274,13 +259,13 @@ static int set_local_rtc(sd_bus *bus, char **args, unsigned n) {
 }
 
 static int set_ntp(sd_bus *bus, char **args, unsigned n) {
-        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int b, r;
 
         assert(args);
         assert(n == 2);
 
-        polkit_agent_open_if_enabled();
+        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         b = parse_boolean(args[1]);
         if (b < 0) {
@@ -313,7 +298,7 @@ static int list_timezones(sd_bus *bus, char **args, unsigned n) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read list of time zones: %m");
 
-        pager_open_if_enabled();
+        pager_open(arg_no_pager, false);
         strv_print(zones);
 
         return 0;
@@ -373,9 +358,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case ARG_VERSION:
-                        puts(PACKAGE_STRING);
-                        puts(SYSTEMD_FEATURES);
-                        return 0;
+                        return version();
 
                 case 'H':
                         arg_transport = BUS_TRANSPORT_REMOTE;
@@ -490,7 +473,7 @@ static int timedatectl_main(sd_bus *bus, int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");
@@ -501,7 +484,7 @@ int main(int argc, char *argv[]) {
         if (r <= 0)
                 goto finish;
 
-        r = bus_open_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0) {
                 log_error_errno(r, "Failed to create bus connection: %m");
                 goto finish;
@@ -510,6 +493,9 @@ int main(int argc, char *argv[]) {
         r = timedatectl_main(bus, argc, argv);
 
 finish:
+        /* make sure we terminate the bus connection first, and then close the
+         * pager, see issue #3543 for the details. */
+        sd_bus_flush_close_unref(bus);
         pager_close();
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;

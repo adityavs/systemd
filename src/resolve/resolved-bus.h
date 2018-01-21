@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -24,3 +23,4 @@
 #include "resolved-manager.h"
 
 int manager_connect_bus(Manager *m);
+int bus_dns_server_append(sd_bus_message *reply, DnsServer *s, bool with_ifindex);

@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
   This file is part of systemd.
 
@@ -20,27 +19,33 @@
 ***/
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <sys/epoll.h>
-#include <signal.h>
-#include <libmount.h>
-#include <sys/inotify.h>
 
-#include "manager.h"
-#include "unit.h"
-#include "mount.h"
-#include "log.h"
 #include "sd-messages.h"
-#include "strv.h"
-#include "mkdir.h"
-#include "path-util.h"
-#include "mount-setup.h"
-#include "unit-name.h"
+
+#include "alloc-util.h"
 #include "dbus-mount.h"
-#include "special.h"
+#include "escape.h"
 #include "exit-status.h"
+#include "format-util.h"
 #include "fstab-util.h"
-#include "formats-util.h"
+#include "log.h"
+#include "manager.h"
+#include "mkdir.h"
+#include "mount-setup.h"
+#include "mount-util.h"
+#include "mount.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "process-util.h"
+#include "special.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "strv.h"
+#include "unit-name.h"
+#include "unit.h"
 
 #define RETRY_UMOUNT_MAX 32
 
@@ -54,8 +59,6 @@ static const UnitActiveState state_translation_table[_MOUNT_STATE_MAX] = {
         [MOUNT_MOUNTED] = UNIT_ACTIVE,
         [MOUNT_REMOUNTING] = UNIT_RELOADING,
         [MOUNT_UNMOUNTING] = UNIT_DEACTIVATING,
-        [MOUNT_MOUNTING_SIGTERM] = UNIT_DEACTIVATING,
-        [MOUNT_MOUNTING_SIGKILL] = UNIT_DEACTIVATING,
         [MOUNT_REMOUNTING_SIGTERM] = UNIT_RELOADING,
         [MOUNT_REMOUNTING_SIGKILL] = UNIT_RELOADING,
         [MOUNT_UNMOUNTING_SIGTERM] = UNIT_DEACTIVATING,
@@ -65,6 +68,18 @@ static const UnitActiveState state_translation_table[_MOUNT_STATE_MAX] = {
 
 static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *userdata);
 static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata);
+
+static bool MOUNT_STATE_WITH_PROCESS(MountState state) {
+        return IN_SET(state,
+                      MOUNT_MOUNTING,
+                      MOUNT_MOUNTING_DONE,
+                      MOUNT_REMOUNTING,
+                      MOUNT_REMOUNTING_SIGTERM,
+                      MOUNT_REMOUNTING_SIGKILL,
+                      MOUNT_UNMOUNTING,
+                      MOUNT_UNMOUNTING_SIGTERM,
+                      MOUNT_UNMOUNTING_SIGKILL);
+}
 
 static bool mount_needs_network(const char *options, const char *fstype) {
         if (fstab_test_option(options, "_netdev\0"))
@@ -80,6 +95,15 @@ static bool mount_is_network(const MountParameters *p) {
         assert(p);
 
         return mount_needs_network(p->options, p->fstype);
+}
+
+static bool mount_is_loop(const MountParameters *p) {
+        assert(p);
+
+        if (fstab_test_option(p->options, "loop\0"))
+                return true;
+
+        return false;
 }
 
 static bool mount_is_bind(const MountParameters *p) {
@@ -98,6 +122,24 @@ static bool mount_is_auto(const MountParameters *p) {
         assert(p);
 
         return !fstab_test_option(p->options, "noauto\0");
+}
+
+static bool mount_is_automount(const MountParameters *p) {
+        assert(p);
+
+        return fstab_test_option(p->options,
+                                 "comment=systemd.automount\0"
+                                 "x-systemd.automount\0");
+}
+
+static bool mount_is_bound_to_device(const Mount *m) {
+        const MountParameters *p;
+
+        if (m->from_fragment)
+                return true;
+
+        p = &m->parameters_proc_self_mountinfo;
+        return fstab_test_option(p->options, "x-systemd.device-bound\0");
 }
 
 static bool needs_quota(const MountParameters *p) {
@@ -122,18 +164,11 @@ static void mount_init(Unit *u) {
         assert(u->load_state == UNIT_STUB);
 
         m->timeout_usec = u->manager->default_timeout_start_usec;
-        m->directory_mode = 0755;
 
-        if (unit_has_name(u, "-.mount")) {
-                /* Don't allow start/stop for root directory */
-                u->refuse_manual_start = true;
-                u->refuse_manual_stop = true;
-        } else {
-                /* The stdio/kmsg bridge socket is on /, in order to avoid a
-                 * dep loop, don't use kmsg logging for -.mount */
-                m->exec_context.std_output = u->manager->default_std_output;
-                m->exec_context.std_error = u->manager->default_std_error;
-        }
+        m->exec_context.std_output = u->manager->default_std_output;
+        m->exec_context.std_error = u->manager->default_std_error;
+
+        m->directory_mode = 0755;
 
         /* We need to make sure that /usr/bin/mount is always called
          * in the same process group as us, so that the autofs kernel
@@ -146,29 +181,27 @@ static void mount_init(Unit *u) {
         u->ignore_on_isolate = true;
 }
 
-static int mount_arm_timer(Mount *m) {
+static int mount_arm_timer(Mount *m, usec_t usec) {
         int r;
 
         assert(m);
 
-        if (m->timeout_usec <= 0) {
-                m->timer_event_source = sd_event_source_unref(m->timer_event_source);
-                return 0;
-        }
-
         if (m->timer_event_source) {
-                r = sd_event_source_set_time(m->timer_event_source, now(CLOCK_MONOTONIC) + m->timeout_usec);
+                r = sd_event_source_set_time(m->timer_event_source, usec);
                 if (r < 0)
                         return r;
 
                 return sd_event_source_set_enabled(m->timer_event_source, SD_EVENT_ONESHOT);
         }
 
+        if (usec == USEC_INFINITY)
+                return 0;
+
         r = sd_event_add_time(
                         UNIT(m)->manager->event,
                         &m->timer_event_source,
                         CLOCK_MONOTONIC,
-                        now(CLOCK_MONOTONIC) + m->timeout_usec, 0,
+                        usec, 0,
                         mount_dispatch_timer, m);
         if (r < 0)
                 return r;
@@ -203,8 +236,7 @@ static void mount_done(Unit *u) {
 
         assert(m);
 
-        free(m->where);
-        m->where = NULL;
+        m->where = mfree(m->where);
 
         mount_parameters_done(&m->parameters_proc_self_mountinfo);
         mount_parameters_done(&m->parameters_fragment);
@@ -212,6 +244,8 @@ static void mount_done(Unit *u) {
         m->exec_runtime = exec_runtime_unref(m->exec_runtime);
         exec_command_done_array(m->exec_command, _MOUNT_EXEC_COMMAND_MAX);
         m->control_command = NULL;
+
+        dynamic_creds_unref(&m->dynamic_creds);
 
         mount_unwatch_control_pid(m);
 
@@ -236,8 +270,7 @@ _pure_ static MountParameters* get_mount_parameters(Mount *m) {
         return get_mount_parameters_fragment(m);
 }
 
-static int mount_add_mount_links(Mount *m) {
-        _cleanup_free_ char *parent = NULL;
+static int mount_add_mount_dependencies(Mount *m) {
         MountParameters *pm;
         Unit *other;
         Iterator i;
@@ -247,32 +280,32 @@ static int mount_add_mount_links(Mount *m) {
         assert(m);
 
         if (!path_equal(m->where, "/")) {
-                /* Adds in links to other mount points that might lie further
-                 * up in the hierarchy */
-                r = path_get_parent(m->where, &parent);
-                if (r < 0)
-                        return r;
+                _cleanup_free_ char *parent = NULL;
 
-                r = unit_require_mounts_for(UNIT(m), parent);
+                /* Adds in links to other mount points that might lie further up in the hierarchy */
+
+                parent = dirname_malloc(m->where);
+                if (!parent)
+                        return -ENOMEM;
+
+                r = unit_require_mounts_for(UNIT(m), parent, UNIT_DEPENDENCY_IMPLICIT);
                 if (r < 0)
                         return r;
         }
 
-        /* Adds in links to other mount points that might be needed
-         * for the source path (if this is a bind mount) to be
-         * available. */
+        /* Adds in dependencies to other mount points that might be needed for the source path (if this is a bind mount
+         * or a loop mount) to be available. */
         pm = get_mount_parameters_fragment(m);
         if (pm && pm->what &&
             path_is_absolute(pm->what) &&
-            !mount_is_network(pm)) {
+            (mount_is_bind(pm) || mount_is_loop(pm) || !mount_is_network(pm))) {
 
-                r = unit_require_mounts_for(UNIT(m), pm->what);
+                r = unit_require_mounts_for(UNIT(m), pm->what, UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
         }
 
-        /* Adds in links to other units that use this path or paths
-         * further down in the hierarchy */
+        /* Adds in dependencies to other units that use this path or paths further down in the hierarchy */
         s = manager_get_units_requiring_mounts_for(UNIT(m)->manager, m->where);
         SET_FOREACH(other, s, i) {
 
@@ -282,13 +315,13 @@ static int mount_add_mount_links(Mount *m) {
                 if (other == UNIT(m))
                         continue;
 
-                r = unit_add_dependency(other, UNIT_AFTER, UNIT(m), true);
+                r = unit_add_dependency(other, UNIT_AFTER, UNIT(m), true, UNIT_DEPENDENCY_PATH);
                 if (r < 0)
                         return r;
 
                 if (UNIT(m)->fragment_path) {
                         /* If we have fragment configuration, then make this dependency required */
-                        r = unit_add_dependency(other, UNIT_REQUIRES, UNIT(m), true);
+                        r = unit_add_dependency(other, UNIT_REQUIRES, UNIT(m), true, UNIT_DEPENDENCY_PATH);
                         if (r < 0)
                                 return r;
                 }
@@ -297,9 +330,11 @@ static int mount_add_mount_links(Mount *m) {
         return 0;
 }
 
-static int mount_add_device_links(Mount *m) {
-        MountParameters *p;
+static int mount_add_device_dependencies(Mount *m) {
         bool device_wants_mount = false;
+        UnitDependencyMask mask;
+        MountParameters *p;
+        UnitDependency dep;
         int r;
 
         assert(m);
@@ -326,23 +361,33 @@ static int mount_add_device_links(Mount *m) {
         if (path_equal(m->where, "/"))
                 return 0;
 
-        if (mount_is_auto(p) && UNIT(m)->manager->running_as == MANAGER_SYSTEM)
+        if (mount_is_auto(p) && !mount_is_automount(p) && MANAGER_IS_SYSTEM(UNIT(m)->manager))
                 device_wants_mount = true;
 
-        r = unit_add_node_link(UNIT(m), p->what, device_wants_mount);
+        /* Mount units from /proc/self/mountinfo are not bound to devices
+         * by default since they're subject to races when devices are
+         * unplugged. But the user can still force this dep with an
+         * appropriate option (or udev property) so the mount units are
+         * automatically stopped when the device disappears suddenly. */
+        dep = mount_is_bound_to_device(m) ? UNIT_BINDS_TO : UNIT_REQUIRES;
+
+        mask = m->from_fragment ? UNIT_DEPENDENCY_FILE : UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT;
+
+        r = unit_add_node_dependency(UNIT(m), p->what, device_wants_mount, dep, mask);
         if (r < 0)
                 return r;
 
         return 0;
 }
 
-static int mount_add_quota_links(Mount *m) {
-        int r;
+static int mount_add_quota_dependencies(Mount *m) {
+        UnitDependencyMask mask;
         MountParameters *p;
+        int r;
 
         assert(m);
 
-        if (UNIT(m)->manager->running_as != MANAGER_SYSTEM)
+        if (!MANAGER_IS_SYSTEM(UNIT(m)->manager))
                 return 0;
 
         p = get_mount_parameters_fragment(m);
@@ -352,86 +397,110 @@ static int mount_add_quota_links(Mount *m) {
         if (!needs_quota(p))
                 return 0;
 
-        r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_WANTS, SPECIAL_QUOTACHECK_SERVICE, NULL, true);
+        mask = m->from_fragment ? UNIT_DEPENDENCY_FILE : UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT;
+
+        r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_WANTS, SPECIAL_QUOTACHECK_SERVICE, NULL, true, mask);
         if (r < 0)
                 return r;
 
-        r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_WANTS, SPECIAL_QUOTAON_SERVICE, NULL, true);
+        r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_WANTS, SPECIAL_QUOTAON_SERVICE, NULL, true, mask);
         if (r < 0)
                 return r;
 
         return 0;
 }
 
-static bool should_umount(Mount *m) {
+static bool mount_is_extrinsic(Mount *m) {
         MountParameters *p;
+        assert(m);
 
-        if (path_equal(m->where, "/") ||
-            path_equal(m->where, "/usr"))
-                return false;
+        /* Returns true for all units that are "magic" and should be excluded from the usual start-up and shutdown
+         * dependencies. We call them "extrinsic" here, as they are generally mounted outside of the systemd dependency
+         * logic. We shouldn't attempt to manage them ourselves but it's fine if the user operates on them with us. */
 
+        if (!MANAGER_IS_SYSTEM(UNIT(m)->manager)) /* We only automatically manage mounts if we are in system mode */
+                return true;
+
+        if (PATH_IN_SET(m->where,  /* Don't bother with the OS data itself */
+                        "/",
+                        "/usr"))
+                return true;
+
+        if (PATH_STARTSWITH_SET(m->where,
+                                "/run/initramfs",    /* This should stay around from before we boot until after we shutdown */
+                                "/proc",             /* All of this is API VFS */
+                                "/sys",              /* … dito … */
+                                "/dev"))             /* … dito … */
+                return true;
+
+        /* If this is an initrd mount, and we are not in the initrd, then leave this around forever, too. */
         p = get_mount_parameters(m);
-        if (p && fstab_test_option(p->options, "x-initrd.mount\0") &&
-            !in_initrd())
-                return false;
+        if (p && fstab_test_option(p->options, "x-initrd.mount\0") && !in_initrd())
+                return true;
 
-        return true;
+        return false;
 }
 
 static int mount_add_default_dependencies(Mount *m) {
-        const char *after, *after2, *online;
-        MountParameters *p;
+        UnitDependencyMask mask;
         int r;
+        MountParameters *p;
+        const char *after;
 
         assert(m);
 
-        if (UNIT(m)->manager->running_as != MANAGER_SYSTEM)
+        if (!UNIT(m)->default_dependencies)
                 return 0;
 
-        /* We do not add any default dependencies to / and /usr, since
-         * they are guaranteed to stay mounted the whole time, since
-         * our system is on it. Also, don't bother with anything
-         * mounted below virtual file systems, it's also going to be
-         * virtual, and hence not worth the effort. */
-        if (path_equal(m->where, "/") ||
-            path_equal(m->where, "/usr") ||
-            path_startswith(m->where, "/proc") ||
-            path_startswith(m->where, "/sys") ||
-            path_startswith(m->where, "/dev"))
+        /* We do not add any default dependencies to /, /usr or /run/initramfs/, since they are guaranteed to stay
+         * mounted the whole time, since our system is on it.  Also, don't bother with anything mounted below virtual
+         * file systems, it's also going to be virtual, and hence not worth the effort. */
+        if (mount_is_extrinsic(m))
                 return 0;
 
         p = get_mount_parameters(m);
         if (!p)
                 return 0;
 
-        if (mount_is_network(p)) {
-                after = SPECIAL_REMOTE_FS_PRE_TARGET;
-                after2 = SPECIAL_NETWORK_TARGET;
-                online = SPECIAL_NETWORK_ONLINE_TARGET;
-        } else {
-                after = SPECIAL_LOCAL_FS_PRE_TARGET;
-                after2 = NULL;
-                online = NULL;
-        }
+        mask = m->from_fragment ? UNIT_DEPENDENCY_FILE : UNIT_DEPENDENCY_MOUNTINFO_DEFAULT;
 
-        r = unit_add_dependency_by_name(UNIT(m), UNIT_AFTER, after, NULL, true);
+        if (mount_is_network(p)) {
+                /* We order ourselves after network.target. This is
+                 * primarily useful at shutdown: services that take
+                 * down the network should order themselves before
+                 * network.target, so that they are shut down only
+                 * after this mount unit is stopped. */
+
+                r = unit_add_dependency_by_name(UNIT(m), UNIT_AFTER, SPECIAL_NETWORK_TARGET, NULL, true, mask);
+                if (r < 0)
+                        return r;
+
+                /* We pull in network-online.target, and order
+                 * ourselves after it. This is useful at start-up to
+                 * actively pull in tools that want to be started
+                 * before we start mounting network file systems, and
+                 * whose purpose it is to delay this until the network
+                 * is "up". */
+
+                r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_WANTS, UNIT_AFTER, SPECIAL_NETWORK_ONLINE_TARGET, NULL, true, mask);
+                if (r < 0)
+                        return r;
+
+                after = SPECIAL_REMOTE_FS_PRE_TARGET;
+        } else
+                after = SPECIAL_LOCAL_FS_PRE_TARGET;
+
+        r = unit_add_dependency_by_name(UNIT(m), UNIT_AFTER, after, NULL, true, mask);
         if (r < 0)
                 return r;
 
-        if (after2) {
-                r = unit_add_dependency_by_name(UNIT(m), UNIT_AFTER, after2, NULL, true);
-                if (r < 0)
-                        return r;
-        }
+        r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true, mask);
+        if (r < 0)
+                return r;
 
-        if (online) {
-                r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_WANTS, UNIT_AFTER, online, NULL, true);
-                if (r < 0)
-                        return r;
-        }
-
-        if (should_umount(m)) {
-                r = unit_add_two_dependencies_by_name(UNIT(m), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true);
+        /* If this is a tmpfs mount then we have to unmount it before we try to deactivate swaps */
+        if (streq_ptr(p->fstype, "tmpfs")) {
+                r = unit_add_dependency_by_name(UNIT(m), UNIT_AFTER, SPECIAL_SWAP_TARGET, NULL, true, mask);
                 if (r < 0)
                         return r;
         }
@@ -441,6 +510,7 @@ static int mount_add_default_dependencies(Mount *m) {
 
 static int mount_verify(Mount *m) {
         _cleanup_free_ char *e = NULL;
+        MountParameters *p;
         int r;
 
         assert(m);
@@ -448,7 +518,7 @@ static int mount_verify(Mount *m) {
         if (UNIT(m)->load_state != UNIT_LOADED)
                 return 0;
 
-        if (!m->from_fragment && !m->from_proc_self_mountinfo)
+        if (!m->from_fragment && !m->from_proc_self_mountinfo && !UNIT(m)->perpetual)
                 return -ENOENT;
 
         r = unit_name_from_path(m->where, ".mount", &e);
@@ -465,7 +535,8 @@ static int mount_verify(Mount *m) {
                 return -EINVAL;
         }
 
-        if (UNIT(m)->fragment_path && !m->parameters_fragment.what) {
+        p = get_mount_parameters_fragment(m);
+        if (p && !p->what) {
                 log_unit_error(UNIT(m), "What= setting is missing. Refusing.");
                 return -EBADMSG;
         }
@@ -501,15 +572,15 @@ static int mount_add_extras(Mount *m) {
                         return r;
         }
 
-        r = mount_add_device_links(m);
+        r = mount_add_device_dependencies(m);
         if (r < 0)
                 return r;
 
-        r = mount_add_mount_links(m);
+        r = mount_add_mount_dependencies(m);
         if (r < 0)
                 return r;
 
-        r = mount_add_quota_links(m);
+        r = mount_add_quota_dependencies(m);
         if (r < 0)
                 return r;
 
@@ -521,17 +592,34 @@ static int mount_add_extras(Mount *m) {
         if (r < 0)
                 return r;
 
-        r = unit_add_default_slice(u, &m->cgroup_context);
+        r = unit_set_default_slice(u);
         if (r < 0)
                 return r;
 
-        if (u->default_dependencies) {
-                r = mount_add_default_dependencies(m);
-                if (r < 0)
-                        return r;
-        }
+        r = mount_add_default_dependencies(m);
+        if (r < 0)
+                return r;
 
         return 0;
+}
+
+static int mount_load_root_mount(Unit *u) {
+        assert(u);
+
+        if (!unit_has_name(u, SPECIAL_ROOT_MOUNT))
+                return 0;
+
+        u->perpetual = true;
+        u->default_dependencies = false;
+
+        /* The stdio/kmsg bridge socket is on /, in order to avoid a dep loop, don't use kmsg logging for -.mount */
+        MOUNT(u)->exec_context.std_output = EXEC_OUTPUT_NULL;
+        MOUNT(u)->exec_context.std_input = EXEC_INPUT_NULL;
+
+        if (!u->description)
+                u->description = strdup("Root Mount");
+
+        return 1;
 }
 
 static int mount_load(Unit *u) {
@@ -541,11 +629,14 @@ static int mount_load(Unit *u) {
         assert(u);
         assert(u->load_state == UNIT_STUB);
 
-        if (m->from_proc_self_mountinfo)
+        r = mount_load_root_mount(u);
+        if (r < 0)
+                return r;
+
+        if (m->from_proc_self_mountinfo || u->perpetual)
                 r = unit_load_fragment_and_dropin_optional(u);
         else
                 r = unit_load_fragment_and_dropin(u);
-
         if (r < 0)
                 return r;
 
@@ -559,23 +650,6 @@ static int mount_load(Unit *u) {
         return mount_verify(m);
 }
 
-static int mount_notify_automount(Mount *m, MountState old_state, MountState state) {
-        Unit *p;
-        int r;
-        Iterator i;
-
-        assert(m);
-
-        SET_FOREACH(p, UNIT(m)->dependencies[UNIT_TRIGGERED_BY], i)
-                if (p->type == UNIT_AUTOMOUNT) {
-                         r = automount_update_mount(AUTOMOUNT(p), old_state, state);
-                         if (r < 0)
-                                 return r;
-                }
-
-        return 0;
-}
-
 static void mount_set_state(Mount *m, MountState state) {
         MountState old_state;
         assert(m);
@@ -583,29 +657,17 @@ static void mount_set_state(Mount *m, MountState state) {
         old_state = m->state;
         m->state = state;
 
-        if (state != MOUNT_MOUNTING &&
-            state != MOUNT_MOUNTING_DONE &&
-            state != MOUNT_REMOUNTING &&
-            state != MOUNT_UNMOUNTING &&
-            state != MOUNT_MOUNTING_SIGTERM &&
-            state != MOUNT_MOUNTING_SIGKILL &&
-            state != MOUNT_UNMOUNTING_SIGTERM &&
-            state != MOUNT_UNMOUNTING_SIGKILL &&
-            state != MOUNT_REMOUNTING_SIGTERM &&
-            state != MOUNT_REMOUNTING_SIGKILL) {
+        if (!MOUNT_STATE_WITH_PROCESS(state)) {
                 m->timer_event_source = sd_event_source_unref(m->timer_event_source);
                 mount_unwatch_control_pid(m);
                 m->control_command = NULL;
                 m->control_command_id = _MOUNT_EXEC_COMMAND_INVALID;
         }
 
-        mount_notify_automount(m, old_state, state);
-
         if (state != old_state)
                 log_unit_debug(UNIT(m), "Changed %s -> %s", mount_state_to_string(old_state), mount_state_to_string(state));
 
         unit_notify(UNIT(m), state_translation_table[old_state], state_translation_table[state], m->reload_result == MOUNT_SUCCESS);
-        m->reload_result = MOUNT_SUCCESS;
 }
 
 static int mount_coldplug(Unit *u) {
@@ -624,28 +686,21 @@ static int mount_coldplug(Unit *u) {
         if (new_state == m->state)
                 return 0;
 
-        if (new_state == MOUNT_MOUNTING ||
-            new_state == MOUNT_MOUNTING_DONE ||
-            new_state == MOUNT_REMOUNTING ||
-            new_state == MOUNT_UNMOUNTING ||
-            new_state == MOUNT_MOUNTING_SIGTERM ||
-            new_state == MOUNT_MOUNTING_SIGKILL ||
-            new_state == MOUNT_UNMOUNTING_SIGTERM ||
-            new_state == MOUNT_UNMOUNTING_SIGKILL ||
-            new_state == MOUNT_REMOUNTING_SIGTERM ||
-            new_state == MOUNT_REMOUNTING_SIGKILL) {
-
-                if (m->control_pid <= 0)
-                        return -EBADMSG;
+        if (m->control_pid > 0 &&
+            pid_is_unwaited(m->control_pid) &&
+            MOUNT_STATE_WITH_PROCESS(new_state)) {
 
                 r = unit_watch_pid(UNIT(m), m->control_pid);
                 if (r < 0)
                         return r;
 
-                r = mount_arm_timer(m);
+                r = mount_arm_timer(m, usec_add(u->state_change_timestamp.monotonic, m->timeout_usec));
                 if (r < 0)
                         return r;
         }
+
+        if (!IN_SET(new_state, MOUNT_DEAD, MOUNT_FAILED))
+                (void) unit_setup_dynamic_creds(u);
 
         mount_set_state(m, new_state);
         return 0;
@@ -669,7 +724,11 @@ static void mount_dump(Unit *u, FILE *f, const char *prefix) {
                 "%sOptions: %s\n"
                 "%sFrom /proc/self/mountinfo: %s\n"
                 "%sFrom fragment: %s\n"
-                "%sDirectoryMode: %04o\n",
+                "%sExtrinsic: %s\n"
+                "%sDirectoryMode: %04o\n"
+                "%sSloppyOptions: %s\n"
+                "%sLazyUnmount: %s\n"
+                "%sForceUnmount: %s\n",
                 prefix, mount_state_to_string(m->state),
                 prefix, mount_result_to_string(m->result),
                 prefix, m->where,
@@ -678,7 +737,11 @@ static void mount_dump(Unit *u, FILE *f, const char *prefix) {
                 prefix, p ? strna(p->options) : "n/a",
                 prefix, yes_no(m->from_proc_self_mountinfo),
                 prefix, yes_no(m->from_fragment),
-                prefix, m->directory_mode);
+                prefix, yes_no(mount_is_extrinsic(m)),
+                prefix, m->directory_mode,
+                prefix, yes_no(m->sloppy_options),
+                prefix, yes_no(m->lazy_unmount),
+                prefix, yes_no(m->force_unmount));
 
         if (m->control_pid > 0)
                 fprintf(f,
@@ -687,88 +750,112 @@ static void mount_dump(Unit *u, FILE *f, const char *prefix) {
 
         exec_context_dump(&m->exec_context, f, prefix);
         kill_context_dump(&m->kill_context, f, prefix);
+        cgroup_context_dump(&m->cgroup_context, f, prefix);
 }
 
 static int mount_spawn(Mount *m, ExecCommand *c, pid_t *_pid) {
+
+        ExecParameters exec_params = {
+                .flags      = EXEC_APPLY_SANDBOXING|EXEC_APPLY_CHROOT|EXEC_APPLY_TTY_STDIN,
+                .stdin_fd   = -1,
+                .stdout_fd  = -1,
+                .stderr_fd  = -1,
+        };
         pid_t pid;
         int r;
-        ExecParameters exec_params = {
-                .apply_permissions = true,
-                .apply_chroot      = true,
-                .apply_tty_stdin   = true,
-                .bus_endpoint_fd   = -1,
-        };
 
         assert(m);
         assert(c);
         assert(_pid);
 
-        (void) unit_realize_cgroup(UNIT(m));
-        if (m->reset_cpu_usage) {
-                (void) unit_reset_cpu_usage(UNIT(m));
-                m->reset_cpu_usage = false;
-        }
-
-        r = unit_setup_exec_runtime(UNIT(m));
+        r = unit_prepare_exec(UNIT(m));
         if (r < 0)
-                goto fail;
+                return r;
 
-        r = mount_arm_timer(m);
+        r = mount_arm_timer(m, usec_add(now(CLOCK_MONOTONIC), m->timeout_usec));
         if (r < 0)
-                goto fail;
+                return r;
 
-        exec_params.environment = UNIT(m)->manager->environment;
-        exec_params.confirm_spawn = UNIT(m)->manager->confirm_spawn;
-        exec_params.cgroup_supported = UNIT(m)->manager->cgroup_supported;
-        exec_params.cgroup_path = UNIT(m)->cgroup_path;
-        exec_params.cgroup_delegate = m->cgroup_context.delegate;
-        exec_params.runtime_prefix = manager_get_runtime_prefix(UNIT(m)->manager);
+        manager_set_exec_params(UNIT(m)->manager, &exec_params);
+        unit_set_exec_params(UNIT(m), &exec_params);
 
         r = exec_spawn(UNIT(m),
                        c,
                        &m->exec_context,
                        &exec_params,
                        m->exec_runtime,
+                       &m->dynamic_creds,
                        &pid);
         if (r < 0)
-                goto fail;
+                return r;
 
         r = unit_watch_pid(UNIT(m), pid);
         if (r < 0)
                 /* FIXME: we need to do something here */
-                goto fail;
+                return r;
 
         *_pid = pid;
 
         return 0;
-
-fail:
-        m->timer_event_source = sd_event_source_unref(m->timer_event_source);
-
-        return r;
 }
 
 static void mount_enter_dead(Mount *m, MountResult f) {
         assert(m);
 
-        if (f != MOUNT_SUCCESS)
+        if (m->result == MOUNT_SUCCESS)
                 m->result = f;
+
+        if (m->result != MOUNT_SUCCESS)
+                log_unit_warning(UNIT(m), "Failed with result '%s'.", mount_result_to_string(m->result));
+
+        mount_set_state(m, m->result != MOUNT_SUCCESS ? MOUNT_FAILED : MOUNT_DEAD);
 
         exec_runtime_destroy(m->exec_runtime);
         m->exec_runtime = exec_runtime_unref(m->exec_runtime);
 
-        exec_context_destroy_runtime_directory(&m->exec_context, manager_get_runtime_prefix(UNIT(m)->manager));
+        exec_context_destroy_runtime_directory(&m->exec_context, UNIT(m)->manager->prefix[EXEC_DIRECTORY_RUNTIME]);
 
-        mount_set_state(m, m->result != MOUNT_SUCCESS ? MOUNT_FAILED : MOUNT_DEAD);
+        unit_unref_uid_gid(UNIT(m), true);
+
+        dynamic_creds_destroy(&m->dynamic_creds);
 }
 
 static void mount_enter_mounted(Mount *m, MountResult f) {
         assert(m);
 
-        if (f != MOUNT_SUCCESS)
+        if (m->result == MOUNT_SUCCESS)
                 m->result = f;
 
         mount_set_state(m, MOUNT_MOUNTED);
+}
+
+static void mount_enter_dead_or_mounted(Mount *m, MountResult f) {
+        assert(m);
+
+        /* Enter DEAD or MOUNTED state, depending on what the kernel currently says about the mount point. We use this
+         * whenever we executed an operation, so that our internal state reflects what the kernel says again, after all
+         * ultimately we just mirror the kernel's internal state on this. */
+
+        if (m->from_proc_self_mountinfo)
+                mount_enter_mounted(m, f);
+        else
+                mount_enter_dead(m, f);
+}
+
+static int state_to_kill_operation(MountState state) {
+        switch (state) {
+
+        case MOUNT_REMOUNTING_SIGTERM:
+        case MOUNT_UNMOUNTING_SIGTERM:
+                return KILL_TERMINATE;
+
+        case MOUNT_REMOUNTING_SIGKILL:
+        case MOUNT_UNMOUNTING_SIGKILL:
+                return KILL_KILL;
+
+        default:
+                return _KILL_OPERATION_INVALID;
+        }
 }
 
 static void mount_enter_signal(Mount *m, MountState state, MountResult f) {
@@ -776,14 +863,13 @@ static void mount_enter_signal(Mount *m, MountState state, MountResult f) {
 
         assert(m);
 
-        if (f != MOUNT_SUCCESS)
+        if (m->result == MOUNT_SUCCESS)
                 m->result = f;
 
         r = unit_kill_context(
                         UNIT(m),
                         &m->kill_context,
-                        (state != MOUNT_MOUNTING_SIGTERM && state != MOUNT_UNMOUNTING_SIGTERM && state != MOUNT_REMOUNTING_SIGTERM) ?
-                        KILL_KILL : KILL_TERMINATE,
+                        state_to_kill_operation(state),
                         -1,
                         m->control_pid,
                         false);
@@ -791,31 +877,25 @@ static void mount_enter_signal(Mount *m, MountState state, MountResult f) {
                 goto fail;
 
         if (r > 0) {
-                r = mount_arm_timer(m);
+                r = mount_arm_timer(m, usec_add(now(CLOCK_MONOTONIC), m->timeout_usec));
                 if (r < 0)
                         goto fail;
 
                 mount_set_state(m, state);
-        } else if (state == MOUNT_REMOUNTING_SIGTERM)
+        } else if (state == MOUNT_REMOUNTING_SIGTERM && m->kill_context.send_sigkill)
                 mount_enter_signal(m, MOUNT_REMOUNTING_SIGKILL, MOUNT_SUCCESS);
-        else if (state == MOUNT_REMOUNTING_SIGKILL)
+        else if (IN_SET(state, MOUNT_REMOUNTING_SIGTERM, MOUNT_REMOUNTING_SIGKILL))
                 mount_enter_mounted(m, MOUNT_SUCCESS);
-        else if (state == MOUNT_MOUNTING_SIGTERM)
-                mount_enter_signal(m, MOUNT_MOUNTING_SIGKILL, MOUNT_SUCCESS);
-        else if (state == MOUNT_UNMOUNTING_SIGTERM)
+        else if (state == MOUNT_UNMOUNTING_SIGTERM && m->kill_context.send_sigkill)
                 mount_enter_signal(m, MOUNT_UNMOUNTING_SIGKILL, MOUNT_SUCCESS);
         else
-                mount_enter_dead(m, MOUNT_SUCCESS);
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS);
 
         return;
 
 fail:
         log_unit_warning_errno(UNIT(m), r, "Failed to kill processes: %m");
-
-        if (state == MOUNT_REMOUNTING_SIGTERM || state == MOUNT_REMOUNTING_SIGKILL)
-                mount_enter_mounted(m, MOUNT_FAILURE_RESOURCES);
-        else
-                mount_enter_dead(m, MOUNT_FAILURE_RESOURCES);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES);
 }
 
 static void mount_enter_unmounting(Mount *m) {
@@ -833,9 +913,11 @@ static void mount_enter_unmounting(Mount *m) {
         m->control_command_id = MOUNT_EXEC_UNMOUNT;
         m->control_command = m->exec_command + MOUNT_EXEC_UNMOUNT;
 
-        r = exec_command_set(m->control_command, UMOUNT_PATH, m->where, NULL);
-        if (r >= 0 && UNIT(m)->manager->running_as == MANAGER_SYSTEM)
-                r = exec_command_append(m->control_command, "-n", NULL);
+        r = exec_command_set(m->control_command, UMOUNT_PATH, m->where, "-c", NULL);
+        if (r >= 0 && m->lazy_unmount)
+                r = exec_command_append(m->control_command, "-l", NULL);
+        if (r >= 0 && m->force_unmount)
+                r = exec_command_append(m->control_command, "-f", NULL);
         if (r < 0)
                 goto fail;
 
@@ -851,7 +933,7 @@ static void mount_enter_unmounting(Mount *m) {
 
 fail:
         log_unit_warning_errno(UNIT(m), r, "Failed to run 'umount' task: %m");
-        mount_enter_mounted(m, MOUNT_FAILURE_RESOURCES);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES);
 }
 
 static void mount_enter_mounting(Mount *m) {
@@ -859,9 +941,6 @@ static void mount_enter_mounting(Mount *m) {
         MountParameters *p;
 
         assert(m);
-
-        m->control_command_id = MOUNT_EXEC_MOUNT;
-        m->control_command = m->exec_command + MOUNT_EXEC_MOUNT;
 
         r = unit_fail_if_symlink(UNIT(m), m->where);
         if (r < 0)
@@ -871,32 +950,32 @@ static void mount_enter_mounting(Mount *m) {
 
         unit_warn_if_dir_nonempty(UNIT(m), m->where);
 
+        unit_warn_leftover_processes(UNIT(m));
+
+        m->control_command_id = MOUNT_EXEC_MOUNT;
+        m->control_command = m->exec_command + MOUNT_EXEC_MOUNT;
+
         /* Create the source directory for bind-mounts if needed */
         p = get_mount_parameters_fragment(m);
         if (p && mount_is_bind(p))
                 (void) mkdir_p_label(p->what, m->directory_mode);
 
-        if (m->from_fragment) {
+        if (p) {
                 _cleanup_free_ char *opts = NULL;
 
-                r = fstab_filter_options(m->parameters_fragment.options,
-                                         "nofail\0" "noauto\0" "auto\0", NULL, NULL, &opts);
+                r = fstab_filter_options(p->options, "nofail\0" "noauto\0" "auto\0", NULL, NULL, &opts);
                 if (r < 0)
                         goto fail;
 
-                r = exec_command_set(m->control_command, MOUNT_PATH,
-                                     m->parameters_fragment.what, m->where, NULL);
-                if (r >= 0 && UNIT(m)->manager->running_as == MANAGER_SYSTEM)
-                        r = exec_command_append(m->control_command, "-n", NULL);
+                r = exec_command_set(m->control_command, MOUNT_PATH, p->what, m->where, NULL);
                 if (r >= 0 && m->sloppy_options)
                         r = exec_command_append(m->control_command, "-s", NULL);
-                if (r >= 0 && m->parameters_fragment.fstype)
-                        r = exec_command_append(m->control_command, "-t", m->parameters_fragment.fstype, NULL);
+                if (r >= 0 && p->fstype)
+                        r = exec_command_append(m->control_command, "-t", p->fstype, NULL);
                 if (r >= 0 && !isempty(opts))
                         r = exec_command_append(m->control_command, "-o", opts, NULL);
         } else
                 r = -ENOENT;
-
         if (r < 0)
                 goto fail;
 
@@ -912,37 +991,49 @@ static void mount_enter_mounting(Mount *m) {
 
 fail:
         log_unit_warning_errno(UNIT(m), r, "Failed to run 'mount' task: %m");
-        mount_enter_dead(m, MOUNT_FAILURE_RESOURCES);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES);
+}
+
+static void mount_set_reload_result(Mount *m, MountResult result) {
+        assert(m);
+
+        /* Only store the first error we encounter */
+        if (m->reload_result != MOUNT_SUCCESS)
+                return;
+
+        m->reload_result = result;
 }
 
 static void mount_enter_remounting(Mount *m) {
         int r;
+        MountParameters *p;
 
         assert(m);
+
+        /* Reset reload result when we are about to start a new remount operation */
+        m->reload_result = MOUNT_SUCCESS;
 
         m->control_command_id = MOUNT_EXEC_REMOUNT;
         m->control_command = m->exec_command + MOUNT_EXEC_REMOUNT;
 
-        if (m->from_fragment) {
+        p = get_mount_parameters_fragment(m);
+        if (p) {
                 const char *o;
 
-                if (m->parameters_fragment.options)
-                        o = strjoina("remount,", m->parameters_fragment.options);
+                if (p->options)
+                        o = strjoina("remount,", p->options);
                 else
                         o = "remount";
 
                 r = exec_command_set(m->control_command, MOUNT_PATH,
-                                     m->parameters_fragment.what, m->where,
+                                     p->what, m->where,
                                      "-o", o, NULL);
-                if (r >= 0 && UNIT(m)->manager->running_as == MANAGER_SYSTEM)
-                        r = exec_command_append(m->control_command, "-n", NULL);
                 if (r >= 0 && m->sloppy_options)
                         r = exec_command_append(m->control_command, "-s", NULL);
-                if (r >= 0 && m->parameters_fragment.fstype)
-                        r = exec_command_append(m->control_command, "-t", m->parameters_fragment.fstype, NULL);
+                if (r >= 0 && p->fstype)
+                        r = exec_command_append(m->control_command, "-t", p->fstype, NULL);
         } else
                 r = -ENOENT;
-
         if (r < 0)
                 goto fail;
 
@@ -958,33 +1049,44 @@ static void mount_enter_remounting(Mount *m) {
 
 fail:
         log_unit_warning_errno(UNIT(m), r, "Failed to run 'remount' task: %m");
-        m->reload_result = MOUNT_FAILURE_RESOURCES;
-        mount_enter_mounted(m, MOUNT_SUCCESS);
+        mount_set_reload_result(m, MOUNT_FAILURE_RESOURCES);
+        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS);
 }
 
 static int mount_start(Unit *u) {
         Mount *m = MOUNT(u);
+        int r;
 
         assert(m);
 
         /* We cannot fulfill this request right now, try again later
          * please! */
-        if (m->state == MOUNT_UNMOUNTING ||
-            m->state == MOUNT_UNMOUNTING_SIGTERM ||
-            m->state == MOUNT_UNMOUNTING_SIGKILL ||
-            m->state == MOUNT_MOUNTING_SIGTERM ||
-            m->state == MOUNT_MOUNTING_SIGKILL)
+        if (IN_SET(m->state,
+                   MOUNT_UNMOUNTING,
+                   MOUNT_UNMOUNTING_SIGTERM,
+                   MOUNT_UNMOUNTING_SIGKILL))
                 return -EAGAIN;
 
         /* Already on it! */
         if (m->state == MOUNT_MOUNTING)
                 return 0;
 
-        assert(m->state == MOUNT_DEAD || m->state == MOUNT_FAILED);
+        assert(IN_SET(m->state, MOUNT_DEAD, MOUNT_FAILED));
+
+        r = unit_start_limit_test(u);
+        if (r < 0) {
+                mount_enter_dead(m, MOUNT_FAILURE_START_LIMIT_HIT);
+                return r;
+        }
+
+        r = unit_acquire_invocation_id(u);
+        if (r < 0)
+                return r;
 
         m->result = MOUNT_SUCCESS;
         m->reload_result = MOUNT_SUCCESS;
-        m->reset_cpu_usage = true;
+
+        u->reset_accounting = true;
 
         mount_enter_mounting(m);
         return 1;
@@ -995,23 +1097,38 @@ static int mount_stop(Unit *u) {
 
         assert(m);
 
-        /* Already on it */
-        if (m->state == MOUNT_UNMOUNTING ||
-            m->state == MOUNT_UNMOUNTING_SIGKILL ||
-            m->state == MOUNT_UNMOUNTING_SIGTERM ||
-            m->state == MOUNT_MOUNTING_SIGTERM ||
-            m->state == MOUNT_MOUNTING_SIGKILL)
+        switch (m->state) {
+
+        case MOUNT_UNMOUNTING:
+        case MOUNT_UNMOUNTING_SIGKILL:
+        case MOUNT_UNMOUNTING_SIGTERM:
+                /* Already on it */
                 return 0;
 
-        assert(m->state == MOUNT_MOUNTING ||
-               m->state == MOUNT_MOUNTING_DONE ||
-               m->state == MOUNT_MOUNTED ||
-               m->state == MOUNT_REMOUNTING ||
-               m->state == MOUNT_REMOUNTING_SIGTERM ||
-               m->state == MOUNT_REMOUNTING_SIGKILL);
+        case MOUNT_MOUNTING:
+        case MOUNT_MOUNTING_DONE:
+        case MOUNT_REMOUNTING:
+                /* If we are still waiting for /bin/mount, we go directly into kill mode. */
+                mount_enter_signal(m, MOUNT_UNMOUNTING_SIGTERM, MOUNT_SUCCESS);
+                return 0;
 
-        mount_enter_unmounting(m);
-        return 1;
+        case MOUNT_REMOUNTING_SIGTERM:
+                /* If we are already waiting for a hung remount, convert this to the matching unmounting state */
+                mount_set_state(m, MOUNT_UNMOUNTING_SIGTERM);
+                return 0;
+
+        case MOUNT_REMOUNTING_SIGKILL:
+                /* as above */
+                mount_set_state(m, MOUNT_UNMOUNTING_SIGKILL);
+                return 0;
+
+        case MOUNT_MOUNTED:
+                mount_enter_unmounting(m);
+                return 1;
+
+        default:
+                assert_not_reached("Unexpected state.");
+        }
 }
 
 static int mount_reload(Unit *u) {
@@ -1019,13 +1136,14 @@ static int mount_reload(Unit *u) {
 
         assert(m);
 
-        if (m->state == MOUNT_MOUNTING_DONE)
+        if (m->state == MOUNT_MOUNTING_DONE) /* not yet ready to reload, try again */
                 return -EAGAIN;
 
         assert(m->state == MOUNT_MOUNTED);
 
         mount_enter_remounting(m);
-        return 0;
+
+        return 1;
 }
 
 static int mount_serialize(Unit *u, FILE *f, FDSet *fds) {
@@ -1136,7 +1254,7 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
 
         m->control_pid = 0;
 
-        if (is_clean_exit(code, status, NULL))
+        if (is_clean_exit(code, status, EXIT_CLEAN_COMMAND, NULL))
                 f = MOUNT_SUCCESS;
         else if (code == CLD_EXITED)
                 f = MOUNT_FAILURE_EXIT_CODE;
@@ -1147,7 +1265,9 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         else
                 assert_not_reached("Unknown code");
 
-        if (f != MOUNT_SUCCESS)
+        if (IN_SET(m->state, MOUNT_REMOUNTING, MOUNT_REMOUNTING_SIGKILL, MOUNT_REMOUNTING_SIGTERM))
+                mount_set_reload_result(m, f);
+        else if (m->result == MOUNT_SUCCESS)
                 m->result = f;
 
         if (m->control_command) {
@@ -1160,72 +1280,52 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         log_unit_full(u, f == MOUNT_SUCCESS ? LOG_DEBUG : LOG_NOTICE, 0,
                       "Mount process exited, code=%s status=%i", sigchld_code_to_string(code), status);
 
-        /* Note that mount(8) returning and the kernel sending us a
-         * mount table change event might happen out-of-order. If an
-         * operation succeed we assume the kernel will follow soon too
-         * and already change into the resulting state.  If it fails
-         * we check if the kernel still knows about the mount. and
-         * change state accordingly. */
+        /* Note that mount(8) returning and the kernel sending us a mount table change event might happen
+         * out-of-order. If an operation succeed we assume the kernel will follow soon too and already change into the
+         * resulting state.  If it fails we check if the kernel still knows about the mount. and change state
+         * accordingly. */
 
         switch (m->state) {
 
         case MOUNT_MOUNTING:
         case MOUNT_MOUNTING_DONE:
-        case MOUNT_MOUNTING_SIGKILL:
-        case MOUNT_MOUNTING_SIGTERM:
 
-                if (f == MOUNT_SUCCESS)
-                        mount_enter_mounted(m, f);
-                else if (m->from_proc_self_mountinfo)
+                if (f == MOUNT_SUCCESS || m->from_proc_self_mountinfo)
+                        /* If /bin/mount returned success, or if we see the mount point in /proc/self/mountinfo we are
+                         * happy. If we see the first condition first, we should see the second condition
+                         * immediately after – or /bin/mount lies to us and is broken. */
                         mount_enter_mounted(m, f);
                 else
                         mount_enter_dead(m, f);
                 break;
 
         case MOUNT_REMOUNTING:
-        case MOUNT_REMOUNTING_SIGKILL:
         case MOUNT_REMOUNTING_SIGTERM:
-
-                m->reload_result = f;
-                if (m->from_proc_self_mountinfo)
-                        mount_enter_mounted(m, MOUNT_SUCCESS);
-                else
-                        mount_enter_dead(m, MOUNT_SUCCESS);
-
+        case MOUNT_REMOUNTING_SIGKILL:
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS);
                 break;
 
         case MOUNT_UNMOUNTING:
         case MOUNT_UNMOUNTING_SIGKILL:
         case MOUNT_UNMOUNTING_SIGTERM:
 
-                if (f == MOUNT_SUCCESS) {
+                if (f == MOUNT_SUCCESS && m->from_proc_self_mountinfo) {
 
-                        if (m->from_proc_self_mountinfo) {
+                        /* Still a mount point? If so, let's try again. Most likely there were multiple mount points
+                         * stacked on top of each other. Note that due to the io event priority logic we can be sure
+                         * the new mountinfo is loaded before we process the SIGCHLD for the mount command. */
 
-                                /* Still a mount point? If so, let's
-                                 * try again. Most likely there were
-                                 * multiple mount points stacked on
-                                 * top of each other. Note that due to
-                                 * the io event priority logic we can
-                                 * be sure the new mountinfo is loaded
-                                 * before we process the SIGCHLD for
-                                 * the mount command. */
+                        if (m->n_retry_umount < RETRY_UMOUNT_MAX) {
+                                log_unit_debug(u, "Mount still present, trying again.");
+                                m->n_retry_umount++;
+                                mount_enter_unmounting(m);
+                        } else {
+                                log_unit_debug(u, "Mount still present after %u attempts to unmount, giving up.", m->n_retry_umount);
+                                mount_enter_mounted(m, f);
+                        }
+                } else
+                        mount_enter_dead_or_mounted(m, f);
 
-                                if (m->n_retry_umount < RETRY_UMOUNT_MAX) {
-                                        log_unit_debug(u, "Mount still present, trying again.");
-                                        m->n_retry_umount++;
-                                        mount_enter_unmounting(m);
-                                } else {
-                                        log_unit_debug(u, "Mount still present after %u attempts to unmount, giving up.", m->n_retry_umount);
-                                        mount_enter_mounted(m, f);
-                                }
-                        } else
-                                mount_enter_dead(m, f);
-
-                } else if (m->from_proc_self_mountinfo)
-                        mount_enter_mounted(m, f);
-                else
-                        mount_enter_dead(m, f);
                 break;
 
         default:
@@ -1246,77 +1346,181 @@ static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *user
 
         case MOUNT_MOUNTING:
         case MOUNT_MOUNTING_DONE:
-                log_unit_warning(UNIT(m), "Mounting timed out. Stopping.");
-                mount_enter_signal(m, MOUNT_MOUNTING_SIGTERM, MOUNT_FAILURE_TIMEOUT);
-                break;
-
-        case MOUNT_REMOUNTING:
-                log_unit_warning(UNIT(m), "Remounting timed out. Stopping.");
-                m->reload_result = MOUNT_FAILURE_TIMEOUT;
-                mount_enter_mounted(m, MOUNT_SUCCESS);
-                break;
-
-        case MOUNT_UNMOUNTING:
-                log_unit_warning(UNIT(m), "Unmounting timed out. Stopping.");
+                log_unit_warning(UNIT(m), "Mounting timed out. Terminating.");
                 mount_enter_signal(m, MOUNT_UNMOUNTING_SIGTERM, MOUNT_FAILURE_TIMEOUT);
                 break;
 
-        case MOUNT_MOUNTING_SIGTERM:
-                if (m->kill_context.send_sigkill) {
-                        log_unit_warning(UNIT(m), "Mounting timed out. Killing.");
-                        mount_enter_signal(m, MOUNT_MOUNTING_SIGKILL, MOUNT_FAILURE_TIMEOUT);
-                } else {
-                        log_unit_warning(UNIT(m), "Mounting timed out. Skipping SIGKILL. Ignoring.");
-
-                        if (m->from_proc_self_mountinfo)
-                                mount_enter_mounted(m, MOUNT_FAILURE_TIMEOUT);
-                        else
-                                mount_enter_dead(m, MOUNT_FAILURE_TIMEOUT);
-                }
+        case MOUNT_REMOUNTING:
+                log_unit_warning(UNIT(m), "Remounting timed out. Terminating remount process.");
+                mount_set_reload_result(m, MOUNT_FAILURE_TIMEOUT);
+                mount_enter_signal(m, MOUNT_REMOUNTING_SIGTERM, MOUNT_SUCCESS);
                 break;
 
         case MOUNT_REMOUNTING_SIGTERM:
+                mount_set_reload_result(m, MOUNT_FAILURE_TIMEOUT);
+
                 if (m->kill_context.send_sigkill) {
                         log_unit_warning(UNIT(m), "Remounting timed out. Killing.");
-                        mount_enter_signal(m, MOUNT_REMOUNTING_SIGKILL, MOUNT_FAILURE_TIMEOUT);
+                        mount_enter_signal(m, MOUNT_REMOUNTING_SIGKILL, MOUNT_SUCCESS);
                 } else {
                         log_unit_warning(UNIT(m), "Remounting timed out. Skipping SIGKILL. Ignoring.");
-
-                        if (m->from_proc_self_mountinfo)
-                                mount_enter_mounted(m, MOUNT_FAILURE_TIMEOUT);
-                        else
-                                mount_enter_dead(m, MOUNT_FAILURE_TIMEOUT);
+                        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS);
                 }
+                break;
+
+        case MOUNT_REMOUNTING_SIGKILL:
+                mount_set_reload_result(m, MOUNT_FAILURE_TIMEOUT);
+
+                log_unit_warning(UNIT(m), "Mount process still around after SIGKILL. Ignoring.");
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS);
+                break;
+
+        case MOUNT_UNMOUNTING:
+                log_unit_warning(UNIT(m), "Unmounting timed out. Terminating.");
+                mount_enter_signal(m, MOUNT_UNMOUNTING_SIGTERM, MOUNT_FAILURE_TIMEOUT);
                 break;
 
         case MOUNT_UNMOUNTING_SIGTERM:
                 if (m->kill_context.send_sigkill) {
-                        log_unit_warning(UNIT(m), "Unmounting timed out. Killing.");
+                        log_unit_warning(UNIT(m), "Mount process timed out. Killing.");
                         mount_enter_signal(m, MOUNT_UNMOUNTING_SIGKILL, MOUNT_FAILURE_TIMEOUT);
                 } else {
-                        log_unit_warning(UNIT(m), "Unmounting timed out. Skipping SIGKILL. Ignoring.");
-
-                        if (m->from_proc_self_mountinfo)
-                                mount_enter_mounted(m, MOUNT_FAILURE_TIMEOUT);
-                        else
-                                mount_enter_dead(m, MOUNT_FAILURE_TIMEOUT);
+                        log_unit_warning(UNIT(m), "Mount process timed out. Skipping SIGKILL. Ignoring.");
+                        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT);
                 }
                 break;
 
-        case MOUNT_MOUNTING_SIGKILL:
-        case MOUNT_REMOUNTING_SIGKILL:
         case MOUNT_UNMOUNTING_SIGKILL:
-                log_unit_warning(UNIT(m),"Mount process still around after SIGKILL. Ignoring.");
-
-                if (m->from_proc_self_mountinfo)
-                        mount_enter_mounted(m, MOUNT_FAILURE_TIMEOUT);
-                else
-                        mount_enter_dead(m, MOUNT_FAILURE_TIMEOUT);
+                log_unit_warning(UNIT(m), "Mount process still around after SIGKILL. Ignoring.");
+                mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT);
                 break;
 
         default:
                 assert_not_reached("Timeout at wrong time.");
         }
+
+        return 0;
+}
+
+typedef struct {
+        bool is_mounted;
+        bool just_mounted;
+        bool just_changed;
+} MountSetupFlags;
+
+static int mount_setup_new_unit(
+                Unit *u,
+                const char *what,
+                const char *where,
+                const char *options,
+                const char *fstype,
+                MountSetupFlags *flags) {
+
+        MountParameters *p;
+
+        assert(u);
+        assert(flags);
+
+        u->source_path = strdup("/proc/self/mountinfo");
+        MOUNT(u)->where = strdup(where);
+        if (!u->source_path || !MOUNT(u)->where)
+                return -ENOMEM;
+
+        /* Make sure to initialize those fields before mount_is_extrinsic(). */
+        MOUNT(u)->from_proc_self_mountinfo = true;
+        p = &MOUNT(u)->parameters_proc_self_mountinfo;
+
+        p->what = strdup(what);
+        p->options = strdup(options);
+        p->fstype = strdup(fstype);
+        if (!p->what || !p->options || !p->fstype)
+                return -ENOMEM;
+
+        if (!mount_is_extrinsic(MOUNT(u))) {
+                const char *target;
+                int r;
+
+                target = mount_is_network(p) ? SPECIAL_REMOTE_FS_TARGET : SPECIAL_LOCAL_FS_TARGET;
+                r = unit_add_dependency_by_name(u, UNIT_BEFORE, target, NULL, true, UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_dependency_by_name(u, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true, UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT);
+                if (r < 0)
+                        return r;
+        }
+
+        unit_add_to_load_queue(u);
+        flags->is_mounted = true;
+        flags->just_mounted = true;
+        flags->just_changed = true;
+
+        return 0;
+}
+
+static int mount_setup_existing_unit(
+                Unit *u,
+                const char *what,
+                const char *where,
+                const char *options,
+                const char *fstype,
+                MountSetupFlags *flags) {
+
+        MountParameters *p;
+        bool load_extras = false;
+        int r1, r2, r3;
+
+        assert(u);
+        assert(flags);
+
+        if (!MOUNT(u)->where) {
+                MOUNT(u)->where = strdup(where);
+                if (!MOUNT(u)->where)
+                        return -ENOMEM;
+        }
+
+        /* Make sure to initialize those fields before mount_is_extrinsic(). */
+        p = &MOUNT(u)->parameters_proc_self_mountinfo;
+
+        r1 = free_and_strdup(&p->what, what);
+        r2 = free_and_strdup(&p->options, options);
+        r3 = free_and_strdup(&p->fstype, fstype);
+        if (r1 < 0 || r2 < 0 || r3 < 0)
+                return -ENOMEM;
+
+        flags->just_changed = r1 > 0 || r2 > 0 || r3 > 0;
+        flags->is_mounted = true;
+        flags->just_mounted = !MOUNT(u)->from_proc_self_mountinfo || MOUNT(u)->just_mounted;
+
+        MOUNT(u)->from_proc_self_mountinfo = true;
+
+        if (!mount_is_extrinsic(MOUNT(u)) && mount_is_network(p)) {
+                /* _netdev option may have shown up late, or on a
+                 * remount. Add remote-fs dependencies, even though
+                 * local-fs ones may already be there.
+                 *
+                 * Note: due to a current limitation (we don't track
+                 * in the dependency "Set*" objects who created a
+                 * dependency), we can only add deps, never lose them,
+                 * until the next full daemon-reload. */
+                unit_add_dependency_by_name(u, UNIT_BEFORE, SPECIAL_REMOTE_FS_TARGET, NULL, true, UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT);
+                load_extras = true;
+        }
+
+        if (u->load_state == UNIT_NOT_FOUND) {
+                u->load_state = UNIT_LOADED;
+                u->load_error = 0;
+
+                /* Load in the extras later on, after we
+                 * finished initialization of the unit */
+
+                /* FIXME: since we're going to load the unit later on, why setting load_extras=true ? */
+                load_extras = true;
+                flags->just_changed = true;
+        }
+
+        if (load_extras)
+                return mount_add_extras(MOUNT(u));
 
         return 0;
 }
@@ -1329,10 +1533,8 @@ static int mount_setup_unit(
                 const char *fstype,
                 bool set_flags) {
 
-        _cleanup_free_ char *e = NULL, *w = NULL, *o = NULL, *f = NULL;
-        bool load_extras = false;
-        MountParameters *p;
-        bool delete, changed = false;
+        _cleanup_free_ char *e = NULL;
+        MountSetupFlags flags;
         Unit *u;
         int r;
 
@@ -1360,128 +1562,34 @@ static int mount_setup_unit(
 
         u = manager_get_unit(m, e);
         if (!u) {
-                delete = true;
-
-                u = unit_new(m, sizeof(Mount));
-                if (!u)
-                        return log_oom();
-
-                r = unit_add_name(u, e);
+                /* First time we see this mount point meaning that it's
+                 * not been initiated by a mount unit but rather by the
+                 * sysadmin having called mount(8) directly. */
+                r = unit_new_for_name(m, sizeof(Mount), e, &u);
                 if (r < 0)
                         goto fail;
 
-                MOUNT(u)->where = strdup(where);
-                if (!MOUNT(u)->where) {
-                        r = -ENOMEM;
-                        goto fail;
-                }
+                r = mount_setup_new_unit(u, what, where, options, fstype, &flags);
+                if (r < 0)
+                        unit_free(u);
+        } else
+                r = mount_setup_existing_unit(u, what, where, options, fstype, &flags);
 
-                u->source_path = strdup("/proc/self/mountinfo");
-                if (!u->source_path) {
-                        r = -ENOMEM;
-                        goto fail;
-                }
-
-                if (m->running_as == MANAGER_SYSTEM) {
-                        const char* target;
-
-                        target = mount_needs_network(options, fstype) ?  SPECIAL_REMOTE_FS_TARGET : SPECIAL_LOCAL_FS_TARGET;
-                        r = unit_add_dependency_by_name(u, UNIT_BEFORE, target, NULL, true);
-                        if (r < 0)
-                                goto fail;
-
-                        if (should_umount(MOUNT(u))) {
-                                r = unit_add_dependency_by_name(u, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, NULL, true);
-                                if (r < 0)
-                                        goto fail;
-                        }
-                }
-
-                unit_add_to_load_queue(u);
-                changed = true;
-        } else {
-                delete = false;
-
-                if (!MOUNT(u)->where) {
-                        MOUNT(u)->where = strdup(where);
-                        if (!MOUNT(u)->where) {
-                                r = -ENOMEM;
-                                goto fail;
-                        }
-                }
-
-                if (m->running_as == MANAGER_SYSTEM &&
-                    mount_needs_network(options, fstype)) {
-                        /* _netdev option may have shown up late, or on a
-                         * remount. Add remote-fs dependencies, even though
-                         * local-fs ones may already be there. */
-                        unit_add_dependency_by_name(u, UNIT_BEFORE, SPECIAL_REMOTE_FS_TARGET, NULL, true);
-                        load_extras = true;
-                }
-
-                if (u->load_state == UNIT_NOT_FOUND) {
-                        u->load_state = UNIT_LOADED;
-                        u->load_error = 0;
-
-                        /* Load in the extras later on, after we
-                         * finished initialization of the unit */
-                        load_extras = true;
-                        changed = true;
-                }
-        }
-
-        w = strdup(what);
-        o = strdup(options);
-        f = strdup(fstype);
-        if (!w || !o || !f) {
-                r = -ENOMEM;
+        if (r < 0)
                 goto fail;
-        }
-
-        p = &MOUNT(u)->parameters_proc_self_mountinfo;
-
-        changed = changed ||
-                !streq_ptr(p->options, options) ||
-                !streq_ptr(p->what, what) ||
-                !streq_ptr(p->fstype, fstype);
 
         if (set_flags) {
-                MOUNT(u)->is_mounted = true;
-                MOUNT(u)->just_mounted = !MOUNT(u)->from_proc_self_mountinfo;
-                MOUNT(u)->just_changed = changed;
+                MOUNT(u)->is_mounted = flags.is_mounted;
+                MOUNT(u)->just_mounted = flags.just_mounted;
+                MOUNT(u)->just_changed = flags.just_changed;
         }
 
-        MOUNT(u)->from_proc_self_mountinfo = true;
-
-        free(p->what);
-        p->what = w;
-        w = NULL;
-
-        free(p->options);
-        p->options = o;
-        o = NULL;
-
-        free(p->fstype);
-        p->fstype = f;
-        f = NULL;
-
-        if (load_extras) {
-                r = mount_add_extras(MOUNT(u));
-                if (r < 0)
-                        goto fail;
-        }
-
-        if (changed)
+        if (flags.just_changed)
                 unit_add_to_dbus_queue(u);
 
         return 0;
-
 fail:
         log_warning_errno(r, "Failed to set up mount unit: %m");
-
-        if (delete && u)
-                unit_free(u);
-
         return r;
 }
 
@@ -1545,89 +1653,122 @@ static void mount_shutdown(Manager *m) {
         assert(m);
 
         m->mount_event_source = sd_event_source_unref(m->mount_event_source);
-        m->mount_utab_event_source = sd_event_source_unref(m->mount_utab_event_source);
 
-        if (m->proc_self_mountinfo) {
-                fclose(m->proc_self_mountinfo);
-                m->proc_self_mountinfo = NULL;
-        }
-        m->utab_inotify_fd = safe_close(m->utab_inotify_fd);
+        mnt_unref_monitor(m->mount_monitor);
+        m->mount_monitor = NULL;
 }
 
-static int mount_get_timeout(Unit *u, uint64_t *timeout) {
+static int mount_get_timeout(Unit *u, usec_t *timeout) {
         Mount *m = MOUNT(u);
+        usec_t t;
         int r;
 
         if (!m->timer_event_source)
                 return 0;
 
-        r = sd_event_source_get_time(m->timer_event_source, timeout);
+        r = sd_event_source_get_time(m->timer_event_source, &t);
         if (r < 0)
                 return r;
+        if (t == USEC_INFINITY)
+                return 0;
 
+        *timeout = t;
         return 1;
 }
 
-static int mount_enumerate(Manager *m) {
+static int synthesize_root_mount(Manager *m) {
+        Unit *u;
         int r;
+
         assert(m);
+
+        /* Whatever happens, we know for sure that the root directory is around, and cannot go away. Let's
+         * unconditionally synthesize it here and mark it as perpetual. */
+
+        u = manager_get_unit(m, SPECIAL_ROOT_MOUNT);
+        if (!u) {
+                r = unit_new_for_name(m, sizeof(Mount), SPECIAL_ROOT_MOUNT, &u);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to allocate the special " SPECIAL_ROOT_MOUNT " unit: %m");
+        }
+
+        u->perpetual = true;
+        MOUNT(u)->deserialized_state = MOUNT_MOUNTED;
+
+        unit_add_to_load_queue(u);
+        unit_add_to_dbus_queue(u);
+
+        return 0;
+}
+
+static bool mount_is_mounted(Mount *m) {
+        assert(m);
+
+        return UNIT(m)->perpetual || m->is_mounted;
+}
+
+static void mount_enumerate(Manager *m) {
+        int r;
+
+        assert(m);
+
+        r = synthesize_root_mount(m);
+        if (r < 0)
+                goto fail;
 
         mnt_init_debug(0);
 
-        if (!m->proc_self_mountinfo) {
-                m->proc_self_mountinfo = fopen("/proc/self/mountinfo", "re");
-                if (!m->proc_self_mountinfo)
-                        return -errno;
+        if (!m->mount_monitor) {
+                int fd;
 
-                r = sd_event_add_io(m->event, &m->mount_event_source, fileno(m->proc_self_mountinfo), EPOLLPRI, mount_dispatch_io, m);
-                if (r < 0)
-                        goto fail;
-
-                /* Dispatch this before we dispatch SIGCHLD, so that
-                 * we always get the events from /proc/self/mountinfo
-                 * before the SIGCHLD of /usr/bin/mount. */
-                r = sd_event_source_set_priority(m->mount_event_source, -10);
-                if (r < 0)
-                        goto fail;
-
-                (void) sd_event_source_set_description(m->mount_event_source, "mount-mountinfo-dispatch");
-        }
-
-        if (m->utab_inotify_fd < 0) {
-                m->utab_inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
-                if (m->utab_inotify_fd < 0) {
-                        r = -errno;
+                m->mount_monitor = mnt_new_monitor();
+                if (!m->mount_monitor) {
+                        log_oom();
                         goto fail;
                 }
 
-                (void) mkdir_p_label("/run/mount", 0755);
-
-                r = inotify_add_watch(m->utab_inotify_fd, "/run/mount", IN_MOVED_TO);
+                r = mnt_monitor_enable_kernel(m->mount_monitor, 1);
                 if (r < 0) {
-                        r = -errno;
+                        log_error_errno(r, "Failed to enable watching of kernel mount events: %m");
                         goto fail;
                 }
 
-                r = sd_event_add_io(m->event, &m->mount_utab_event_source, m->utab_inotify_fd, EPOLLIN, mount_dispatch_io, m);
-                if (r < 0)
+                r = mnt_monitor_enable_userspace(m->mount_monitor, 1, NULL);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to enable watching of userspace mount events: %m");
                         goto fail;
+                }
 
-                r = sd_event_source_set_priority(m->mount_utab_event_source, -10);
-                if (r < 0)
+                /* mnt_unref_monitor() will close the fd */
+                fd = r = mnt_monitor_get_fd(m->mount_monitor);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to acquire watch file descriptor: %m");
                         goto fail;
+                }
 
-                (void) sd_event_source_set_description(m->mount_utab_event_source, "mount-utab-dispatch");
+                r = sd_event_add_io(m->event, &m->mount_event_source, fd, EPOLLIN, mount_dispatch_io, m);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to watch mount file descriptor: %m");
+                        goto fail;
+                }
+
+                r = sd_event_source_set_priority(m->mount_event_source, -10);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to adjust mount watch priority: %m");
+                        goto fail;
+                }
+
+                (void) sd_event_source_set_description(m->mount_event_source, "mount-monitor-dispatch");
         }
 
         r = mount_load_proc_self_mountinfo(m, false);
         if (r < 0)
                 goto fail;
 
-        return 0;
+        return;
 
 fail:
         mount_shutdown(m);
-        return r;
 }
 
 static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
@@ -1639,45 +1780,27 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
         int r;
 
         assert(m);
-        assert(revents & (EPOLLPRI | EPOLLIN));
+        assert(revents & EPOLLIN);
 
-        /* The manager calls this for every fd event happening on the
-         * /proc/self/mountinfo file, which informs us about mounting
-         * table changes, and for /run/mount events which we watch
-         * for mount options. */
-
-        if (fd == m->utab_inotify_fd) {
+        if (fd == mnt_monitor_get_fd(m->mount_monitor)) {
                 bool rescan = false;
 
-                /* FIXME: We *really* need to replace this with
-                 * libmount's own API for this, we should not hardcode
-                 * internal behaviour of libmount here. */
+                /* Drain all events and verify that the event is valid.
+                 *
+                 * Note that libmount also monitors /run/mount mkdir if the
+                 * directory does not exist yet. The mkdir may generate event
+                 * which is irrelevant for us.
+                 *
+                 * error: r < 0; valid: r == 0, false positive: rc == 1 */
+                do {
+                        r = mnt_monitor_next_change(m->mount_monitor, NULL, NULL);
+                        if (r == 0)
+                                rescan = true;
+                        else if (r < 0)
+                                return log_error_errno(r, "Failed to drain libmount events");
+                } while (r == 0);
 
-                for (;;) {
-                        union inotify_event_buffer buffer;
-                        struct inotify_event *e;
-                        ssize_t l;
-
-                        l = read(fd, &buffer, sizeof(buffer));
-                        if (l < 0) {
-                                if (errno == EAGAIN || errno == EINTR)
-                                        break;
-
-                                log_error_errno(errno, "Failed to read utab inotify: %m");
-                                break;
-                        }
-
-                        FOREACH_INOTIFY_EVENT(e, buffer, l) {
-                                /* Only care about changes to utab,
-                                 * but we have to monitor the
-                                 * directory to reliably get
-                                 * notifications about when utab is
-                                 * replaced using rename(2) */
-                                if ((e->mask & IN_Q_OVERFLOW) || streq(e->name, "utab"))
-                                        rescan = true;
-                        }
-                }
-
+                log_debug("libmount event [rescan: %s]", yes_no(rescan));
                 if (!rescan)
                         return 0;
         }
@@ -1699,7 +1822,7 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
         LIST_FOREACH(units_by_type, u, m->units_by_type[UNIT_MOUNT]) {
                 Mount *mount = MOUNT(u);
 
-                if (!mount->is_mounted) {
+                if (!mount_is_mounted(mount)) {
 
                         /* A mount point is not around right now. It
                          * might be gone, or might never have
@@ -1722,6 +1845,7 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
                                 /* This has just been unmounted by
                                  * somebody else, follow the state
                                  * change. */
+                                mount->result = MOUNT_SUCCESS; /* make sure we forget any earlier umount failures */
                                 mount_enter_dead(mount, MOUNT_SUCCESS);
                                 break;
 
@@ -1737,9 +1861,10 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
 
                         case MOUNT_DEAD:
                         case MOUNT_FAILED:
-                                /* This has just been mounted by
-                                 * somebody else, follow the state
-                                 * change. */
+
+                                /* This has just been mounted by somebody else, follow the state change, but let's
+                                 * generate a new invocation ID for this implicitly and automatically. */
+                                (void) unit_acquire_invocation_id(UNIT(mount));
                                 mount_enter_mounted(mount, MOUNT_SUCCESS);
                                 break;
 
@@ -1758,7 +1883,7 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
                         }
                 }
 
-                if (mount->is_mounted &&
+                if (mount_is_mounted(mount) &&
                     mount->from_proc_self_mountinfo &&
                     mount->parameters_proc_self_mountinfo.what) {
 
@@ -1795,26 +1920,20 @@ static void mount_reset_failed(Unit *u) {
 }
 
 static int mount_kill(Unit *u, KillWho who, int signo, sd_bus_error *error) {
+        Mount *m = MOUNT(u);
+
+        assert(m);
+
         return unit_kill_common(u, who, signo, -1, MOUNT(u)->control_pid, error);
 }
 
-static const char* const mount_state_table[_MOUNT_STATE_MAX] = {
-        [MOUNT_DEAD] = "dead",
-        [MOUNT_MOUNTING] = "mounting",
-        [MOUNT_MOUNTING_DONE] = "mounting-done",
-        [MOUNT_MOUNTED] = "mounted",
-        [MOUNT_REMOUNTING] = "remounting",
-        [MOUNT_UNMOUNTING] = "unmounting",
-        [MOUNT_MOUNTING_SIGTERM] = "mounting-sigterm",
-        [MOUNT_MOUNTING_SIGKILL] = "mounting-sigkill",
-        [MOUNT_REMOUNTING_SIGTERM] = "remounting-sigterm",
-        [MOUNT_REMOUNTING_SIGKILL] = "remounting-sigkill",
-        [MOUNT_UNMOUNTING_SIGTERM] = "unmounting-sigterm",
-        [MOUNT_UNMOUNTING_SIGKILL] = "unmounting-sigkill",
-        [MOUNT_FAILED] = "failed"
-};
+static int mount_control_pid(Unit *u) {
+        Mount *m = MOUNT(u);
 
-DEFINE_STRING_TABLE_LOOKUP(mount_state, MountState);
+        assert(m);
+
+        return m->control_pid;
+}
 
 static const char* const mount_exec_command_table[_MOUNT_EXEC_COMMAND_MAX] = {
         [MOUNT_EXEC_MOUNT] = "ExecMount",
@@ -1830,7 +1949,8 @@ static const char* const mount_result_table[_MOUNT_RESULT_MAX] = {
         [MOUNT_FAILURE_TIMEOUT] = "timeout",
         [MOUNT_FAILURE_EXIT_CODE] = "exit-code",
         [MOUNT_FAILURE_SIGNAL] = "signal",
-        [MOUNT_FAILURE_CORE_DUMP] = "core-dump"
+        [MOUNT_FAILURE_CORE_DUMP] = "core-dump",
+        [MOUNT_FAILURE_START_LIMIT_HIT] = "start-limit-hit",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(mount_result, MountResult);
@@ -1841,15 +1961,13 @@ const UnitVTable mount_vtable = {
         .cgroup_context_offset = offsetof(Mount, cgroup_context),
         .kill_context_offset = offsetof(Mount, kill_context),
         .exec_runtime_offset = offsetof(Mount, exec_runtime),
+        .dynamic_creds_offset = offsetof(Mount, dynamic_creds),
 
         .sections =
                 "Unit\0"
                 "Mount\0"
                 "Install\0",
         .private_section = "Mount",
-
-        .no_alias = true,
-        .no_instances = true,
 
         .init = mount_init,
         .load = mount_load,
@@ -1877,7 +1995,8 @@ const UnitVTable mount_vtable = {
 
         .reset_failed = mount_reset_failed,
 
-        .bus_interface = "org.freedesktop.systemd1.Mount",
+        .control_pid = mount_control_pid,
+
         .bus_vtable = bus_mount_vtable,
         .bus_set_property = bus_mount_set_property,
         .bus_commit_properties = bus_mount_commit_properties,
@@ -1897,7 +2016,6 @@ const UnitVTable mount_vtable = {
                 .finished_start_job = {
                         [JOB_DONE]       = "Mounted %s.",
                         [JOB_FAILED]     = "Failed to mount %s.",
-                        [JOB_DEPENDENCY] = "Dependency failed for %s.",
                         [JOB_TIMEOUT]    = "Timed out mounting %s.",
                 },
                 .finished_stop_job = {

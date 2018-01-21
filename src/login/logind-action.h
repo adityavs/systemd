@@ -1,5 +1,4 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
 /***
@@ -35,6 +34,7 @@ typedef enum HandleAction {
         _HANDLE_ACTION_INVALID = -1
 } HandleAction;
 
+#include "logind-inhibit.h"
 #include "logind.h"
 
 int manager_handle_action(
